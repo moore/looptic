@@ -11,9 +11,8 @@ import board, digitalio
 use_macrosynthplug = True  # False to use built-in speaker of MacroPad RP2040
 num_pads = 12  # If we decide to use some of the keys for other things this can be adjusted
 waves = [None] * num_pads
-pads_lit = [0] * num_pads  # list of drum keys that are being played
 pads_mute = [0] * num_pads # which pads are muted
-
+base_bpm = 60
 
 # Load wave objects upfront in attempt to reduce play latency
 def load_samples():
@@ -21,9 +20,8 @@ def load_samples():
         waves[i] = audiocore.WaveFile(open("samples/" + fname,"rb"))  #
 
 # play a drum sample, either by sequencer or pressing pads
-def play_drum(num, pressed):
-    pads_lit[num] = pressed
-    voice = mixer.voice[num]   # get mixer voice
+def play_drum(voice_num, num, pressed):
+    voice = mixer.voice[voice_num]   # get mixer voice
     if pressed and not pads_mute[num]:
         voice.play(waves[num],loop=False)
     else: # released
@@ -68,6 +66,7 @@ current_beat = None
 beat_offset = 0
 tone_off = 0
 
+
 while True:
     key_event = macropad.keys.events.get()
     t = int(time.monotonic_ns() / (10**6))
@@ -75,7 +74,11 @@ while True:
     for i in range(len(beats)):
         key = beats[i]
         if key.next <= t:
-            key.next += 1000 - key.beat
+            if key.beat > 0:
+                interval = int((1000 * 60) / (key.beat * base_bpm))
+                count = t//interval
+                key.next = int((count + 1) * interval)
+
 
             if key.active:
                 macropad.pixels[i] = colorwheel(
@@ -86,12 +89,10 @@ while True:
                 if i >= 6:
                     drum = 1 
 
-                play_drum(drum, True)
+                play_drum(i, drum, True)
 
-                if False: #if tone_off < t:
-                    macropad.start_tone(tones[i])
+                if tone_off < t:
                     tone_off = t + 100
-                    text_lines[0].text = "Tone off {}".format(tone_off)
 
 
     encoder_value = macropad.encoder
@@ -102,7 +103,7 @@ while True:
         if current_beat is not None:
             delta = encoder_value - beat_offset
             current_beat.beat += delta
-            current_beat.next += delta
+            #current_beat.next += delta
 
             if current_beat.beat > 0:
                 current_beat.active = True
@@ -129,5 +130,4 @@ while True:
     text_lines.show()
 
     if t >= tone_off:
-        macropad.stop_tone()
         macropad.pixels.fill((0, 0, 0))
