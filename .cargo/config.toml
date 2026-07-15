@@ -1,0 +1,6 @@
+[alias]
+firmware = "build --release --target thumbv6m-none-eabi"
+flash = "run --release --target thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+runner = "probe-rs run --chip RP2040"

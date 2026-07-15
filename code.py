@@ -3,8 +3,9 @@ Loop-tick synth
 """
 from rainbowio import colorwheel
 from adafruit_macropad import MacroPad
+from adafruit_ticks import ticks_ms, ticks_diff, ticks_add
 import audiocore, audiomixer, audiopwmio
-import time, os
+import time, os, math
 import board, digitalio
 
 
@@ -65,19 +66,28 @@ last_encoder = 0
 current_beat = None
 beat_offset = 0
 tone_off = 0
-
-
+tick = 0
+last_t = 0
 while True:
     key_event = macropad.keys.events.get()
-    t = int(time.monotonic_ns() / (10**6))
+    t = math.floor(time.monotonic_ns() / (10**6))
+    played = [False, False]
 
+    #if t != last_t and t != (last_t + 1):
+    #    print("t is {} last_t is {} diff {}".format(t, last_t, t - last_t))
+
+    
     for i in range(len(beats)):
         key = beats[i]
+                  
         if key.next <= t:
             if key.beat > 0:
-                interval = int((1000 * 60) / (key.beat * base_bpm))
-                count = t//interval
-                key.next = int((count + 1) * interval)
+                #if key.next < t:
+                #    print("oops i {} t {} key.next {} diff {}".format(i, t, key.next, t - key.next))
+
+                interval = (1000 * 60) // (key.beat * base_bpm)
+                count = math.floor(t/interval)
+                key.next = (count + 1) * interval
 
 
             if key.active:
@@ -89,23 +99,33 @@ while True:
                 if i >= 6:
                     drum = 1 
 
-                play_drum(i, drum, True)
+                if not played[drum]:
+                    print("play {}, prev_dif {}".format(drum, t - last_t))
+
+                    played[drum] = True
+                    play_drum(i, drum, True)
+                else:
+                    print("supress {}".format(drum))
 
                 if tone_off < t:
                     tone_off = t + 100
 
+    last_t = t
 
     encoder_value = macropad.encoder
 
     if encoder_value != last_encoder:
         last_encoder = encoder_value
-        text_lines[1].text = "Encoder: {}".format(encoder_value)
+
         if current_beat is not None:
             delta = encoder_value - beat_offset
             current_beat.beat += delta
-            #current_beat.next += delta
 
             if current_beat.beat > 0:
+                interval = (1000 * 60) // (current_beat.beat * base_bpm)
+                count = math.floor(t/interval)
+                current_beat.next = (count + 1) * interval
+                
                 current_beat.active = True
             else:
                 current_beat.active = False
@@ -113,7 +133,7 @@ while True:
 
 
             beat_offset = encoder_value
-            text_lines[3].text = "Beat {}".format(current_beat.beat)
+            text_lines[1].text = "Beat {}".format(current_beat.beat)
 
 
     if key_event:
@@ -121,8 +141,7 @@ while True:
             beat_offset = encoder_value
             key_number = key_event.key_number
             current_beat = beats[key_number]
-            text_lines[2].text = "Time {}".format(t)
-            text_lines[3].text = "Beat {}".format(current_beat.beat)
+            text_lines[1].text = "Beat {}".format(current_beat.beat)
 
         else:
             current_beat = None
