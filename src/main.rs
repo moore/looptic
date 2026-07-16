@@ -42,8 +42,9 @@ use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
 use looptic::{
-    AUDIO_BLOCK_FRAMES, HeldPadSelection, KeyDebouncer, PAD_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD,
-    Sequencer, SharedState, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active,
+    AUDIO_BLOCK_FRAMES, EncoderAcceleration, HeldPadSelection, KeyDebouncer, PAD_COUNT,
+    SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, WavPcm16, apply_encoder_delta,
+    colorwheel, led_pulse_active,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -225,14 +226,17 @@ async fn controls_task(
     let mut debouncer = KeyDebouncer::new(5);
     let mut selection = HeldPadSelection::new();
     let mut next_scan = Instant::now();
+    let mut encoder_acceleration = EncoderAcceleration::new();
 
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
             let selected = ui.lock(|state| state.borrow().selected_pad);
-            let delta = match direction {
+            let direction_delta = match direction {
                 Direction::Clockwise => 1,
                 Direction::CounterClockwise => -1,
             };
+            let delta =
+                encoder_acceleration.update(Instant::now().as_millis(), selected, direction_delta);
             shared.lock(|state| {
                 let mut state = state.borrow_mut();
                 apply_encoder_delta(&mut state, selected, delta);
@@ -312,7 +316,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         }
     }
 
-    let mut last_value: Option<(Option<usize>, u16)> = None;
+    let mut last_value: Option<(Option<usize>, u32)> = None;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let mut ticker = Ticker::every(DISPLAY_INTERVAL);
 
@@ -320,7 +324,9 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         let selected = ui.lock(|state| state.borrow().selected_pad);
         let displayed_value = shared.lock(|state| {
             let state = state.borrow();
-            selected.map_or(state.base_interval_ms, |pad| state.desired_beats[pad])
+            selected.map_or(state.base_interval_ms, |pad| {
+                u32::from(state.desired_beats[pad])
+            })
         });
         let value = (selected, displayed_value);
 
@@ -329,7 +335,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
                 .draw(&mut display);
 
-            let mut line: String<16> = String::new();
+            let mut line: String<24> = String::new();
             if selected.is_some() {
                 let _ = write!(&mut line, "Beat {}", displayed_value);
             } else {

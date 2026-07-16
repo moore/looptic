@@ -9,11 +9,12 @@ pub const PAD_COUNT: usize = 12;
 pub const SAMPLE_RATE: u32 = 22_050;
 pub const AUDIO_BLOCK_FRAMES: usize = 128;
 pub const MAX_BEAT_MULTIPLIER: u16 = 1_000;
-pub const DEFAULT_BASE_INTERVAL_MS: u16 = 1_000;
+pub const DEFAULT_BASE_INTERVAL_MS: u32 = 1_000;
 // At 50 ms, the maximum multiplier produces 20 kHz: still below the audio clock.
-pub const MIN_BASE_INTERVAL_MS: u16 = 50;
-pub const MAX_BASE_INTERVAL_MS: u16 = 5_000;
-pub const BASE_INTERVAL_STEP_MS: u16 = 10;
+pub const MIN_BASE_INTERVAL_MS: u32 = 50;
+pub const BASE_INTERVAL_STEP_MS: u32 = 10;
+pub const FAST_ENCODER_MULTIPLIER: i32 = 10;
+pub const FAST_ENCODER_THRESHOLD_MS: u64 = 75;
 
 const SAMPLE_COUNT: usize = 2;
 const KICK_INDEX: usize = 0;
@@ -291,7 +292,7 @@ impl DitherEncoder {
 pub struct Sequencer<'a> {
     samples: [WavPcm16<'a>; SAMPLE_COUNT],
     pads: [PadState; PAD_COUNT],
-    base_interval_ms: u16,
+    base_interval_ms: u32,
     dither: DitherEncoder,
 }
 
@@ -309,7 +310,7 @@ impl<'a> Sequencer<'a> {
         &self.pads
     }
 
-    pub const fn base_interval_ms(&self) -> u16 {
+    pub const fn base_interval_ms(&self) -> u32 {
         self.base_interval_ms
     }
 
@@ -320,10 +321,10 @@ impl<'a> Sequencer<'a> {
     pub fn apply_timing(
         &mut self,
         beats: &[u16; PAD_COUNT],
-        base_interval_ms: u16,
+        base_interval_ms: u32,
         from_frame: u64,
     ) {
-        let base_interval_ms = base_interval_ms.clamp(MIN_BASE_INTERVAL_MS, MAX_BASE_INTERVAL_MS);
+        let base_interval_ms = base_interval_ms.max(MIN_BASE_INTERVAL_MS);
         let base_changed = self.base_interval_ms != base_interval_ms;
         self.base_interval_ms = base_interval_ms;
 
@@ -394,14 +395,14 @@ impl<'a> Sequencer<'a> {
     }
 }
 
-fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u16) -> u64 {
+fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
     let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
     let denominator = u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
     let ordinal = numerator / denominator + 1;
     ordinal as u64
 }
 
-fn frame_for_tick(ordinal: u64, beats_per_interval: u16, base_interval_ms: u16) -> u64 {
+fn frame_for_tick(ordinal: u64, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
     if beats_per_interval == 0 {
         return u64::MAX;
     }
@@ -431,7 +432,7 @@ pub const fn saturating_i16(value: i32) -> i16 {
 #[derive(Clone, Copy, Debug)]
 pub struct SharedState {
     pub desired_beats: [u16; PAD_COUNT],
-    pub base_interval_ms: u16,
+    pub base_interval_ms: u32,
     pub playback_frame: u64,
     pub latest_trigger_frames: [u64; PAD_COUNT],
     pub underrun_count: u32,
@@ -570,13 +571,51 @@ pub fn adjust_beat_multiplier(current: u16, delta: i32) -> u16 {
     adjusted.clamp(0, i32::from(MAX_BEAT_MULTIPLIER)) as u16
 }
 
-pub fn adjust_base_interval(current_ms: u16, delta_steps: i32) -> u16 {
-    let delta_ms = delta_steps.saturating_mul(i32::from(BASE_INTERVAL_STEP_MS));
-    let adjusted = i32::from(current_ms).saturating_add(delta_ms);
-    adjusted.clamp(
-        i32::from(MIN_BASE_INTERVAL_MS),
-        i32::from(MAX_BASE_INTERVAL_MS),
-    ) as u16
+pub fn adjust_base_interval(current_ms: u32, delta_steps: i32) -> u32 {
+    let delta_ms = delta_steps
+        .unsigned_abs()
+        .saturating_mul(BASE_INTERVAL_STEP_MS);
+    if delta_steps.is_negative() {
+        current_ms
+            .saturating_sub(delta_ms)
+            .max(MIN_BASE_INTERVAL_MS)
+    } else {
+        current_ms.saturating_add(delta_ms)
+    }
+}
+
+/// Accelerate a direction delta when consecutive detents arrive quickly.
+pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32 {
+    let multiplier = if elapsed_ms.is_some_and(|elapsed| elapsed <= FAST_ENCODER_THRESHOLD_MS) {
+        FAST_ENCODER_MULTIPLIER
+    } else {
+        1
+    };
+    direction.saturating_mul(multiplier)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncoderAcceleration {
+    last_event: Option<(u64, Option<usize>, i32)>,
+}
+
+impl EncoderAcceleration {
+    pub const fn new() -> Self {
+        Self { last_event: None }
+    }
+
+    pub fn update(&mut self, now_ms: u64, selected_pad: Option<usize>, direction: i32) -> i32 {
+        let elapsed_ms = match self.last_event {
+            Some((last_ms, last_selected, last_direction))
+                if last_selected == selected_pad && last_direction == direction =>
+            {
+                now_ms.checked_sub(last_ms)
+            }
+            _ => None,
+        };
+        self.last_event = Some((now_ms, selected_pad, direction));
+        accelerated_encoder_delta(direction, elapsed_ms)
+    }
 }
 
 /// Apply one or more encoder steps to the currently selected timing control.
@@ -860,6 +899,25 @@ mod tests {
     }
 
     #[test]
+    fn long_base_interval_supports_large_polyrhythm_divisions() {
+        let kick_bytes = wav(&[1], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 71;
+        beats[6] = 73;
+
+        // 71 divisions across 106.5 seconds gives exactly 40 BPM.
+        sequencer.apply_timing(&beats, 106_500, 0);
+        assert_eq!(sequencer.base_interval_ms(), 106_500);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(33_075));
+        assert_eq!(sequencer.pads()[6].next_frame, Some(32_169));
+    }
+
+    #[test]
     fn scheduler_is_safe_across_playback_frame_wrap() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
@@ -989,14 +1047,27 @@ mod tests {
         assert_eq!(adjust_base_interval(1_000, 1), 1_010);
         assert_eq!(adjust_base_interval(1_000, -1), 990);
         assert_eq!(adjust_base_interval(MIN_BASE_INTERVAL_MS, -1), 50);
-        assert_eq!(adjust_base_interval(MAX_BASE_INTERVAL_MS, 1), 5_000);
+        assert_eq!(adjust_base_interval(u32::MAX, 1), u32::MAX);
+        assert_eq!(accelerated_encoder_delta(1, None), 1);
+        assert_eq!(accelerated_encoder_delta(1, Some(76)), 1);
+        assert_eq!(accelerated_encoder_delta(1, Some(75)), 10);
+        assert_eq!(accelerated_encoder_delta(-1, Some(20)), -10);
+
+        let mut acceleration = EncoderAcceleration::new();
+        assert_eq!(acceleration.update(1_000, Some(3), 1), 1);
+        assert_eq!(acceleration.update(1_050, Some(3), 1), 10);
+        assert_eq!(acceleration.update(1_060, Some(4), 1), 1);
+        assert_eq!(acceleration.update(1_070, Some(4), -1), -1);
+        assert_eq!(acceleration.update(1_080, Some(4), -1), -10);
 
         let mut state = SharedState::default();
         apply_encoder_delta(&mut state, None, 1);
         assert_eq!(state.base_interval_ms, 1_010);
-        apply_encoder_delta(&mut state, Some(3), 1);
-        assert_eq!(state.desired_beats[3], 1);
-        assert_eq!(state.base_interval_ms, 1_010);
+        apply_encoder_delta(&mut state, None, 10);
+        assert_eq!(state.base_interval_ms, 1_110);
+        apply_encoder_delta(&mut state, Some(3), 10);
+        assert_eq!(state.desired_beats[3], 10);
+        assert_eq!(state.base_interval_ms, 1_110);
         assert_eq!(colorwheel(0), (255, 0, 0));
         assert_eq!(colorwheel(85), (0, 255, 0));
         assert_eq!(colorwheel(170), (0, 0, 255));

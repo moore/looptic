@@ -9,10 +9,15 @@ The first Rust milestone embeds the existing kick and open-hi-hat WAV files,
 runs twelve independent sequencer voices, and drives the MacroPad keys, rotary
 encoder, OLED, and NeoPixels. Keys select a pad; turning the encoder changes
 that pad's beat multiplier from 0 through 1000 triggers per base interval.
-With no key held, the encoder changes the global base interval from 50 through
-5000 ms in 10 ms steps; the default is 1000 ms. Clockwise increases the
-interval (slower), while counter-clockwise decreases it (faster). Pads 0–5 use
-the kick sample and pads 6–11 use the open hi-hat.
+With no key held, the encoder changes the global base interval, starting at
+1000 ms with a 50 ms safety minimum and no application-level maximum. Slow
+turns change the interval by 10 ms and pad multipliers by 1; consecutive
+detents within 75 ms accelerate both controls by 10x. Clockwise increases the
+interval (slower), while counter-clockwise decreases it (faster). For example,
+a 106,500 ms base interval with pad values 71 and 73 gives a 71:73 polyrhythm
+whose 71 side is exactly 40 BPM. Pads 0–5 use the kick sample and pads 6–11 use
+the open hi-hat. The interval uses a saturating `u32` millisecond value, whose
+representational limit is about 49.7 days.
 
 ## Audio hardware
 
