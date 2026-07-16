@@ -60,14 +60,28 @@ cargo firmware
 ```
 
 This is an alias for
-`cargo build --release --target thumbv6m-none-eabi`.
+`cargo build --release`. The project defaults all build commands to the
+`thumbv6m-none-eabi` firmware target.
+
+Inspect the firmware's code-size breakdown with `cargo-bloat`:
+
+```console
+cargo firmware-bloat
+```
+
+The project alias supplies the release profile, RP2040 target, and firmware
+binary automatically. Additional `cargo-bloat` options can be appended, such
+as `cargo firmware-bloat --crates`.
 
 Run the platform-independent parser, mixer, scheduler, and UI-state tests on
 the host:
 
 ```console
-cargo test
+cargo host-test
 ```
+
+The alias selects `x86_64-unknown-linux-gnu`, overriding the embedded default
+so Rust's standard test harness is available.
 
 Run the formatting and target checks used before flashing:
 
@@ -76,7 +90,26 @@ cargo fmt --check
 cargo clippy --release --target thumbv6m-none-eabi --bin looptic --locked -- -D warnings
 ```
 
-## Install with UF2/BOOTSEL
+## Flash over USB
+
+Put the MacroPad into its USB bootloader by holding BOOTSEL while connecting
+USB, or by holding BOOTSEL while pressing RESET. Once the `RPI-RP2` volume is
+mounted, run:
+
+```console
+cargo flash
+```
+
+The `flash` alias builds the optimized RP2040 ELF, and the configured
+`elf2uf2-rs deploy` runner converts and copies it to the USB bootloader. The
+board reboots into LoopTic when deployment completes. No SWD probe is needed.
+
+If the separate `probe-rs` `cargo-flash` subcommand is installed, Cargo may
+warn that this project's `flash` alias shadows it. The alias is intentional;
+`cargo run --release` performs the same USB deployment without that naming
+collision.
+
+## Create a UF2 manually
 
 Convert the release ELF to UF2:
 
@@ -86,21 +119,20 @@ elf2uf2-rs convert \
   looptic.uf2
 ```
 
-Hold the MacroPad's BOOTSEL button while connecting USB (or press RESET while
-holding BOOTSEL), then copy `looptic.uf2` to the mounted `RPI-RP2` volume. The
-board reboots into LoopTic after the copy completes.
+Copy `looptic.uf2` to the mounted `RPI-RP2` volume. This is equivalent to the
+automated `cargo flash` workflow.
 
 ## Install or debug with probe-rs
 
 Connect an SWD probe to the MacroPad debug pads and run:
 
 ```console
-cargo flash
+cargo firmware
+probe-rs run --chip RP2040 target/thumbv6m-none-eabi/release/looptic
 ```
 
-The `flash` alias selects the RP2040 target, and its Cargo runner is configured
-as `probe-rs run --chip RP2040`, so it flashes the ELF and displays `defmt` RTT
-output. A probe is optional and is not needed for UF2 installation.
+This flashes the ELF and displays `defmt` RTT output. A probe is optional and
+is not needed for USB deployment.
 
 ## Hardware verification
 
