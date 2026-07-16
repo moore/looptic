@@ -8,9 +8,11 @@
 pub const PAD_COUNT: usize = 12;
 pub const SAMPLE_RATE: u32 = 22_050;
 pub const AUDIO_BLOCK_FRAMES: usize = 128;
-pub const MAX_BEAT_MULTIPLIER: u16 = 1_000;
+pub const MAX_BEAT_MULTIPLIER: u16 = 2_048;
+pub const PATTERN_BITS: usize = 2_048;
+pub const PATTERN_BYTES: usize = PATTERN_BITS / 8;
 pub const DEFAULT_BASE_INTERVAL_MS: u32 = 1_000;
-// At 50 ms, the maximum multiplier produces 20 kHz: still below the audio clock.
+// Faster-than-audio trigger grids are coalesced to one trigger per sample frame.
 pub const MIN_BASE_INTERVAL_MS: u32 = 50;
 pub const BASE_INTERVAL_STEP_MS: u32 = 10;
 pub const FAST_ENCODER_MULTIPLIER: i32 = 10;
@@ -27,6 +29,101 @@ const PWM_DITHER_CYCLES: u32 = 16;
 
 /// Centered PWM command used while no PCM data is available.
 pub const SILENCE_PWM_WORD: u32 = 64 | (63 << 7);
+
+/// A fixed-resolution pattern spanning one complete base interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pattern {
+    bits: [u8; PATTERN_BYTES],
+}
+
+impl Pattern {
+    pub const fn all_enabled() -> Self {
+        Self {
+            bits: [u8::MAX; PATTERN_BYTES],
+        }
+    }
+
+    pub fn bit(&self, index: usize) -> Option<bool> {
+        (index < PATTERN_BITS).then(|| self.bits[index / 8] & (1 << (index % 8)) != 0)
+    }
+
+    pub fn set_bit(&mut self, index: usize, enabled: bool) -> bool {
+        if index >= PATTERN_BITS {
+            return false;
+        }
+        let mask = 1 << (index % 8);
+        if enabled {
+            self.bits[index / 8] |= mask;
+        } else {
+            self.bits[index / 8] &= !mask;
+        }
+        true
+    }
+
+    pub fn step_enabled(&self, step: u16, division: u16) -> Option<bool> {
+        let (start, _) = pattern_step_range(step, division)?;
+        self.bit(start)
+    }
+
+    pub fn set_step_enabled(&mut self, step: u16, division: u16, enabled: bool) -> bool {
+        let Some((start, end)) = pattern_step_range(step, division) else {
+            return false;
+        };
+
+        let first_byte = start / 8;
+        let last_byte = (end - 1) / 8;
+        let first_mask = u8::MAX << (start % 8);
+        let last_width = (end - 1) % 8 + 1;
+        let last_mask = u8::MAX >> (8 - last_width);
+
+        if first_byte == last_byte {
+            set_masked_bits(&mut self.bits[first_byte], first_mask & last_mask, enabled);
+            return true;
+        }
+
+        set_masked_bits(&mut self.bits[first_byte], first_mask, enabled);
+        self.bits[first_byte + 1..last_byte].fill(if enabled { u8::MAX } else { 0 });
+        set_masked_bits(&mut self.bits[last_byte], last_mask, enabled);
+        true
+    }
+
+    pub fn fill(&mut self, enabled: bool) {
+        self.bits.fill(if enabled { u8::MAX } else { 0 });
+    }
+}
+
+fn set_masked_bits(byte: &mut u8, mask: u8, enabled: bool) {
+    if enabled {
+        *byte |= mask;
+    } else {
+        *byte &= !mask;
+    }
+}
+
+impl Pattern {
+    pub fn toggle_step(&mut self, step: u16, division: u16) -> Option<bool> {
+        let enabled = !self.step_enabled(step, division)?;
+        self.set_step_enabled(step, division, enabled);
+        Some(enabled)
+    }
+}
+
+impl Default for Pattern {
+    fn default() -> Self {
+        Self::all_enabled()
+    }
+}
+
+pub fn pattern_step_range(step: u16, division: u16) -> Option<(usize, usize)> {
+    if division == 0 || division > MAX_BEAT_MULTIPLIER || step >= division {
+        return None;
+    }
+    let division = usize::from(division);
+    let step = usize::from(step);
+    let start = step * PATTERN_BITS / division;
+    let end = (step + 1) * PATTERN_BITS / division;
+    Some((start, end))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WavError {
@@ -226,7 +323,7 @@ impl Voice {
 #[derive(Clone, Copy, Debug)]
 pub struct PadState {
     pub beats_per_interval: u16,
-    pub tick_ordinal: u64,
+    pub tick_ordinal: u128,
     pub next_frame: Option<u64>,
     pub voice: Voice,
 }
@@ -293,6 +390,7 @@ impl DitherEncoder {
 pub struct Sequencer<'a> {
     samples: [WavPcm16<'a>; SAMPLE_COUNT],
     pads: [PadState; PAD_COUNT],
+    patterns: [Pattern; PAD_COUNT],
     base_interval_ms: u32,
     dither: DitherEncoder,
 }
@@ -302,6 +400,7 @@ impl<'a> Sequencer<'a> {
         Self {
             samples: [kick, open_hat],
             pads: core::array::from_fn(PadState::new),
+            patterns: [Pattern::all_enabled(); PAD_COUNT],
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             dither: DitherEncoder::new(),
         }
@@ -313,6 +412,18 @@ impl<'a> Sequencer<'a> {
 
     pub const fn base_interval_ms(&self) -> u32 {
         self.base_interval_ms
+    }
+
+    pub fn set_pattern(&mut self, pad: usize, pattern: Pattern) -> bool {
+        let Some(destination) = self.patterns.get_mut(pad) else {
+            return false;
+        };
+        *destination = pattern;
+        true
+    }
+
+    pub fn pattern(&self, pad: usize) -> Option<&Pattern> {
+        self.patterns.get(pad)
     }
 
     /// Apply the base interval and per-pad beat multipliers at a render boundary.
@@ -366,10 +477,26 @@ impl<'a> Sequencer<'a> {
         let mut sample_triggered = [false; SAMPLE_COUNT];
 
         for (pad_index, pad) in self.pads.iter_mut().enumerate() {
-            if pad
+            let mut enabled_step_due = false;
+            while pad
                 .next_frame
                 .is_some_and(|next| frame_has_reached(frame, next))
             {
+                let division = pad.beats_per_interval;
+                let logical_step = pad.tick_ordinal.wrapping_sub(1) % u128::from(division);
+                enabled_step_due |= self.patterns[pad_index]
+                    .step_enabled(logical_step as u16, division)
+                    .unwrap_or(false);
+
+                pad.tick_ordinal = pad.tick_ordinal.wrapping_add(1);
+                pad.next_frame = Some(frame_for_tick(
+                    pad.tick_ordinal,
+                    division,
+                    self.base_interval_ms,
+                ));
+            }
+
+            if enabled_step_due {
                 report.latest_visual_triggers[pad_index] = Some(frame);
                 let sample_index = pad.voice.sample.index();
                 if !sample_triggered[sample_index] {
@@ -378,13 +505,6 @@ impl<'a> Sequencer<'a> {
                     report.audible_trigger_counts[sample_index] =
                         report.audible_trigger_counts[sample_index].saturating_add(1);
                 }
-
-                pad.tick_ordinal = pad.tick_ordinal.wrapping_add(1);
-                pad.next_frame = Some(frame_for_tick(
-                    pad.tick_ordinal,
-                    pad.beats_per_interval,
-                    self.base_interval_ms,
-                ));
             }
         }
 
@@ -396,18 +516,17 @@ impl<'a> Sequencer<'a> {
     }
 }
 
-fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
+fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u32) -> u128 {
     let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
     let denominator = u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
-    let ordinal = numerator / denominator + 1;
-    ordinal as u64
+    numerator / denominator + 1
 }
 
-fn frame_for_tick(ordinal: u64, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
+fn frame_for_tick(ordinal: u128, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
     if beats_per_interval == 0 {
         return u64::MAX;
     }
-    let numerator = u128::from(ordinal) * u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
+    let numerator = ordinal * u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
     let denominator = 1_000 * u128::from(beats_per_interval);
     numerator.div_ceil(denominator) as u64
 }
@@ -438,6 +557,9 @@ pub struct SharedState {
     pub playback_frame: u64,
     pub latest_trigger_frames: [u64; PAD_COUNT],
     pub underrun_count: u32,
+    patterns: [Pattern; PAD_COUNT],
+    pattern_dirty_mask: u16,
+    pub pattern_revision: u32,
 }
 
 impl Default for SharedState {
@@ -449,7 +571,30 @@ impl Default for SharedState {
             playback_frame: 0,
             latest_trigger_frames: [0; PAD_COUNT],
             underrun_count: 0,
+            patterns: [Pattern::all_enabled(); PAD_COUNT],
+            pattern_dirty_mask: 0,
+            pattern_revision: 0,
         }
+    }
+}
+
+impl SharedState {
+    pub fn pattern(&self, pad: usize) -> Option<&Pattern> {
+        self.patterns.get(pad)
+    }
+
+    pub fn toggle_pattern_step(&mut self, pad: usize, step: u16) -> Option<bool> {
+        let division = *self.desired_beats.get(pad)?;
+        let enabled = self.patterns.get_mut(pad)?.toggle_step(step, division)?;
+        self.pattern_dirty_mask |= 1 << pad;
+        self.pattern_revision = self.pattern_revision.wrapping_add(1);
+        Some(enabled)
+    }
+
+    pub fn take_pattern_dirty_mask(&mut self) -> u16 {
+        let dirty = self.pattern_dirty_mask;
+        self.pattern_dirty_mask = 0;
+        dirty
     }
 }
 
@@ -506,7 +651,7 @@ impl KeyDebouncer {
     }
 }
 
-/// Tracks the most recently pressed key that is still held.
+/// Tracks the oldest pressed key that is still held as the primary pad.
 pub struct HeldPadSelection {
     held_mask: u16,
     press_order: [u32; PAD_COUNT],
@@ -540,14 +685,18 @@ impl HeldPadSelection {
 
     pub fn selected(&self) -> Option<usize> {
         let mut selected = None;
-        let mut newest = 0_u32;
+        let mut oldest = u32::MAX;
         for pad in 0..PAD_COUNT {
-            if self.held_mask & (1 << pad) != 0 && self.press_order[pad] >= newest {
-                newest = self.press_order[pad];
+            if self.held_mask & (1 << pad) != 0 && self.press_order[pad] < oldest {
+                oldest = self.press_order[pad];
                 selected = Some(pad);
             }
         }
         selected
+    }
+
+    pub const fn held_mask(&self) -> u16 {
+        self.held_mask
     }
 
     fn renumber(&mut self) {
@@ -593,6 +742,81 @@ pub fn adjust_led_brightness(current_percent: u8, delta: i32) -> u8 {
         .clamp(0, 100) as u8
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatternEditorAction {
+    Entered,
+    Toggle { pad: usize, step: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PatternEditorState {
+    pub active: bool,
+    pub cursor: u16,
+}
+
+impl PatternEditorState {
+    pub const fn new() -> Self {
+        Self {
+            active: false,
+            cursor: 0,
+        }
+    }
+
+    pub fn update_primary(&mut self, primary: Option<usize>, division: u16) {
+        if primary.is_none() {
+            self.active = false;
+            self.cursor = 0;
+        } else if self.active {
+            self.cursor = wrap_pattern_cursor(self.cursor, division, 0);
+        }
+    }
+
+    pub fn button_pressed(
+        &mut self,
+        primary: Option<usize>,
+        division: u16,
+    ) -> Option<PatternEditorAction> {
+        let pad = primary?;
+        if !self.active {
+            self.active = true;
+            self.cursor = 0;
+            return Some(PatternEditorAction::Entered);
+        }
+        if division == 0 {
+            return None;
+        }
+        self.cursor %= division;
+        Some(PatternEditorAction::Toggle {
+            pad,
+            step: self.cursor,
+        })
+    }
+
+    pub fn scroll(&mut self, division: u16, delta: i32) {
+        if self.active {
+            self.cursor = wrap_pattern_cursor(self.cursor, division, delta);
+        }
+    }
+}
+
+pub fn wrap_pattern_cursor(cursor: u16, division: u16, delta: i32) -> u16 {
+    if division == 0 {
+        return 0;
+    }
+    i32::from(cursor)
+        .saturating_add(delta)
+        .rem_euclid(i32::from(division)) as u16
+}
+
+pub fn pattern_window_start(cursor: u16, division: u16, visible_rows: u16) -> u16 {
+    if visible_rows == 0 || division <= visible_rows {
+        return 0;
+    }
+    cursor
+        .saturating_sub(visible_rows / 2)
+        .min(division - visible_rows)
+}
+
 /// Accelerate a direction delta when consecutive detents arrive quickly.
 pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32 {
     let multiplier = if elapsed_ms.is_some_and(|elapsed| elapsed <= FAST_ENCODER_THRESHOLD_MS) {
@@ -608,11 +832,17 @@ pub enum EncoderTarget {
     BaseInterval,
     LedBrightness,
     Pad(usize),
+    PatternStep(usize),
 }
 
 impl EncoderTarget {
-    pub const fn for_controls(selected_pad: Option<usize>, encoder_pressed: bool) -> Self {
+    pub const fn for_controls(
+        selected_pad: Option<usize>,
+        encoder_pressed: bool,
+        pattern_mode: bool,
+    ) -> Self {
         match selected_pad {
+            Some(pad) if pattern_mode => Self::PatternStep(pad),
             Some(pad) => Self::Pad(pad),
             None if encoder_pressed => Self::LedBrightness,
             None => Self::BaseInterval,
@@ -650,7 +880,7 @@ pub fn apply_encoder_delta(state: &mut SharedState, target: EncoderTarget, delta
         EncoderTarget::Pad(pad) if pad < PAD_COUNT => {
             state.desired_beats[pad] = adjust_beat_multiplier(state.desired_beats[pad], delta);
         }
-        EncoderTarget::Pad(_) => {}
+        EncoderTarget::Pad(_) | EncoderTarget::PatternStep(_) => {}
         EncoderTarget::BaseInterval => {
             state.base_interval_ms = adjust_base_interval(state.base_interval_ms, delta);
         }
@@ -878,6 +1108,65 @@ mod tests {
     }
 
     #[test]
+    fn patterns_use_a_fixed_2048_bit_phase_grid() {
+        assert_eq!(core::mem::size_of::<Pattern>(), PATTERN_BYTES);
+
+        let pattern = Pattern::default();
+        assert_eq!(pattern.bit(0), Some(true));
+        assert_eq!(pattern.bit(PATTERN_BITS - 1), Some(true));
+        assert_eq!(pattern.bit(PATTERN_BITS), None);
+
+        assert_eq!(pattern_step_range(0, 1), Some((0, PATTERN_BITS)));
+        assert_eq!(pattern_step_range(0, 3), Some((0, 682)));
+        assert_eq!(pattern_step_range(1, 3), Some((682, 1_365)));
+        assert_eq!(pattern_step_range(2, 3), Some((1_365, PATTERN_BITS)));
+        assert_eq!(pattern_step_range(731, 2_048), Some((731, 732)));
+        assert_eq!(pattern_step_range(0, 0), None);
+        assert_eq!(pattern_step_range(3, 3), None);
+    }
+
+    #[test]
+    fn pattern_edits_fill_ranges_and_resample_their_first_bits() {
+        let mut pattern = Pattern::default();
+        assert_eq!(pattern.toggle_step(0, 2), Some(false));
+
+        // Turning off the first half at division 2 also turns off the first
+        // two entries when the same fixed grid is sampled at division 4.
+        assert_eq!(pattern.step_enabled(0, 4), Some(false));
+        assert_eq!(pattern.step_enabled(1, 4), Some(false));
+        assert_eq!(pattern.step_enabled(2, 4), Some(true));
+        assert_eq!(pattern.step_enabled(3, 4), Some(true));
+        assert_eq!(pattern.bit(1_023), Some(false));
+        assert_eq!(pattern.bit(1_024), Some(true));
+
+        // A later coarse edit replaces every finer bit in that logical range.
+        assert!(pattern.set_step_enabled(1, 3, false));
+        for bit in 682..1_365 {
+            assert_eq!(pattern.bit(bit), Some(false));
+        }
+        assert_eq!(pattern.toggle_step(1, 3), Some(true));
+        for bit in 682..1_365 {
+            assert_eq!(pattern.bit(bit), Some(true));
+        }
+    }
+
+    #[test]
+    fn shared_patterns_track_audio_sync_and_display_revisions() {
+        let mut state = SharedState::default();
+        state.desired_beats[2] = 4;
+
+        assert_eq!(state.toggle_pattern_step(2, 1), Some(false));
+        assert_eq!(state.pattern_revision, 1);
+        assert_eq!(state.pattern(2).unwrap().step_enabled(1, 4), Some(false));
+        assert_eq!(state.take_pattern_dirty_mask(), 1 << 2);
+        assert_eq!(state.take_pattern_dirty_mask(), 0);
+
+        assert_eq!(state.toggle_pattern_step(2, 4), None);
+        assert_eq!(state.pattern_revision, 1);
+        assert_eq!(state.take_pattern_dirty_mask(), 0);
+    }
+
+    #[test]
     fn scheduling_is_global_phase_aligned_and_zero_stops_new_triggers() {
         let kick_bytes = wav(&[1, 2, 3], false);
         let hat_bytes = wav(&[4, 5, 6], false);
@@ -905,6 +1194,34 @@ mod tests {
         beats[0] = 0;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 10_001);
         assert_eq!(sequencer.pads()[0].next_frame, None);
+    }
+
+    #[test]
+    fn disabled_pattern_ticks_advance_without_triggering_audio_or_visuals() {
+        let kick_bytes = wav(&[100], false);
+        let hat_bytes = wav(&[200], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut pattern = Pattern::default();
+        assert!(pattern.set_step_enabled(0, 4, false));
+        assert!(sequencer.set_pattern(0, pattern));
+
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 4;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+
+        let mut output = [0_u32; 1];
+        let disabled = sequencer.render(5_513, &mut output);
+        assert_eq!(disabled.latest_visual_triggers[0], None);
+        assert_eq!(disabled.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(11_025));
+
+        let enabled = sequencer.render(11_025, &mut output);
+        assert_eq!(enabled.latest_visual_triggers[0], Some(11_025));
+        assert_eq!(enabled.audible_trigger_counts[0], 1);
     }
 
     #[test]
@@ -989,9 +1306,41 @@ mod tests {
         sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
 
         let mut output = [0_u32; AUDIO_BLOCK_FRAMES];
-        sequencer.render(0, &mut output);
+        let report = sequencer.render(0, &mut output);
         let next = sequencer.pads()[0].next_frame.unwrap();
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 236);
+        assert_eq!(report.audible_trigger_counts[0], 127);
         assert!(!frame_has_reached((AUDIO_BLOCK_FRAMES - 1) as u64, next));
+    }
+
+    #[test]
+    fn coalesced_ticks_trigger_when_any_due_pattern_entry_is_enabled() {
+        let kick_bytes = wav(&[1], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut pattern = Pattern::default();
+        pattern.fill(false);
+        assert!(pattern.set_step_enabled(2, MAX_BEAT_MULTIPLIER, true));
+        assert!(sequencer.set_pattern(0, pattern));
+
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = MAX_BEAT_MULTIPLIER;
+        sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
+
+        let mut output = [0_u32; 1];
+        let first_frame = sequencer.render(1, &mut output);
+        assert_eq!(first_frame.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
+
+        // Ordinals 2 and 3 both land on frame 2. Step 1 is disabled and
+        // step 2 is enabled, so the pair coalesces into exactly one trigger.
+        let coalesced = sequencer.render(2, &mut output);
+        assert_eq!(coalesced.latest_visual_triggers[0], Some(2));
+        assert_eq!(coalesced.audible_trigger_counts[0], 1);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 4);
     }
 
     #[test]
@@ -1054,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_debounce_and_selection_falls_back_to_previous_held_pad() {
+    fn keys_debounce_and_oldest_held_pad_remains_primary() {
         let mut debounce = KeyDebouncer::new(3);
         assert_eq!(debounce.update(1), KeyChanges::default());
         assert_eq!(debounce.update(1), KeyChanges::default());
@@ -1068,12 +1417,13 @@ mod tests {
             pressed: 1 << 4,
             released: 0,
         });
-        assert_eq!(selection.selected(), Some(4));
+        assert_eq!(selection.selected(), Some(0));
+        assert_eq!(selection.held_mask(), (1 << 0) | (1 << 4));
         selection.apply(KeyChanges {
             pressed: 0,
-            released: 1 << 4,
+            released: 1 << 0,
         });
-        assert_eq!(selection.selected(), Some(0));
+        assert_eq!(selection.selected(), Some(4));
 
         assert_eq!(debounce.update(0), KeyChanges::default());
         assert_eq!(debounce.update(0), KeyChanges::default());
@@ -1081,9 +1431,64 @@ mod tests {
     }
 
     #[test]
+    fn pattern_editor_enters_then_toggles_and_resets_only_when_all_keys_are_up() {
+        let mut editor = PatternEditorState::new();
+        editor.update_primary(Some(2), 4);
+        assert_eq!(
+            editor.button_pressed(Some(2), 4),
+            Some(PatternEditorAction::Entered)
+        );
+        assert!(editor.active);
+
+        editor.scroll(4, 1);
+        assert_eq!(editor.cursor, 1);
+        assert_eq!(
+            editor.button_pressed(Some(2), 4),
+            Some(PatternEditorAction::Toggle { pad: 2, step: 1 })
+        );
+        editor.scroll(4, 10);
+        assert_eq!(editor.cursor, 3);
+
+        // A later-held pad becomes primary only after the older key is
+        // released; pattern mode itself persists until every key is released.
+        editor.update_primary(Some(7), 2);
+        assert!(editor.active);
+        assert_eq!(editor.cursor, 1);
+        assert_eq!(
+            editor.button_pressed(Some(7), 2),
+            Some(PatternEditorAction::Toggle { pad: 7, step: 1 })
+        );
+
+        editor.update_primary(Some(7), 0);
+        assert!(editor.active);
+        assert_eq!(editor.cursor, 0);
+        assert_eq!(editor.button_pressed(Some(7), 0), None);
+
+        editor.update_primary(None, 0);
+        assert_eq!(editor, PatternEditorState::new());
+    }
+
+    #[test]
+    fn pattern_cursor_wraps_and_display_window_tracks_it() {
+        assert_eq!(wrap_pattern_cursor(0, 8, -1), 7);
+        assert_eq!(wrap_pattern_cursor(7, 8, 1), 0);
+        assert_eq!(wrap_pattern_cursor(1, 8, 10), 3);
+        assert_eq!(wrap_pattern_cursor(123, 0, 10), 0);
+
+        assert_eq!(pattern_window_start(0, 12, 5), 0);
+        assert_eq!(pattern_window_start(4, 12, 5), 2);
+        assert_eq!(pattern_window_start(11, 12, 5), 7);
+        assert_eq!(pattern_window_start(3, 4, 5), 0);
+        assert_eq!(pattern_window_start(3, 12, 0), 0);
+    }
+
+    #[test]
     fn timing_palette_and_led_helpers_are_bounded() {
         assert_eq!(adjust_beat_multiplier(0, -1), 0);
-        assert_eq!(adjust_beat_multiplier(999, 10), MAX_BEAT_MULTIPLIER);
+        assert_eq!(
+            adjust_beat_multiplier(MAX_BEAT_MULTIPLIER - 1, 10),
+            MAX_BEAT_MULTIPLIER
+        );
         assert_eq!(adjust_base_interval(1_000, 1), 1_010);
         assert_eq!(adjust_base_interval(1_000, -1), 990);
         assert_eq!(adjust_base_interval(MIN_BASE_INTERVAL_MS, -1), 50);
@@ -1094,16 +1499,20 @@ mod tests {
         assert_eq!(accelerated_encoder_delta(-1, Some(20)), -10);
 
         assert_eq!(
-            EncoderTarget::for_controls(None, false),
+            EncoderTarget::for_controls(None, false, false),
             EncoderTarget::BaseInterval
         );
         assert_eq!(
-            EncoderTarget::for_controls(None, true),
+            EncoderTarget::for_controls(None, true, false),
             EncoderTarget::LedBrightness
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true),
+            EncoderTarget::for_controls(Some(3), true, false),
             EncoderTarget::Pad(3)
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), true, true),
+            EncoderTarget::PatternStep(3)
         );
 
         let mut acceleration = EncoderAcceleration::new();

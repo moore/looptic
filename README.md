@@ -7,20 +7,45 @@ from the original CircuitPython prototype to Rust using
 
 The first Rust milestone embeds the existing kick and open-hi-hat WAV files,
 runs twelve independent sequencer voices, and drives the MacroPad keys, rotary
-encoder, OLED, and NeoPixels. Keys select a pad; turning the encoder changes
-that pad's beat multiplier from 0 through 1000 triggers per base interval.
-With no key held, the encoder changes the global base interval, starting at
-1000 ms with a 50 ms safety minimum and no application-level maximum. Slow
-turns change the interval by 10 ms and pad multipliers by 1; consecutive
-detents within 75 ms accelerate both controls by 10x. Clockwise increases the
-interval (slower), while counter-clockwise decreases it (faster). For example,
-a 106,500 ms base interval with pad values 71 and 73 gives a 71:73 polyrhythm
-whose 71 side is exactly 40 BPM. Pads 0–5 use the kick sample and pads 6–11 use
-the open hi-hat. The interval uses a saturating `u32` millisecond value, whose
-representational limit is about 49.7 days. With no pad selected, hold the
-encoder button while turning to adjust key NeoPixel brightness from 0 through
-100%; brightness starts at 50%, and slow and fast turns change it by 1% and
-10%, respectively.
+encoder, OLED, and NeoPixels. Pads 0–5 use the kick sample and pads 6–11 use
+the open hi-hat.
+
+## Controls and patterns
+
+Hold a key and turn the encoder to change that pad's beat division from 0
+through 2048 trigger points per base interval. If several keys overlap, the
+first (oldest) currently held key is primary. Later keys are ignored while
+that key remains held; after it is released, the oldest remaining held key
+becomes primary.
+
+While a key is held, press the encoder button once to enter pattern mode. The
+OLED becomes a scrolling list with one entry per trigger point, and turning
+the encoder moves the selection. Subsequent encoder-button presses toggle the
+selected trigger off or on. Pattern mode remains active while any key is held
+and exits only after all keys are released. A division of 0 displays no
+triggers, so scrolling and toggling have no effect.
+
+Each pad has a fixed 2048-bit (256-byte) pattern in RAM, initially with every
+bit enabled. Editing a trigger at a division below 2048 fills that trigger's
+proportional range on the fixed grid. Changing the division does not rescale
+or rewrite the stored pattern: playback maps each new trigger range onto the
+same grid and samples its first bit. This lets a pattern be viewed at other
+divisions without an interpolation step.
+
+With no key held, turning the encoder changes the global base interval,
+starting at 1000 ms with a 50 ms safety minimum and no application-level
+maximum. Holding the encoder button while turning instead adjusts key
+NeoPixel brightness from 0 through 100%; brightness starts at 50%. Slow turns
+change the interval by 10 ms, a pad division by 1, or brightness by 1%;
+consecutive detents within 75 ms accelerate those changes to 100 ms, 10, or
+10%, respectively. Clockwise increases the interval (slower) and the selected
+value, while counter-clockwise decreases it (faster). For example, a
+106,500 ms base interval with pad values 71 and 73 gives a 71:73 polyrhythm
+whose 71 side is exactly 40 BPM. The interval uses a saturating `u32`
+millisecond value, whose representational limit is about 49.7 days. At extreme
+settings such as a 50 ms interval with division 2048, several trigger points
+can fall on one audio frame; they intentionally coalesce into one trigger for
+that pad on that frame.
 
 ## Audio hardware
 
@@ -150,12 +175,20 @@ is not needed for USB deployment.
 
 After flashing, verify all twelve keys, both encoder directions, the complete
 OLED image, each NeoPixel color and brightness range, and the kick/hat split.
-Verify that holding the encoder button changes brightness only when no pad is
-selected. Exercise all pads
-while turning the encoder and confirm GP13 remains off; a latched red LED means
-firmware initialization failed or the audio PIO FIFO stalled. For audio timing
-validation, set the base interval to 1000 ms, record a `Beat 1` pattern for 60
-seconds, and check that it remains within 0.02% of one trigger per second.
+Hold overlapping keys and verify that only the oldest held key is edited until
+it is released. Enter pattern mode, scroll its OLED list, toggle several
+entries, and verify that the mode persists across a change of primary key but
+exits once every key is released. Check that division 0 shows no trigger
+entries, that patterns start fully enabled after boot, and that edits made at
+one division are sampled consistently after changing the division. Verify
+that holding the encoder button changes brightness only when no pad is
+selected. Exercise all pads while turning the encoder and updating patterns,
+and confirm GP13 remains off; a latched red LED means firmware initialization
+failed or the audio PIO FIFO stalled. At the 50 ms/2048 extreme, coalesced
+triggers are expected and are not an underrun. For audio timing validation,
+set the base interval to 1000 ms, leave a `Beat 1` pattern enabled, record it
+for 60 seconds, and check that it remains within 0.02% of one trigger per
+second.
 
 The Rust firmware keeps the two WAV files embedded in flash, so no filesystem
 copy step is required. The sample files remain in the repository as the audio

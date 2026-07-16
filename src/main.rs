@@ -43,8 +43,9 @@ use fixed::types::U24F8;
 use heapless::String;
 use looptic::{
     AUDIO_BLOCK_FRAMES, EncoderAcceleration, EncoderTarget, HeldPadSelection, KeyDebouncer,
-    PAD_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, WavPcm16,
-    apply_encoder_delta, colorwheel, led_pulse_active, scale_color,
+    PAD_COUNT, PatternEditorAction, PatternEditorState, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer,
+    SharedState, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active, pattern_window_start,
+    scale_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -65,6 +66,7 @@ type UiShared = Mutex<CriticalSectionRawMutex, RefCell<UiState>>;
 struct UiState {
     selected_pad: Option<usize>,
     encoder_pressed: bool,
+    pattern_editor: PatternEditorState,
 }
 
 struct OledResources {
@@ -168,6 +170,7 @@ async fn audio_task(
         (state.desired_beats, state.base_interval_ms)
     });
     sequencer.apply_timing(&initial_beats, initial_base_interval, front_start);
+    sync_pattern_updates(shared, &mut sequencer);
     let report = sequencer.render(front_start, front);
     publish_render(shared, &report);
 
@@ -188,6 +191,7 @@ async fn audio_task(
             (state.desired_beats, state.base_interval_ms)
         });
         sequencer.apply_timing(&beats, base_interval, back_start);
+        sync_pattern_updates(shared, &mut sequencer);
         let report = sequencer.render(back_start, back);
         publish_render(shared, &report);
 
@@ -204,6 +208,20 @@ async fn audio_task(
         shared.lock(|state| state.borrow_mut().playback_frame = front_start);
         mem::swap(&mut front, &mut back);
     }
+}
+
+fn sync_pattern_updates(shared: &Shared, sequencer: &mut Sequencer<'_>) {
+    shared.lock(|state| {
+        let mut state = state.borrow_mut();
+        let dirty = state.take_pattern_dirty_mask();
+        for pad in 0..PAD_COUNT {
+            if dirty & (1 << pad) != 0
+                && let Some(pattern) = state.pattern(pad).copied()
+            {
+                sequencer.set_pattern(pad, pattern);
+            }
+        }
+    });
 }
 
 fn publish_render(shared: &Shared, report: &looptic::RenderReport) {
@@ -234,18 +252,29 @@ async fn controls_task(
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
             let ui_state = ui.lock(|state| *state.borrow());
-            let target =
-                EncoderTarget::for_controls(ui_state.selected_pad, ui_state.encoder_pressed);
+            let target = EncoderTarget::for_controls(
+                ui_state.selected_pad,
+                ui_state.encoder_pressed,
+                ui_state.pattern_editor.active,
+            );
             let direction_delta = match direction {
                 Direction::Clockwise => 1,
                 Direction::CounterClockwise => -1,
             };
             let delta =
                 encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta);
-            shared.lock(|state| {
-                let mut state = state.borrow_mut();
-                apply_encoder_delta(&mut state, target, delta);
-            });
+            match target {
+                EncoderTarget::PatternStep(pad) => {
+                    let division = shared.lock(|state| state.borrow().desired_beats[pad]);
+                    ui.lock(|state| {
+                        state.borrow_mut().pattern_editor.scroll(division, delta);
+                    });
+                }
+                _ => shared.lock(|state| {
+                    let mut state = state.borrow_mut();
+                    apply_encoder_delta(&mut state, target, delta);
+                }),
+            }
         }
 
         let now = Instant::now();
@@ -259,13 +288,28 @@ async fn controls_task(
 
             let changes = debouncer.update(raw_mask);
             selection.apply(changes);
-            encoder_button_debouncer.update(u16::from(encoder_button.is_low()));
+            let button_changes =
+                encoder_button_debouncer.update(u16::from(encoder_button.is_low()));
             let encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
-            ui.lock(|state| {
-                let mut state = state.borrow_mut();
-                state.selected_pad = selection.selected();
-                state.encoder_pressed = encoder_pressed;
+            let primary = selection.selected();
+            let division = primary.map_or(0, |pad| {
+                shared.lock(|state| state.borrow().desired_beats[pad])
             });
+            let mut next_ui = ui.lock(|state| *state.borrow());
+            next_ui.selected_pad = primary;
+            next_ui.encoder_pressed = encoder_pressed;
+            next_ui.pattern_editor.update_primary(primary, division);
+            let editor_action = if button_changes.pressed & 1 != 0 {
+                next_ui.pattern_editor.button_pressed(primary, division)
+            } else {
+                None
+            };
+            if let Some(PatternEditorAction::Toggle { pad, step }) = editor_action {
+                shared.lock(|state| {
+                    state.borrow_mut().toggle_pattern_step(pad, step);
+                });
+            }
+            ui.lock(|state| *state.borrow_mut() = next_ui);
 
             next_scan += KEY_SCAN_INTERVAL;
             if next_scan <= now {
@@ -317,6 +361,67 @@ async fn led_task(
     }
 }
 
+fn draw_pattern_editor<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    shared: &Shared,
+    pad: usize,
+    cursor: u16,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    const VISIBLE_ROWS: u16 = 5;
+    let (division, cursor, window_start, enabled_rows) = shared.lock(|state| {
+        let state = state.borrow();
+        let division = state.desired_beats[pad];
+        let cursor = if division == 0 { 0 } else { cursor % division };
+        let window_start = pattern_window_start(cursor, division, VISIBLE_ROWS);
+        let mut enabled_rows = [false; VISIBLE_ROWS as usize];
+        if let Some(pattern) = state.pattern(pad) {
+            for row in 0..VISIBLE_ROWS {
+                let step = window_start + row;
+                if step < division {
+                    enabled_rows[usize::from(row)] =
+                        pattern.step_enabled(step, division).unwrap_or(false);
+                }
+            }
+        }
+        (division, cursor, window_start, enabled_rows)
+    });
+
+    let mut header: String<24> = String::new();
+    let _ = write!(&mut header, "LoopTic P{} {}", pad + 1, division);
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    if division == 0 {
+        let _ = Text::with_baseline("No triggers", Point::new(0, 16), style, Baseline::Top)
+            .draw(display);
+        return;
+    }
+
+    for row in 0..VISIBLE_ROWS {
+        let step = window_start + row;
+        if step >= division {
+            break;
+        }
+        let marker = if step == cursor { '>' } else { ' ' };
+        let state = if enabled_rows[usize::from(row)] {
+            "ON"
+        } else {
+            "off"
+        };
+        let mut line: String<16> = String::new();
+        let _ = write!(&mut line, "{} {:04} {}", marker, step + 1, state);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 14 + i32::from(row) * 10),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+}
+
 #[embassy_executor::task]
 async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'static UiShared) {
     let mut spi_config = spi::Config::default();
@@ -335,42 +440,68 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         }
     }
 
-    let mut last_value: Option<(EncoderTarget, u32)> = None;
+    let mut last_value: Option<(EncoderTarget, u32, u32)> = None;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let mut ticker = Ticker::every(DISPLAY_INTERVAL);
 
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
-        let target = EncoderTarget::for_controls(ui_state.selected_pad, ui_state.encoder_pressed);
-        let displayed_value = shared.lock(|state| {
+        let target = EncoderTarget::for_controls(
+            ui_state.selected_pad,
+            ui_state.encoder_pressed,
+            ui_state.pattern_editor.active,
+        );
+        let (displayed_value, pattern_revision) = shared.lock(|state| {
             let state = state.borrow();
             match target {
-                EncoderTarget::BaseInterval => state.base_interval_ms,
-                EncoderTarget::LedBrightness => u32::from(state.led_brightness_percent),
-                EncoderTarget::Pad(pad) => u32::from(state.desired_beats[pad]),
+                EncoderTarget::BaseInterval => (state.base_interval_ms, 0),
+                EncoderTarget::LedBrightness => (u32::from(state.led_brightness_percent), 0),
+                EncoderTarget::Pad(pad) => (u32::from(state.desired_beats[pad]), 0),
+                EncoderTarget::PatternStep(_) => (
+                    u32::from(ui_state.pattern_editor.cursor),
+                    state.pattern_revision,
+                ),
             }
         });
-        let value = (target, displayed_value);
+        let value = (target, displayed_value, pattern_revision);
 
         if last_value != Some(value) {
             display.clear();
-            let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                .draw(&mut display);
-
-            let mut line: String<24> = String::new();
             match target {
                 EncoderTarget::Pad(_) => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
                     let _ = write!(&mut line, "Beat {}", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
                 }
                 EncoderTarget::BaseInterval => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
                     let _ = write!(&mut line, "Base {} ms", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
                 }
                 EncoderTarget::LedBrightness => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
                     let _ = write!(&mut line, "Light {}%", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                EncoderTarget::PatternStep(pad) => {
+                    draw_pattern_editor(
+                        &mut display,
+                        style,
+                        shared,
+                        pad,
+                        ui_state.pattern_editor.cursor,
+                    );
                 }
             }
-            let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                .draw(&mut display);
 
             if display.flush().is_err() {
                 FATAL_FAULT.store(true, Ordering::Relaxed);
