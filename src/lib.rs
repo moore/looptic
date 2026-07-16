@@ -15,6 +15,7 @@ pub const MIN_BASE_INTERVAL_MS: u32 = 50;
 pub const BASE_INTERVAL_STEP_MS: u32 = 10;
 pub const FAST_ENCODER_MULTIPLIER: i32 = 10;
 pub const FAST_ENCODER_THRESHOLD_MS: u64 = 75;
+pub const DEFAULT_LED_BRIGHTNESS_PERCENT: u8 = 50;
 
 const SAMPLE_COUNT: usize = 2;
 const KICK_INDEX: usize = 0;
@@ -433,6 +434,7 @@ pub const fn saturating_i16(value: i32) -> i16 {
 pub struct SharedState {
     pub desired_beats: [u16; PAD_COUNT],
     pub base_interval_ms: u32,
+    pub led_brightness_percent: u8,
     pub playback_frame: u64,
     pub latest_trigger_frames: [u64; PAD_COUNT],
     pub underrun_count: u32,
@@ -443,6 +445,7 @@ impl Default for SharedState {
         Self {
             desired_beats: [0; PAD_COUNT],
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
+            led_brightness_percent: DEFAULT_LED_BRIGHTNESS_PERCENT,
             playback_frame: 0,
             latest_trigger_frames: [0; PAD_COUNT],
             underrun_count: 0,
@@ -584,6 +587,12 @@ pub fn adjust_base_interval(current_ms: u32, delta_steps: i32) -> u32 {
     }
 }
 
+pub fn adjust_led_brightness(current_percent: u8, delta: i32) -> u8 {
+    i32::from(current_percent)
+        .saturating_add(delta)
+        .clamp(0, 100) as u8
+}
+
 /// Accelerate a direction delta when consecutive detents arrive quickly.
 pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32 {
     let multiplier = if elapsed_ms.is_some_and(|elapsed| elapsed <= FAST_ENCODER_THRESHOLD_MS) {
@@ -594,9 +603,26 @@ pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32
     direction.saturating_mul(multiplier)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EncoderTarget {
+    BaseInterval,
+    LedBrightness,
+    Pad(usize),
+}
+
+impl EncoderTarget {
+    pub const fn for_controls(selected_pad: Option<usize>, encoder_pressed: bool) -> Self {
+        match selected_pad {
+            Some(pad) => Self::Pad(pad),
+            None if encoder_pressed => Self::LedBrightness,
+            None => Self::BaseInterval,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EncoderAcceleration {
-    last_event: Option<(u64, Option<usize>, i32)>,
+    last_event: Option<(u64, EncoderTarget, i32)>,
 }
 
 impl EncoderAcceleration {
@@ -604,31 +630,41 @@ impl EncoderAcceleration {
         Self { last_event: None }
     }
 
-    pub fn update(&mut self, now_ms: u64, selected_pad: Option<usize>, direction: i32) -> i32 {
+    pub fn update(&mut self, now_ms: u64, target: EncoderTarget, direction: i32) -> i32 {
         let elapsed_ms = match self.last_event {
-            Some((last_ms, last_selected, last_direction))
-                if last_selected == selected_pad && last_direction == direction =>
+            Some((last_ms, last_target, last_direction))
+                if last_target == target && last_direction == direction =>
             {
                 now_ms.checked_sub(last_ms)
             }
             _ => None,
         };
-        self.last_event = Some((now_ms, selected_pad, direction));
+        self.last_event = Some((now_ms, target, direction));
         accelerated_encoder_delta(direction, elapsed_ms)
     }
 }
 
 /// Apply one or more encoder steps to the currently selected timing control.
-pub fn apply_encoder_delta(state: &mut SharedState, selected_pad: Option<usize>, delta: i32) {
-    match selected_pad {
-        Some(pad) if pad < PAD_COUNT => {
+pub fn apply_encoder_delta(state: &mut SharedState, target: EncoderTarget, delta: i32) {
+    match target {
+        EncoderTarget::Pad(pad) if pad < PAD_COUNT => {
             state.desired_beats[pad] = adjust_beat_multiplier(state.desired_beats[pad], delta);
         }
-        Some(_) => {}
-        None => {
+        EncoderTarget::Pad(_) => {}
+        EncoderTarget::BaseInterval => {
             state.base_interval_ms = adjust_base_interval(state.base_interval_ms, delta);
         }
+        EncoderTarget::LedBrightness => {
+            state.led_brightness_percent =
+                adjust_led_brightness(state.led_brightness_percent, delta);
+        }
     }
+}
+
+pub fn scale_color(color: (u8, u8, u8), brightness_percent: u8) -> (u8, u8, u8) {
+    let brightness = u16::from(brightness_percent.min(100));
+    let scale = |channel: u8| ((u16::from(channel) * brightness + 50) / 100) as u8;
+    (scale(color.0), scale(color.1), scale(color.2))
 }
 
 /// CircuitPython `rainbowio.colorwheel` for an 8-bit wheel position.
@@ -1038,6 +1074,10 @@ mod tests {
             released: 1 << 4,
         });
         assert_eq!(selection.selected(), Some(0));
+
+        assert_eq!(debounce.update(0), KeyChanges::default());
+        assert_eq!(debounce.update(0), KeyChanges::default());
+        assert_eq!(debounce.update(0).released, 1);
     }
 
     #[test]
@@ -1053,21 +1093,57 @@ mod tests {
         assert_eq!(accelerated_encoder_delta(1, Some(75)), 10);
         assert_eq!(accelerated_encoder_delta(-1, Some(20)), -10);
 
+        assert_eq!(
+            EncoderTarget::for_controls(None, false),
+            EncoderTarget::BaseInterval
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(None, true),
+            EncoderTarget::LedBrightness
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), true),
+            EncoderTarget::Pad(3)
+        );
+
         let mut acceleration = EncoderAcceleration::new();
-        assert_eq!(acceleration.update(1_000, Some(3), 1), 1);
-        assert_eq!(acceleration.update(1_050, Some(3), 1), 10);
-        assert_eq!(acceleration.update(1_060, Some(4), 1), 1);
-        assert_eq!(acceleration.update(1_070, Some(4), -1), -1);
-        assert_eq!(acceleration.update(1_080, Some(4), -1), -10);
+        assert_eq!(acceleration.update(1_000, EncoderTarget::Pad(3), 1), 1);
+        assert_eq!(acceleration.update(1_050, EncoderTarget::Pad(3), 1), 10);
+        assert_eq!(
+            acceleration.update(1_060, EncoderTarget::LedBrightness, 1),
+            1
+        );
+        assert_eq!(
+            acceleration.update(1_070, EncoderTarget::BaseInterval, 1),
+            1
+        );
+        assert_eq!(
+            acceleration.update(1_080, EncoderTarget::BaseInterval, -1),
+            -1
+        );
+        assert_eq!(
+            acceleration.update(1_090, EncoderTarget::BaseInterval, -1),
+            -10
+        );
 
         let mut state = SharedState::default();
-        apply_encoder_delta(&mut state, None, 1);
+        apply_encoder_delta(&mut state, EncoderTarget::BaseInterval, 1);
         assert_eq!(state.base_interval_ms, 1_010);
-        apply_encoder_delta(&mut state, None, 10);
+        apply_encoder_delta(&mut state, EncoderTarget::BaseInterval, 10);
         assert_eq!(state.base_interval_ms, 1_110);
-        apply_encoder_delta(&mut state, Some(3), 10);
+        apply_encoder_delta(&mut state, EncoderTarget::Pad(3), 10);
         assert_eq!(state.desired_beats[3], 10);
         assert_eq!(state.base_interval_ms, 1_110);
+        apply_encoder_delta(&mut state, EncoderTarget::LedBrightness, -10);
+        assert_eq!(state.led_brightness_percent, 40);
+        apply_encoder_delta(&mut state, EncoderTarget::LedBrightness, -1_000);
+        assert_eq!(state.led_brightness_percent, 0);
+        apply_encoder_delta(&mut state, EncoderTarget::LedBrightness, 1_000);
+        assert_eq!(state.led_brightness_percent, 100);
+
+        assert_eq!(scale_color((200, 100, 50), 100), (200, 100, 50));
+        assert_eq!(scale_color((200, 100, 50), 50), (100, 50, 25));
+        assert_eq!(scale_color((200, 100, 50), 0), (0, 0, 0));
         assert_eq!(colorwheel(0), (255, 0, 0));
         assert_eq!(colorwheel(85), (0, 255, 0));
         assert_eq!(colorwheel(170), (0, 0, 255));

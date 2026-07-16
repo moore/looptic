@@ -17,7 +17,10 @@ interval (slower), while counter-clockwise decreases it (faster). For example,
 a 106,500 ms base interval with pad values 71 and 73 gives a 71:73 polyrhythm
 whose 71 side is exactly 40 BPM. Pads 0–5 use the kick sample and pads 6–11 use
 the open hi-hat. The interval uses a saturating `u32` millisecond value, whose
-representational limit is about 49.7 days.
+representational limit is about 49.7 days. With no pad selected, hold the
+encoder button while turning to adjust key NeoPixel brightness from 0 through
+100%; brightness starts at 50%, and slow and fast turns change it by 1% and
+10%, respectively.
 
 ## Audio hardware
 
@@ -39,6 +42,7 @@ directly. The MacroPad's built-in speaker is intentionally held disabled.
 | SynthPlug audio | GP20 / STEMMA SDA | PIO0 SM0, DMA CH0 |
 | 12 NeoPixels | GP19 | PIO1 SM0, DMA CH1 |
 | Rotary encoder | GP17 and GP18 | PIO1 SM1 |
+| Encoder push switch | GP0, active low | Debounced GPIO input |
 | Keys 1–12 | GP1–GP12, active low | GPIO inputs with pull-ups |
 | OLED clock/data | GP26 SCK, GP27 MOSI | SPI1 at 10 MHz |
 | OLED control | GP22 CS, GP23 reset, GP24 D/C | GPIO outputs |
@@ -145,7 +149,9 @@ is not needed for USB deployment.
 ## Hardware verification
 
 After flashing, verify all twelve keys, both encoder directions, the complete
-OLED image, each NeoPixel color, and the kick/hat split. Exercise all pads
+OLED image, each NeoPixel color and brightness range, and the kick/hat split.
+Verify that holding the encoder button changes brightness only when no pad is
+selected. Exercise all pads
 while turning the encoder and confirm GP13 remains off; a latched red LED means
 firmware initialization failed or the audio PIO FIFO stalled. For audio timing
 validation, set the base interval to 1000 ms, record a `Beat 1` pattern for 60

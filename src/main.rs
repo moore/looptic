@@ -42,9 +42,9 @@ use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
 use looptic::{
-    AUDIO_BLOCK_FRAMES, EncoderAcceleration, HeldPadSelection, KeyDebouncer, PAD_COUNT,
-    SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, WavPcm16, apply_encoder_delta,
-    colorwheel, led_pulse_active,
+    AUDIO_BLOCK_FRAMES, EncoderAcceleration, EncoderTarget, HeldPadSelection, KeyDebouncer,
+    PAD_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, WavPcm16,
+    apply_encoder_delta, colorwheel, led_pulse_active, scale_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -64,6 +64,7 @@ type UiShared = Mutex<CriticalSectionRawMutex, RefCell<UiState>>;
 #[derive(Clone, Copy, Default)]
 struct UiState {
     selected_pad: Option<usize>,
+    encoder_pressed: bool,
 }
 
 struct OledResources {
@@ -220,26 +221,30 @@ fn publish_render(shared: &Shared, report: &looptic::RenderReport) {
 async fn controls_task(
     mut keys: [Input<'static>; PAD_COUNT],
     mut encoder: PioEncoder<'static, PIO1, 1>,
+    encoder_button: Input<'static>,
     shared: &'static Shared,
     ui: &'static UiShared,
 ) {
     let mut debouncer = KeyDebouncer::new(5);
+    let mut encoder_button_debouncer = KeyDebouncer::new(5);
     let mut selection = HeldPadSelection::new();
     let mut next_scan = Instant::now();
     let mut encoder_acceleration = EncoderAcceleration::new();
 
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
-            let selected = ui.lock(|state| state.borrow().selected_pad);
+            let ui_state = ui.lock(|state| *state.borrow());
+            let target =
+                EncoderTarget::for_controls(ui_state.selected_pad, ui_state.encoder_pressed);
             let direction_delta = match direction {
                 Direction::Clockwise => 1,
                 Direction::CounterClockwise => -1,
             };
             let delta =
-                encoder_acceleration.update(Instant::now().as_millis(), selected, direction_delta);
+                encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta);
             shared.lock(|state| {
                 let mut state = state.borrow_mut();
-                apply_encoder_delta(&mut state, selected, delta);
+                apply_encoder_delta(&mut state, target, delta);
             });
         }
 
@@ -254,7 +259,13 @@ async fn controls_task(
 
             let changes = debouncer.update(raw_mask);
             selection.apply(changes);
-            ui.lock(|state| state.borrow_mut().selected_pad = selection.selected());
+            encoder_button_debouncer.update(u16::from(encoder_button.is_low()));
+            let encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
+            ui.lock(|state| {
+                let mut state = state.borrow_mut();
+                state.selected_pad = selection.selected();
+                state.encoder_pressed = encoder_pressed;
+            });
 
             next_scan += KEY_SCAN_INTERVAL;
             if next_scan <= now {
@@ -270,22 +281,30 @@ async fn led_task(
     mut pixels: PioWs2812<'static, PIO1, 0, PAD_COUNT, Grb>,
     mut status_led: Output<'static>,
     shared: &'static Shared,
+    ui: &'static UiShared,
 ) {
     let mut ticker = Ticker::every(LED_INTERVAL);
     loop {
-        let (playback_frame, triggers, underruns) = shared.lock(|state| {
+        let (playback_frame, triggers, underruns, brightness) = shared.lock(|state| {
             let state = state.borrow();
             (
                 state.playback_frame,
                 state.latest_trigger_frames,
                 state.underrun_count,
+                state.led_brightness_percent,
             )
+        });
+        let brightness_preview = ui.lock(|state| {
+            let state = state.borrow();
+            state.selected_pad.is_none() && state.encoder_pressed
         });
 
         let mut colors = [RGB8::default(); PAD_COUNT];
         for pad in 0..PAD_COUNT {
-            if led_pulse_active(playback_frame, triggers[pad], SAMPLE_RATE / 10) {
-                let (r, g, b) = colorwheel((21 * pad) as u8);
+            if brightness_preview
+                || led_pulse_active(playback_frame, triggers[pad], SAMPLE_RATE / 10)
+            {
+                let (r, g, b) = scale_color(colorwheel((21 * pad) as u8), brightness);
                 colors[pad] = RGB8 { r, g, b };
             }
         }
@@ -316,19 +335,22 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         }
     }
 
-    let mut last_value: Option<(Option<usize>, u32)> = None;
+    let mut last_value: Option<(EncoderTarget, u32)> = None;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let mut ticker = Ticker::every(DISPLAY_INTERVAL);
 
     loop {
-        let selected = ui.lock(|state| state.borrow().selected_pad);
+        let ui_state = ui.lock(|state| *state.borrow());
+        let target = EncoderTarget::for_controls(ui_state.selected_pad, ui_state.encoder_pressed);
         let displayed_value = shared.lock(|state| {
             let state = state.borrow();
-            selected.map_or(state.base_interval_ms, |pad| {
-                u32::from(state.desired_beats[pad])
-            })
+            match target {
+                EncoderTarget::BaseInterval => state.base_interval_ms,
+                EncoderTarget::LedBrightness => u32::from(state.led_brightness_percent),
+                EncoderTarget::Pad(pad) => u32::from(state.desired_beats[pad]),
+            }
         });
-        let value = (selected, displayed_value);
+        let value = (target, displayed_value);
 
         if last_value != Some(value) {
             display.clear();
@@ -336,10 +358,16 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 .draw(&mut display);
 
             let mut line: String<24> = String::new();
-            if selected.is_some() {
-                let _ = write!(&mut line, "Beat {}", displayed_value);
-            } else {
-                let _ = write!(&mut line, "Base {} ms", displayed_value);
+            match target {
+                EncoderTarget::Pad(_) => {
+                    let _ = write!(&mut line, "Beat {}", displayed_value);
+                }
+                EncoderTarget::BaseInterval => {
+                    let _ = write!(&mut line, "Base {} ms", displayed_value);
+                }
+                EncoderTarget::LedBrightness => {
+                    let _ = write!(&mut line, "Light {}%", displayed_value);
+                }
             }
             let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
                 .draw(&mut display);
@@ -395,6 +423,7 @@ fn main() -> ! {
     let pixels = PioWs2812::new(&mut common, sm0, p.DMA_CH1, Irqs, p.PIN_19, &pixel_program);
     let encoder_program = PioEncoderProgram::new(&mut common);
     let encoder = PioEncoder::new(&mut common, sm1, p.PIN_17, p.PIN_18, &encoder_program);
+    let encoder_button = Input::new(p.PIN_0, Pull::Up);
 
     let keys = [
         Input::new(p.PIN_1, Pull::Up),
@@ -413,8 +442,8 @@ fn main() -> ! {
 
     let low_executor = EXECUTOR_LOW.init(Executor::new());
     low_executor.run(|spawner| {
-        spawner.spawn(controls_task(keys, encoder, shared, ui).unwrap());
-        spawner.spawn(led_task(pixels, status_led, shared).unwrap());
+        spawner.spawn(controls_task(keys, encoder, encoder_button, shared, ui).unwrap());
+        spawner.spawn(led_task(pixels, status_led, shared, ui).unwrap());
         let oled = OledResources {
             spi: p.SPI1,
             sck: p.PIN_26,
