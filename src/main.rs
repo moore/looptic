@@ -42,8 +42,8 @@ use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
 use looptic::{
-    AUDIO_BLOCK_FRAMES, HeldPadSelection, KeyDebouncer, MAX_RATE_HZ, PAD_COUNT, SAMPLE_RATE,
-    SILENCE_PWM_WORD, Sequencer, SharedState, WavPcm16, adjust_rate, colorwheel, led_pulse_active,
+    AUDIO_BLOCK_FRAMES, HeldPadSelection, KeyDebouncer, PAD_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD,
+    Sequencer, SharedState, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -161,8 +161,11 @@ async fn audio_task(
     let mut back = AUDIO_DMA_BACK.init([SILENCE_PWM_WORD; AUDIO_BLOCK_FRAMES]);
 
     let mut front_start = 0_u64;
-    let initial_rates = shared.lock(|state| state.borrow().desired_rates);
-    sequencer.apply_rates(&initial_rates, front_start);
+    let (initial_beats, initial_base_interval) = shared.lock(|state| {
+        let state = state.borrow();
+        (state.desired_beats, state.base_interval_ms)
+    });
+    sequencer.apply_timing(&initial_beats, initial_base_interval, front_start);
     let report = sequencer.render(front_start, front);
     publish_render(shared, &report);
 
@@ -178,8 +181,11 @@ async fn audio_task(
         let transfer = sm.tx().dma_push(&mut dma, front, false);
 
         let back_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
-        let rates = shared.lock(|state| state.borrow().desired_rates);
-        sequencer.apply_rates(&rates, back_start);
+        let (beats, base_interval) = shared.lock(|state| {
+            let state = state.borrow();
+            (state.desired_beats, state.base_interval_ms)
+        });
+        sequencer.apply_timing(&beats, base_interval, back_start);
         let report = sequencer.render(back_start, back);
         publish_render(shared, &report);
 
@@ -223,17 +229,14 @@ async fn controls_task(
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
             let selected = ui.lock(|state| state.borrow().selected_pad);
-            if let Some(pad) = selected {
-                shared.lock(|state| {
-                    let mut state = state.borrow_mut();
-                    let delta = match direction {
-                        Direction::Clockwise => 1,
-                        Direction::CounterClockwise => -1,
-                    };
-                    state.desired_rates[pad] =
-                        adjust_rate(state.desired_rates[pad], delta, MAX_RATE_HZ);
-                });
-            }
+            let delta = match direction {
+                Direction::Clockwise => 1,
+                Direction::CounterClockwise => -1,
+            };
+            shared.lock(|state| {
+                let mut state = state.borrow_mut();
+                apply_encoder_delta(&mut state, selected, delta);
+            });
         }
 
         let now = Instant::now();
@@ -315,10 +318,11 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
 
     loop {
         let selected = ui.lock(|state| state.borrow().selected_pad);
-        let rate = selected.map_or(0, |pad| {
-            shared.lock(|state| state.borrow().desired_rates[pad])
+        let displayed_value = shared.lock(|state| {
+            let state = state.borrow();
+            selected.map_or(state.base_interval_ms, |pad| state.desired_beats[pad])
         });
-        let value = (selected, rate);
+        let value = (selected, displayed_value);
 
         if last_value != Some(value) {
             display.clear();
@@ -326,7 +330,11 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 .draw(&mut display);
 
             let mut line: String<16> = String::new();
-            let _ = write!(&mut line, "Beat {}", rate);
+            if selected.is_some() {
+                let _ = write!(&mut line, "Beat {}", displayed_value);
+            } else {
+                let _ = write!(&mut line, "Base {} ms", displayed_value);
+            }
             let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
                 .draw(&mut display);
 

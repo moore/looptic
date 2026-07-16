@@ -8,7 +8,12 @@
 pub const PAD_COUNT: usize = 12;
 pub const SAMPLE_RATE: u32 = 22_050;
 pub const AUDIO_BLOCK_FRAMES: usize = 128;
-pub const MAX_RATE_HZ: u16 = 1_000;
+pub const MAX_BEAT_MULTIPLIER: u16 = 1_000;
+pub const DEFAULT_BASE_INTERVAL_MS: u16 = 1_000;
+// At 50 ms, the maximum multiplier produces 20 kHz: still below the audio clock.
+pub const MIN_BASE_INTERVAL_MS: u16 = 50;
+pub const MAX_BASE_INTERVAL_MS: u16 = 5_000;
+pub const BASE_INTERVAL_STEP_MS: u16 = 10;
 
 const SAMPLE_COUNT: usize = 2;
 const KICK_INDEX: usize = 0;
@@ -218,7 +223,7 @@ impl Voice {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PadState {
-    pub rate_hz: u16,
+    pub beats_per_interval: u16,
     pub tick_ordinal: u64,
     pub next_frame: Option<u64>,
     pub voice: Voice,
@@ -227,7 +232,7 @@ pub struct PadState {
 impl PadState {
     const fn new(pad: usize) -> Self {
         Self {
-            rate_hz: 0,
+            beats_per_interval: 0,
             tick_ordinal: 0,
             next_frame: None,
             voice: Voice::new(SampleId::for_pad(pad)),
@@ -286,6 +291,7 @@ impl DitherEncoder {
 pub struct Sequencer<'a> {
     samples: [WavPcm16<'a>; SAMPLE_COUNT],
     pads: [PadState; PAD_COUNT],
+    base_interval_ms: u16,
     dither: DitherEncoder,
 }
 
@@ -294,6 +300,7 @@ impl<'a> Sequencer<'a> {
         Self {
             samples: [kick, open_hat],
             pads: core::array::from_fn(PadState::new),
+            base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             dither: DitherEncoder::new(),
         }
     }
@@ -302,25 +309,42 @@ impl<'a> Sequencer<'a> {
         &self.pads
     }
 
-    /// Apply absolute rates at a render boundary.
+    pub const fn base_interval_ms(&self) -> u16 {
+        self.base_interval_ms
+    }
+
+    /// Apply the base interval and per-pad beat multipliers at a render boundary.
     ///
-    /// Changed rates are aligned to the global sample epoch and begin at the
-    /// first tick strictly after `from_frame`. Unchanged pads retain phase.
-    pub fn apply_rates(&mut self, rates: &[u16; PAD_COUNT], from_frame: u64) {
-        for (pad, requested) in self.pads.iter_mut().zip(rates.iter().copied()) {
-            let rate = requested.min(MAX_RATE_HZ);
-            if pad.rate_hz == rate {
+    /// Changed timing is aligned to the global sample epoch and begins at the
+    /// first tick strictly after `from_frame`. Unchanged timing retains phase.
+    pub fn apply_timing(
+        &mut self,
+        beats: &[u16; PAD_COUNT],
+        base_interval_ms: u16,
+        from_frame: u64,
+    ) {
+        let base_interval_ms = base_interval_ms.clamp(MIN_BASE_INTERVAL_MS, MAX_BASE_INTERVAL_MS);
+        let base_changed = self.base_interval_ms != base_interval_ms;
+        self.base_interval_ms = base_interval_ms;
+
+        for (pad, requested) in self.pads.iter_mut().zip(beats.iter().copied()) {
+            let beats_per_interval = requested.min(MAX_BEAT_MULTIPLIER);
+            if !base_changed && pad.beats_per_interval == beats_per_interval {
                 continue;
             }
 
-            pad.rate_hz = rate;
-            if rate == 0 {
+            pad.beats_per_interval = beats_per_interval;
+            if beats_per_interval == 0 {
                 pad.tick_ordinal = 0;
                 pad.next_frame = None;
             } else {
-                let ordinal = next_ordinal_after(from_frame, rate);
+                let ordinal = next_ordinal_after(from_frame, beats_per_interval, base_interval_ms);
                 pad.tick_ordinal = ordinal;
-                pad.next_frame = Some(frame_for_tick(ordinal, rate));
+                pad.next_frame = Some(frame_for_tick(
+                    ordinal,
+                    beats_per_interval,
+                    base_interval_ms,
+                ));
             }
         }
     }
@@ -354,7 +378,11 @@ impl<'a> Sequencer<'a> {
                 }
 
                 pad.tick_ordinal = pad.tick_ordinal.wrapping_add(1);
-                pad.next_frame = Some(frame_for_tick(pad.tick_ordinal, pad.rate_hz));
+                pad.next_frame = Some(frame_for_tick(
+                    pad.tick_ordinal,
+                    pad.beats_per_interval,
+                    self.base_interval_ms,
+                ));
             }
         }
 
@@ -366,18 +394,19 @@ impl<'a> Sequencer<'a> {
     }
 }
 
-fn next_ordinal_after(frame: u64, rate: u16) -> u64 {
-    let product = u128::from(frame) * u128::from(rate);
-    let ordinal = product / u128::from(SAMPLE_RATE) + 1;
+fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u16) -> u64 {
+    let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
+    let denominator = u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
+    let ordinal = numerator / denominator + 1;
     ordinal as u64
 }
 
-fn frame_for_tick(ordinal: u64, rate: u16) -> u64 {
-    if rate == 0 {
+fn frame_for_tick(ordinal: u64, beats_per_interval: u16, base_interval_ms: u16) -> u64 {
+    if beats_per_interval == 0 {
         return u64::MAX;
     }
-    let numerator = u128::from(ordinal) * u128::from(SAMPLE_RATE);
-    let denominator = u128::from(rate);
+    let numerator = u128::from(ordinal) * u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
+    let denominator = 1_000 * u128::from(beats_per_interval);
     numerator.div_ceil(denominator) as u64
 }
 
@@ -401,7 +430,8 @@ pub const fn saturating_i16(value: i32) -> i16 {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SharedState {
-    pub desired_rates: [u16; PAD_COUNT],
+    pub desired_beats: [u16; PAD_COUNT],
+    pub base_interval_ms: u16,
     pub playback_frame: u64,
     pub latest_trigger_frames: [u64; PAD_COUNT],
     pub underrun_count: u32,
@@ -410,7 +440,8 @@ pub struct SharedState {
 impl Default for SharedState {
     fn default() -> Self {
         Self {
-            desired_rates: [0; PAD_COUNT],
+            desired_beats: [0; PAD_COUNT],
+            base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             playback_frame: 0,
             latest_trigger_frames: [0; PAD_COUNT],
             underrun_count: 0,
@@ -534,9 +565,31 @@ impl Default for HeldPadSelection {
     }
 }
 
-pub fn adjust_rate(current: u16, delta: i32, maximum: u16) -> u16 {
+pub fn adjust_beat_multiplier(current: u16, delta: i32) -> u16 {
     let adjusted = i32::from(current).saturating_add(delta);
-    adjusted.clamp(0, i32::from(maximum)) as u16
+    adjusted.clamp(0, i32::from(MAX_BEAT_MULTIPLIER)) as u16
+}
+
+pub fn adjust_base_interval(current_ms: u16, delta_steps: i32) -> u16 {
+    let delta_ms = delta_steps.saturating_mul(i32::from(BASE_INTERVAL_STEP_MS));
+    let adjusted = i32::from(current_ms).saturating_add(delta_ms);
+    adjusted.clamp(
+        i32::from(MIN_BASE_INTERVAL_MS),
+        i32::from(MAX_BASE_INTERVAL_MS),
+    ) as u16
+}
+
+/// Apply one or more encoder steps to the currently selected timing control.
+pub fn apply_encoder_delta(state: &mut SharedState, selected_pad: Option<usize>, delta: i32) {
+    match selected_pad {
+        Some(pad) if pad < PAD_COUNT => {
+            state.desired_beats[pad] = adjust_beat_multiplier(state.desired_beats[pad], delta);
+        }
+        Some(_) => {}
+        None => {
+            state.base_interval_ms = adjust_base_interval(state.base_interval_ms, delta);
+        }
+    }
 }
 
 /// CircuitPython `rainbowio.colorwheel` for an 8-bit wheel position.
@@ -750,33 +803,60 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_is_global_phase_aligned_and_rate_zero_stops_new_triggers() {
+    fn scheduling_is_global_phase_aligned_and_zero_stops_new_triggers() {
         let kick_bytes = wav(&[1, 2, 3], false);
         let hat_bytes = wav(&[4, 5, 6], false);
         let mut sequencer = Sequencer::new(
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut rates = [0; PAD_COUNT];
-        rates[0] = 1;
-        sequencer.apply_rates(&rates, 0);
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 1;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
         assert_eq!(sequencer.pads()[0].next_frame, Some(22_050));
 
-        rates[1] = 2;
-        sequencer.apply_rates(&rates, 0);
+        beats[1] = 2;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
         assert_eq!(sequencer.pads()[1].next_frame, Some(11_025));
 
-        rates[2] = 1_000;
-        sequencer.apply_rates(&rates, 0);
+        beats[2] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
         assert_eq!(sequencer.pads()[2].next_frame, Some(23));
 
-        rates[0] = 3;
-        sequencer.apply_rates(&rates, 10_000);
+        beats[0] = 3;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 10_000);
         assert_eq!(sequencer.pads()[0].next_frame, Some(14_700));
 
-        rates[0] = 0;
-        sequencer.apply_rates(&rates, 10_001);
+        beats[0] = 0;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 10_001);
         assert_eq!(sequencer.pads()[0].next_frame, None);
+    }
+
+    #[test]
+    fn changing_base_interval_reschedules_all_enabled_pads() {
+        let kick_bytes = wav(&[1, 2, 3], false);
+        let hat_bytes = wav(&[4, 5, 6], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 1;
+        beats[6] = 2;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.pads[0].voice.trigger();
+
+        sequencer.apply_timing(&beats, 500, 10_000);
+        assert_eq!(sequencer.base_interval_ms(), 500);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(11_025));
+        assert_eq!(sequencer.pads()[6].next_frame, Some(11_025));
+        assert!(sequencer.pads()[0].voice.playing);
+
+        // Changing timing exactly on a new-grid boundary selects the following one.
+        sequencer.apply_timing(&beats, 1_000, 11_025);
+        sequencer.apply_timing(&beats, 500, 11_025);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(22_050));
+        assert_eq!(sequencer.pads()[1].next_frame, None);
     }
 
     #[test]
@@ -787,9 +867,9 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut rates = [0; PAD_COUNT];
-        rates[0] = 1_000;
-        sequencer.apply_rates(&rates, u64::MAX - 10);
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, u64::MAX - 10);
         let deadline = sequencer.pads()[0].next_frame.unwrap();
         assert!(
             deadline < 32,
@@ -803,6 +883,24 @@ mod tests {
     }
 
     #[test]
+    fn fastest_supported_timing_never_builds_a_frame_backlog() {
+        let kick_bytes = wav(&[1], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = MAX_BEAT_MULTIPLIER;
+        sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
+
+        let mut output = [0_u32; AUDIO_BLOCK_FRAMES];
+        sequencer.render(0, &mut output);
+        let next = sequencer.pads()[0].next_frame.unwrap();
+        assert!(!frame_has_reached((AUDIO_BLOCK_FRAMES - 1) as u64, next));
+    }
+
+    #[test]
     fn rendering_suppresses_duplicate_samples_but_not_visuals() {
         let kick_bytes = wav(&[100, 50], false);
         let hat_bytes = wav(&[200, 100], false);
@@ -810,11 +908,11 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut rates = [0; PAD_COUNT];
-        rates[0] = 1_000;
-        rates[1] = 1_000;
-        rates[6] = 1_000;
-        sequencer.apply_rates(&rates, 0);
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 1_000;
+        beats[1] = 1_000;
+        beats[6] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
 
         let mut output = [0_u32; 24];
         let report = sequencer.render(0, &mut output);
@@ -835,9 +933,9 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut rates = [0; PAD_COUNT];
-        rates[0] = 3;
-        sequencer.apply_rates(&rates, 0);
+        let mut beats = [0; PAD_COUNT];
+        beats[0] = 3;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
 
         let mut total = 0_u32;
         let mut buffer = [0_u32; AUDIO_BLOCK_FRAMES];
@@ -885,9 +983,20 @@ mod tests {
     }
 
     #[test]
-    fn rate_palette_and_led_helpers_are_bounded() {
-        assert_eq!(adjust_rate(0, -1, MAX_RATE_HZ), 0);
-        assert_eq!(adjust_rate(999, 10, MAX_RATE_HZ), MAX_RATE_HZ);
+    fn timing_palette_and_led_helpers_are_bounded() {
+        assert_eq!(adjust_beat_multiplier(0, -1), 0);
+        assert_eq!(adjust_beat_multiplier(999, 10), MAX_BEAT_MULTIPLIER);
+        assert_eq!(adjust_base_interval(1_000, 1), 1_010);
+        assert_eq!(adjust_base_interval(1_000, -1), 990);
+        assert_eq!(adjust_base_interval(MIN_BASE_INTERVAL_MS, -1), 50);
+        assert_eq!(adjust_base_interval(MAX_BASE_INTERVAL_MS, 1), 5_000);
+
+        let mut state = SharedState::default();
+        apply_encoder_delta(&mut state, None, 1);
+        assert_eq!(state.base_interval_ms, 1_010);
+        apply_encoder_delta(&mut state, Some(3), 1);
+        assert_eq!(state.desired_beats[3], 1);
+        assert_eq!(state.base_interval_ms, 1_010);
         assert_eq!(colorwheel(0), (255, 0, 0));
         assert_eq!(colorwheel(85), (0, 255, 0));
         assert_eq!(colorwheel(170), (0, 0, 255));

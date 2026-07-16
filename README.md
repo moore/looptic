@@ -8,7 +8,10 @@ from the original CircuitPython prototype to Rust using
 The first Rust milestone embeds the existing kick and open-hi-hat WAV files,
 runs twelve independent sequencer voices, and drives the MacroPad keys, rotary
 encoder, OLED, and NeoPixels. Keys select a pad; turning the encoder changes
-that pad's trigger rate from 0 through 1000 triggers per second. Pads 0–5 use
+that pad's beat multiplier from 0 through 1000 triggers per base interval.
+With no key held, the encoder changes the global base interval from 50 through
+5000 ms in 10 ms steps; the default is 1000 ms. Clockwise increases the
+interval (slower), while counter-clockwise decreases it (faster). Pads 0–5 use
 the kick sample and pads 6–11 use the open hi-hat.
 
 ## Audio hardware
@@ -140,8 +143,8 @@ After flashing, verify all twelve keys, both encoder directions, the complete
 OLED image, each NeoPixel color, and the kick/hat split. Exercise all pads
 while turning the encoder and confirm GP13 remains off; a latched red LED means
 firmware initialization failed or the audio PIO FIFO stalled. For audio timing
-validation, record a rate-1 pattern for 60 seconds and check that it remains
-within 0.02% of one trigger per second.
+validation, set the base interval to 1000 ms, record a `Beat 1` pattern for 60
+seconds, and check that it remains within 0.02% of one trigger per second.
 
 The Rust firmware keeps the two WAV files embedded in flash, so no filesystem
 copy step is required. The sample files remain in the repository as the audio
