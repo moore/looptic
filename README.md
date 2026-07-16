@@ -2,7 +2,7 @@
 
 LoopTic is a 12-pad sample sequencer for the [Adafruit MacroPad
 RP2040](https://www.adafruit.com/product/5128). The firmware is being ported
-from the original CircuitPython [`code.py`](code.py) to Rust using
+from the original CircuitPython prototype to Rust using
 [Embassy](https://embassy.dev/).
 
 The first Rust milestone embeds the existing kick and open-hi-hat WAV files,
@@ -144,8 +144,8 @@ validation, record a rate-1 pattern for 60 seconds and check that it remains
 within 0.02% of one trigger per second.
 
 The Rust firmware keeps the two WAV files embedded in flash, so no filesystem
-copy step is required. The CircuitPython program and sample files remain in
-the repository as the behavior and audio reference.
+copy step is required. The sample files remain in the repository as the audio
+reference.
 
 ## Licensing
 

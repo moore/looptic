@@ -73,7 +73,6 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
-target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -152,7 +151,11 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# Rust embedded firmware outputs
+# Local editor settings
+.vscode/
+
+# Rust build and firmware outputs
+/target/
 *.uf2
 *.map
 
