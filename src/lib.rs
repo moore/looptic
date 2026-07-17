@@ -74,10 +74,17 @@ const fn coarse_dither_masks() -> [u16; PWM_DITHER_CYCLES as usize + 1] {
 /// Centered PWM command used while no PCM data is available.
 pub const SILENCE_PWM_WORD: u32 = 64 | (63 << 7);
 
-/// A fixed-resolution pattern spanning one complete base interval.
+/// A persistent 2,048-slot map whose first `division` bits form the active pattern.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pattern {
     bits: [u8; PATTERN_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatternFillState {
+    Empty,
+    Full,
+    Mixed,
 }
 
 impl Pattern {
@@ -105,42 +112,36 @@ impl Pattern {
     }
 
     pub fn step_enabled(&self, step: u16, division: u16) -> Option<bool> {
-        let (start, _) = pattern_step_range(step, division)?;
-        self.bit(start)
+        let index = pattern_step_index(step, division)?;
+        self.bit(index)
     }
 
     pub fn set_step_enabled(&mut self, step: u16, division: u16, enabled: bool) -> bool {
-        let Some((start, end)) = pattern_step_range(step, division) else {
+        let Some(index) = pattern_step_index(step, division) else {
             return false;
         };
-
-        let first_byte = start / 8;
-        let last_byte = (end - 1) / 8;
-        let first_mask = u8::MAX << (start % 8);
-        let last_width = (end - 1) % 8 + 1;
-        let last_mask = u8::MAX >> (8 - last_width);
-
-        if first_byte == last_byte {
-            set_masked_bits(&mut self.bits[first_byte], first_mask & last_mask, enabled);
-            return true;
-        }
-
-        set_masked_bits(&mut self.bits[first_byte], first_mask, enabled);
-        self.bits[first_byte + 1..last_byte].fill(if enabled { u8::MAX } else { 0 });
-        set_masked_bits(&mut self.bits[last_byte], last_mask, enabled);
-        true
+        self.set_bit(index, enabled)
     }
 
     pub fn fill(&mut self, enabled: bool) {
         self.bits.fill(if enabled { u8::MAX } else { 0 });
     }
-}
 
-fn set_masked_bits(byte: &mut u8, mask: u8, enabled: bool) {
-    if enabled {
-        *byte |= mask;
-    } else {
-        *byte &= !mask;
+    pub fn fill_state(&self) -> PatternFillState {
+        let mut any_enabled = false;
+        let mut any_disabled = false;
+        for &byte in &self.bits {
+            any_enabled |= byte != 0;
+            any_disabled |= byte != u8::MAX;
+            if any_enabled && any_disabled {
+                return PatternFillState::Mixed;
+            }
+        }
+        if any_enabled {
+            PatternFillState::Full
+        } else {
+            PatternFillState::Empty
+        }
     }
 }
 
@@ -158,15 +159,11 @@ impl Default for Pattern {
     }
 }
 
-pub fn pattern_step_range(step: u16, division: u16) -> Option<(usize, usize)> {
+pub fn pattern_step_index(step: u16, division: u16) -> Option<usize> {
     if division == 0 || division > MAX_BEAT_MULTIPLIER || step >= division {
         return None;
     }
-    let division = usize::from(division);
-    let step = usize::from(step);
-    let start = step * PATTERN_BITS / division;
-    let end = (step + 1) * PATTERN_BITS / division;
-    Some((start, end))
+    Some(usize::from(step))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,10 +417,6 @@ pub struct PadState {
     period_remainder: u32,
     deadline_error: u32,
     next_step: u16,
-    pattern_bit_index: u16,
-    pattern_phase: u16,
-    pattern_whole_bits: u16,
-    pattern_remainder: u16,
 }
 
 impl PadState {
@@ -439,10 +432,6 @@ impl PadState {
             period_remainder: 0,
             deadline_error: 0,
             next_step: 0,
-            pattern_bit_index: 0,
-            pattern_phase: 0,
-            pattern_whole_bits: 0,
-            pattern_remainder: 0,
         }
     }
 
@@ -455,10 +444,6 @@ impl PadState {
         self.period_remainder = 0;
         self.deadline_error = 0;
         self.next_step = 0;
-        self.pattern_bit_index = 0;
-        self.pattern_phase = 0;
-        self.pattern_whole_bits = 0;
-        self.pattern_remainder = 0;
     }
 
     /// Align this pad to the first global-grid tick strictly after `from_frame`.
@@ -485,9 +470,6 @@ impl PadState {
         self.period_remainder = (period_numerator % u64::from(period_denominator)) as u32;
         self.deadline_error = deadline_error as u32;
         self.next_step = ((ordinal - 1) % u128::from(beats_per_interval)) as u16;
-        self.pattern_whole_bits = (PATTERN_BITS / usize::from(beats_per_interval)) as u16;
-        self.pattern_remainder = (PATTERN_BITS % usize::from(beats_per_interval)) as u16;
-        self.realign_pattern_cursor();
     }
 
     /// Consume every tick due at `frame`, coalescing their pattern states.
@@ -529,9 +511,7 @@ impl PadState {
     }
 
     fn current_step_enabled(&self, pattern: &Pattern) -> bool {
-        pattern
-            .bit(usize::from(self.pattern_bit_index))
-            .unwrap_or(false)
+        pattern.bit(usize::from(self.next_step)).unwrap_or(false)
     }
 
     fn advance_one(&mut self) {
@@ -548,14 +528,10 @@ impl PadState {
         };
         self.next_frame = Some(deadline.wrapping_add(frame_delta));
         self.tick_ordinal = self.tick_ordinal.wrapping_add(1);
-        advance_pattern_position(
-            &mut self.next_step,
-            &mut self.pattern_bit_index,
-            &mut self.pattern_phase,
-            self.beats_per_interval,
-            self.pattern_whole_bits,
-            self.pattern_remainder,
-        );
+        self.next_step += 1;
+        if self.next_step == self.beats_per_interval {
+            self.next_step = 0;
+        }
     }
 
     fn take_due_fast(&mut self, frame: u64, pattern: &Pattern) -> bool {
@@ -585,20 +561,14 @@ impl PadState {
         };
 
         let mut step = self.next_step;
-        let mut bit_index = self.pattern_bit_index;
-        let mut phase = self.pattern_phase;
         for _ in 0..unique_steps {
-            if pattern.bit(usize::from(bit_index)).unwrap_or(false) {
+            if pattern.bit(usize::from(step)).unwrap_or(false) {
                 return true;
             }
-            advance_pattern_position(
-                &mut step,
-                &mut bit_index,
-                &mut phase,
-                division,
-                self.pattern_whole_bits,
-                self.pattern_remainder,
-            );
+            step += 1;
+            if step == division {
+                step = 0;
+            }
         }
         false
     }
@@ -623,40 +593,6 @@ impl PadState {
         let step_advance = (due % division) as u16;
         let next_step = u32::from(self.next_step) + u32::from(step_advance);
         self.next_step = (next_step % u32::from(self.beats_per_interval)) as u16;
-        self.realign_pattern_cursor();
-    }
-
-    fn realign_pattern_cursor(&mut self) {
-        let division = u32::from(self.beats_per_interval);
-        let scaled_step = u32::from(self.next_step) * PATTERN_BITS as u32;
-        self.pattern_bit_index = (scaled_step / division) as u16;
-        self.pattern_phase = (scaled_step % division) as u16;
-    }
-}
-
-/// Advance `floor(step * PATTERN_BITS / division)` without a variable divide.
-#[inline]
-fn advance_pattern_position(
-    step: &mut u16,
-    bit_index: &mut u16,
-    phase: &mut u16,
-    division: u16,
-    whole_bits: u16,
-    remainder: u16,
-) {
-    *step += 1;
-    if *step == division {
-        *step = 0;
-        *bit_index = 0;
-        *phase = 0;
-        return;
-    }
-
-    *bit_index += whole_bits;
-    *phase += remainder;
-    if *phase >= division {
-        *phase -= division;
-        *bit_index += 1;
     }
 }
 
@@ -2062,6 +1998,16 @@ impl SharedState {
         Some(enabled)
     }
 
+    pub fn set_pattern_all(&mut self, pad: usize, enabled: bool) -> bool {
+        let Some(pattern) = self.patterns.get_mut(pad) else {
+            return false;
+        };
+        pattern.fill(enabled);
+        self.pattern_dirty_mask |= 1 << pad;
+        self.pattern_revision = self.pattern_revision.wrapping_add(1);
+        true
+    }
+
     pub fn take_pattern_dirty_mask(&mut self) -> u16 {
         let dirty = self.pattern_dirty_mask;
         self.pattern_dirty_mask = 0;
@@ -2368,13 +2314,46 @@ pub fn adjust_volume_percent(current_percent: u8, delta: i32) -> u8 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternEditorAction {
     Entered,
+    AllMenuOpened,
+    AllMenuCancelled,
+    SetAll { pad: usize, enabled: bool },
     Toggle { pad: usize, step: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PatternAllChoice {
+    #[default]
+    Cancel,
+    All,
+    None,
+}
+
+impl PatternAllChoice {
+    fn adjusted(self, delta: i32) -> Self {
+        let index: i32 = match self {
+            Self::Cancel => 0,
+            Self::All => 1,
+            Self::None => 2,
+        };
+        match index.saturating_add(delta).clamp(0, 2) {
+            0 => Self::Cancel,
+            1 => Self::All,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatternAllMenu {
+    pub pad: usize,
+    pub choice: PatternAllChoice,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PatternEditorState {
     pub active: bool,
     pub cursor: u16,
+    pub all_menu: Option<PatternAllMenu>,
 }
 
 impl PatternEditorState {
@@ -2382,15 +2361,18 @@ impl PatternEditorState {
         Self {
             active: false,
             cursor: 0,
+            all_menu: None,
         }
     }
 
     pub fn update_primary(&mut self, primary: Option<usize>, division: u16) {
         if primary.is_none() {
-            self.active = false;
-            self.cursor = 0;
+            *self = Self::new();
         } else if self.active {
-            self.cursor = wrap_pattern_cursor(self.cursor, division, 0);
+            self.cursor = self.cursor.min(division);
+            if self.all_menu.is_some_and(|menu| Some(menu.pad) != primary) {
+                self.all_menu = None;
+            }
         }
     }
 
@@ -2399,24 +2381,46 @@ impl PatternEditorState {
         primary: Option<usize>,
         division: u16,
     ) -> Option<PatternEditorAction> {
-        let pad = primary?;
+        let Some(pad) = primary else {
+            self.all_menu = None;
+            return None;
+        };
         if !self.active {
             self.active = true;
             self.cursor = 0;
+            self.all_menu = None;
             return Some(PatternEditorAction::Entered);
         }
-        if division == 0 {
-            return None;
+        if let Some(menu) = self.all_menu.take() {
+            if menu.pad != pad || menu.choice == PatternAllChoice::Cancel {
+                return Some(PatternEditorAction::AllMenuCancelled);
+            }
+            return Some(PatternEditorAction::SetAll {
+                pad,
+                enabled: menu.choice == PatternAllChoice::All,
+            });
         }
-        self.cursor %= division;
+        self.cursor = self.cursor.min(division);
+        if self.cursor == 0 {
+            self.all_menu = Some(PatternAllMenu {
+                pad,
+                choice: PatternAllChoice::Cancel,
+            });
+            return Some(PatternEditorAction::AllMenuOpened);
+        }
         Some(PatternEditorAction::Toggle {
             pad,
-            step: self.cursor,
+            step: self.cursor - 1,
         })
     }
 
     pub fn scroll(&mut self, division: u16, delta: i32) {
-        if self.active {
+        if !self.active {
+            return;
+        }
+        if let Some(menu) = &mut self.all_menu {
+            menu.choice = menu.choice.adjusted(delta);
+        } else {
             self.cursor = wrap_pattern_cursor(self.cursor, division, delta);
         }
     }
@@ -2436,21 +2440,20 @@ pub const fn pattern_button_allowed(
 }
 
 pub fn wrap_pattern_cursor(cursor: u16, division: u16, delta: i32) -> u16 {
-    if division == 0 {
-        return 0;
-    }
+    let entry_count = i32::from(division) + 1;
     i32::from(cursor)
         .saturating_add(delta)
-        .rem_euclid(i32::from(division)) as u16
+        .rem_euclid(entry_count) as u16
 }
 
 pub fn pattern_window_start(cursor: u16, division: u16, visible_rows: u16) -> u16 {
-    if visible_rows == 0 || division <= visible_rows {
+    let entry_count = division.saturating_add(1);
+    if visible_rows == 0 || entry_count <= visible_rows {
         return 0;
     }
     cursor
         .saturating_sub(visible_rows / 2)
-        .min(division - visible_rows)
+        .min(entry_count - visible_rows)
 }
 
 /// Accelerate a direction delta when consecutive detents arrive quickly.
@@ -2955,46 +2958,65 @@ mod tests {
     }
 
     #[test]
-    fn patterns_use_a_fixed_2048_bit_phase_grid() {
+    fn patterns_use_fixed_direct_slots_for_every_division() {
         assert_eq!(core::mem::size_of::<Pattern>(), PATTERN_BYTES);
 
         let pattern = Pattern::default();
+        assert_eq!(pattern.fill_state(), PatternFillState::Full);
         assert_eq!(pattern.bit(0), Some(true));
         assert_eq!(pattern.bit(PATTERN_BITS - 1), Some(true));
         assert_eq!(pattern.bit(PATTERN_BITS), None);
 
-        assert_eq!(pattern_step_range(0, 1), Some((0, PATTERN_BITS)));
-        assert_eq!(pattern_step_range(0, 3), Some((0, 682)));
-        assert_eq!(pattern_step_range(1, 3), Some((682, 1_365)));
-        assert_eq!(pattern_step_range(2, 3), Some((1_365, PATTERN_BITS)));
-        assert_eq!(pattern_step_range(731, 2_048), Some((731, 732)));
-        assert_eq!(pattern_step_range(0, 0), None);
-        assert_eq!(pattern_step_range(3, 3), None);
+        for division in 1..=MAX_BEAT_MULTIPLIER {
+            for step in 0..division {
+                assert_eq!(pattern_step_index(step, division), Some(usize::from(step)));
+            }
+        }
+        assert_eq!(pattern_step_index(0, 0), None);
+        assert_eq!(pattern_step_index(3, 3), None);
+        assert_eq!(pattern_step_index(0, MAX_BEAT_MULTIPLIER + 1), None);
     }
 
     #[test]
-    fn pattern_edits_fill_ranges_and_resample_their_first_bits() {
+    fn pattern_edits_change_one_slot_and_hidden_slots_survive_resize() {
         let mut pattern = Pattern::default();
         assert_eq!(pattern.toggle_step(0, 2), Some(false));
 
-        // Turning off the first half at division 2 also turns off the first
-        // two entries when the same fixed grid is sampled at division 4.
+        // Expanding exposes later stored slots without deriving them from the
+        // earlier, smaller division.
         assert_eq!(pattern.step_enabled(0, 4), Some(false));
-        assert_eq!(pattern.step_enabled(1, 4), Some(false));
+        assert_eq!(pattern.step_enabled(1, 4), Some(true));
         assert_eq!(pattern.step_enabled(2, 4), Some(true));
         assert_eq!(pattern.step_enabled(3, 4), Some(true));
-        assert_eq!(pattern.bit(1_023), Some(false));
-        assert_eq!(pattern.bit(1_024), Some(true));
+        assert_eq!(pattern.bit(1), Some(true));
+        assert_eq!(pattern.bit(PATTERN_BITS - 1), Some(true));
 
-        // A later coarse edit replaces every finer bit in that logical range.
-        assert!(pattern.set_step_enabled(1, 3, false));
-        for bit in 682..1_365 {
-            assert_eq!(pattern.bit(bit), Some(false));
-        }
-        assert_eq!(pattern.toggle_step(1, 3), Some(true));
-        for bit in 682..1_365 {
-            assert_eq!(pattern.bit(bit), Some(true));
-        }
+        // Slot 6 becomes hidden at division 4, but neither the division nor an
+        // edit to a visible slot clears it.
+        assert!(pattern.set_step_enabled(6, 8, false));
+        assert!(pattern.set_step_enabled(1, 4, false));
+        assert_eq!(pattern.step_enabled(1, 4), Some(false));
+        assert_eq!(pattern.step_enabled(6, 4), None);
+        assert_eq!(pattern.step_enabled(6, 8), Some(false));
+        assert_eq!(pattern.bit(5), Some(true));
+        assert_eq!(pattern.bit(7), Some(true));
+    }
+
+    #[test]
+    fn whole_map_state_tracks_explicit_fill_and_clear() {
+        let mut pattern = Pattern::default();
+        assert_eq!(pattern.fill_state(), PatternFillState::Full);
+
+        assert!(pattern.set_bit(PATTERN_BITS - 1, false));
+        assert_eq!(pattern.fill_state(), PatternFillState::Mixed);
+        pattern.fill(true);
+        assert_eq!(pattern.fill_state(), PatternFillState::Full);
+        assert_eq!(pattern.bit(PATTERN_BITS - 1), Some(true));
+
+        pattern.fill(false);
+        assert_eq!(pattern.fill_state(), PatternFillState::Empty);
+        assert_eq!(pattern.bit(0), Some(false));
+        assert_eq!(pattern.bit(PATTERN_BITS - 1), Some(false));
     }
 
     #[test]
@@ -3011,6 +3033,26 @@ mod tests {
         assert_eq!(state.toggle_pattern_step(2, 4), None);
         assert_eq!(state.pattern_revision, 1);
         assert_eq!(state.take_pattern_dirty_mask(), 0);
+
+        // Explicit All/None choices are independent of division and always
+        // cover all 2,048 stored bits.
+        state.desired_beats[2] = 0;
+        assert!(state.set_pattern_all(2, true));
+        assert_eq!(state.pattern_revision, 2);
+        assert_eq!(
+            state.pattern(2).unwrap().fill_state(),
+            PatternFillState::Full
+        );
+        assert_eq!(state.take_pattern_dirty_mask(), 1 << 2);
+        assert!(state.set_pattern_all(2, false));
+        assert_eq!(state.pattern_revision, 3);
+        assert_eq!(
+            state.pattern(2).unwrap().fill_state(),
+            PatternFillState::Empty
+        );
+        assert_eq!(state.take_pattern_dirty_mask(), 1 << 2);
+        assert!(!state.set_pattern_all(BEAT_PAD_COUNT, true));
+        assert_eq!(state.pattern_revision, 3);
     }
 
     #[test]
@@ -3049,12 +3091,9 @@ mod tests {
                         assert_eq!(actual.next_frame, Some(reference.next_frame));
                         assert!(actual.deadline_error < actual.period_denominator);
                         assert!(actual.next_step < division);
-                        let (expected_bit, _) =
-                            pattern_step_range(actual.next_step, division).unwrap();
-                        assert_eq!(usize::from(actual.pattern_bit_index), expected_bit);
                         assert_eq!(
-                            usize::from(actual.pattern_phase),
-                            usize::from(actual.next_step) * PATTERN_BITS % usize::from(division)
+                            pattern_step_index(actual.next_step, division),
+                            Some(usize::from(actual.next_step))
                         );
                     }
                 }
@@ -3063,7 +3102,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_pattern_cursor_matches_every_division() {
+    fn direct_pattern_cursor_matches_every_division() {
         let pattern = patterned_clock_fixture();
 
         for division in 1..=MAX_BEAT_MULTIPLIER {
@@ -3073,12 +3112,6 @@ mod tests {
 
             for expected_step in 0..division {
                 assert_eq!(clock.next_step, expected_step, "division={division}");
-                let (expected_bit, _) = pattern_step_range(expected_step, division).unwrap();
-                assert_eq!(
-                    usize::from(clock.pattern_bit_index),
-                    expected_bit,
-                    "division={division}, step={expected_step}"
-                );
                 assert_eq!(
                     clock.current_step_enabled(&pattern),
                     pattern.step_enabled(expected_step, division).unwrap(),
@@ -3088,8 +3121,6 @@ mod tests {
             }
 
             assert_eq!(clock.next_step, 0);
-            assert_eq!(clock.pattern_bit_index, 0);
-            assert_eq!(clock.pattern_phase, 0);
         }
     }
 
@@ -4630,21 +4661,38 @@ mod tests {
             Some(PatternEditorAction::Entered)
         );
         assert!(editor.active);
+        assert_eq!(editor.cursor, 0);
+        assert_eq!(
+            editor.button_pressed(Some(2), 4),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
+        assert_eq!(
+            editor.all_menu,
+            Some(PatternAllMenu {
+                pad: 2,
+                choice: PatternAllChoice::Cancel
+            })
+        );
+        assert_eq!(
+            editor.button_pressed(Some(2), 4),
+            Some(PatternEditorAction::AllMenuCancelled)
+        );
+        assert_eq!(editor.all_menu, None);
 
         editor.scroll(4, 1);
         assert_eq!(editor.cursor, 1);
         assert_eq!(
             editor.button_pressed(Some(2), 4),
-            Some(PatternEditorAction::Toggle { pad: 2, step: 1 })
+            Some(PatternEditorAction::Toggle { pad: 2, step: 0 })
         );
-        editor.scroll(4, 10);
-        assert_eq!(editor.cursor, 3);
+        editor.scroll(4, 3);
+        assert_eq!(editor.cursor, 4);
 
         // A later-held pad becomes primary only after the older key is
         // released; pattern mode itself persists until every beat key is released.
         editor.update_primary(Some(7), 2);
         assert!(editor.active);
-        assert_eq!(editor.cursor, 1);
+        assert_eq!(editor.cursor, 2);
         assert_eq!(
             editor.button_pressed(Some(7), 2),
             Some(PatternEditorAction::Toggle { pad: 7, step: 1 })
@@ -4653,23 +4701,86 @@ mod tests {
         editor.update_primary(Some(7), 0);
         assert!(editor.active);
         assert_eq!(editor.cursor, 0);
-        assert_eq!(editor.button_pressed(Some(7), 0), None);
+        assert_eq!(
+            editor.button_pressed(Some(7), 0),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
 
         editor.update_primary(None, 0);
         assert_eq!(editor, PatternEditorState::new());
     }
 
     #[test]
+    fn pattern_all_menu_is_cancel_first_explicit_and_target_safe() {
+        let mut editor = PatternEditorState::new();
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::Entered)
+        );
+
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
+        editor.scroll(8, -1);
+        assert_eq!(editor.all_menu.unwrap().choice, PatternAllChoice::Cancel);
+        editor.scroll(8, 1);
+        assert_eq!(editor.all_menu.unwrap().choice, PatternAllChoice::All);
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::SetAll {
+                pad: 2,
+                enabled: true
+            })
+        );
+        assert_eq!(editor.all_menu, None);
+
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
+        editor.scroll(8, 2);
+        assert_eq!(editor.all_menu.unwrap().choice, PatternAllChoice::None);
+        editor.scroll(8, 1);
+        assert_eq!(editor.all_menu.unwrap().choice, PatternAllChoice::None);
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::SetAll {
+                pad: 2,
+                enabled: false
+            })
+        );
+
+        // A pending choice cannot follow selection to another instrument.
+        assert_eq!(
+            editor.button_pressed(Some(2), 8),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
+        editor.scroll(8, 1);
+        editor.update_primary(Some(7), 8);
+        assert_eq!(editor.all_menu, None);
+        assert_eq!(
+            editor.button_pressed(Some(7), 8),
+            Some(PatternEditorAction::AllMenuOpened)
+        );
+        editor.update_primary(None, 0);
+        assert_eq!(editor, PatternEditorState::new());
+    }
+
+    #[test]
     fn pattern_cursor_wraps_and_display_window_tracks_it() {
-        assert_eq!(wrap_pattern_cursor(0, 8, -1), 7);
-        assert_eq!(wrap_pattern_cursor(7, 8, 1), 0);
-        assert_eq!(wrap_pattern_cursor(1, 8, 10), 3);
+        assert_eq!(wrap_pattern_cursor(0, 8, -1), 8);
+        assert_eq!(wrap_pattern_cursor(8, 8, 1), 0);
+        assert_eq!(wrap_pattern_cursor(1, 8, 10), 2);
         assert_eq!(wrap_pattern_cursor(123, 0, 10), 0);
+        assert_eq!(wrap_pattern_cursor(0, MAX_BEAT_MULTIPLIER, -1), 2_048);
+        assert_eq!(wrap_pattern_cursor(2_048, MAX_BEAT_MULTIPLIER, 1), 0);
 
         assert_eq!(pattern_window_start(0, 12, 5), 0);
         assert_eq!(pattern_window_start(4, 12, 5), 2);
-        assert_eq!(pattern_window_start(11, 12, 5), 7);
+        assert_eq!(pattern_window_start(12, 12, 5), 8);
         assert_eq!(pattern_window_start(3, 4, 5), 0);
+        assert_eq!(pattern_window_start(0, 0, 5), 0);
         assert_eq!(pattern_window_start(3, 12, 0), 0);
     }
 

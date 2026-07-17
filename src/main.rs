@@ -44,11 +44,12 @@ use heapless::String;
 use looptic::load_control::{AudioLoadController, LoadLevel, RenderPolicy};
 use looptic::{
     AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, EncoderAcceleration, EncoderTarget, HeldPadSelection,
-    KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState, MuteTarget, PatternEditorAction,
-    PatternEditorState, SAMPLE_COUNT, SAMPLE_KEY_INDEX, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer,
-    SharedState, VOLUME_KEY_INDEX, VolumeControlState, VolumeTarget, adjust_sample_selection,
-    apply_encoder_delta, colorwheel, led_pulse_active, mute_led_color, pattern_button_allowed,
-    pattern_window_start, sample_assets, sample_led_color, scale_color, volume_led_color,
+    KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState, MuteTarget, PatternAllChoice,
+    PatternEditorAction, PatternEditorState, PatternFillState, SAMPLE_COUNT, SAMPLE_KEY_INDEX,
+    SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, VOLUME_KEY_INDEX, VolumeControlState,
+    VolumeTarget, adjust_sample_selection, apply_encoder_delta, colorwheel, led_pulse_active,
+    mute_led_color, pattern_button_allowed, pattern_window_start, sample_assets, sample_led_color,
+    scale_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -116,6 +117,15 @@ struct AudioDisplayMetrics {
     max_dma_cadence_us: u32,
     deadline_misses: u32,
     underruns: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayStateKey {
+    target: EncoderTarget,
+    displayed_value: u32,
+    pattern_revision: u32,
+    pattern_all_choice: Option<PatternAllChoice>,
+    diagnostics: Option<AudioDisplayMetrics>,
 }
 
 static SHARED: StaticCell<Shared> = StaticCell::new();
@@ -447,12 +457,11 @@ async fn controls_task(
                 Direction::Clockwise => 1,
                 Direction::CounterClockwise => -1,
             };
-            let accelerated =
-                encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta);
-            let delta = if matches!(target, EncoderTarget::Sample(_)) {
+            let choosing_pattern_all = ui_state.pattern_editor.all_menu.is_some();
+            let delta = if matches!(target, EncoderTarget::Sample(_)) || choosing_pattern_all {
                 direction_delta
             } else {
-                accelerated
+                encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta)
             };
             match target {
                 EncoderTarget::PatternStep(pad) => {
@@ -539,10 +548,22 @@ async fn controls_task(
             } else {
                 None
             };
-            if let Some(PatternEditorAction::Toggle { pad, step }) = editor_action {
-                shared.lock(|state| {
+            match editor_action {
+                Some(PatternEditorAction::Toggle { pad, step }) => shared.lock(|state| {
                     state.borrow_mut().toggle_pattern_step(pad, step);
-                });
+                }),
+                Some(PatternEditorAction::SetAll { pad, enabled }) => {
+                    shared.lock(|state| {
+                        state.borrow_mut().set_pattern_all(pad, enabled);
+                    });
+                    encoder_acceleration = EncoderAcceleration::new();
+                }
+                Some(
+                    PatternEditorAction::AllMenuOpened | PatternEditorAction::AllMenuCancelled,
+                ) => {
+                    encoder_acceleration = EncoderAcceleration::new();
+                }
+                Some(PatternEditorAction::Entered) | None => {}
             }
             ui.lock(|state| *state.borrow_mut() = next_ui);
 
@@ -622,50 +643,94 @@ fn draw_pattern_editor<D>(
     D: DrawTarget<Color = BinaryColor>,
 {
     const VISIBLE_ROWS: u16 = 5;
-    let (division, cursor, window_start, enabled_rows) = shared.lock(|state| {
+    let (division, cursor, window_start, fill_state, enabled_rows) = shared.lock(|state| {
         let state = state.borrow();
         let division = state.desired_beats[pad];
-        let cursor = if division == 0 { 0 } else { cursor % division };
+        let cursor = cursor.min(division);
         let window_start = pattern_window_start(cursor, division, VISIBLE_ROWS);
         let mut enabled_rows = [false; VISIBLE_ROWS as usize];
+        let mut fill_state = PatternFillState::Empty;
         if let Some(pattern) = state.pattern(pad) {
+            fill_state = pattern.fill_state();
             for row in 0..VISIBLE_ROWS {
-                let step = window_start + row;
-                if step < division {
+                let entry = window_start + row;
+                if entry != 0 && entry <= division {
+                    let step = entry - 1;
                     enabled_rows[usize::from(row)] =
                         pattern.step_enabled(step, division).unwrap_or(false);
                 }
             }
         }
-        (division, cursor, window_start, enabled_rows)
+        (division, cursor, window_start, fill_state, enabled_rows)
     });
 
     let mut header: String<24> = String::new();
     let _ = write!(&mut header, "LoopTic P{} {}", pad + 1, division);
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
-    if division == 0 {
-        let _ = Text::with_baseline("No triggers", Point::new(0, 16), style, Baseline::Top)
-            .draw(display);
-        return;
-    }
-
     for row in 0..VISIBLE_ROWS {
-        let step = window_start + row;
-        if step >= division {
+        let entry = window_start + row;
+        if entry > division {
             break;
         }
-        let marker = if step == cursor { '>' } else { ' ' };
-        let state = if enabled_rows[usize::from(row)] {
-            "ON"
-        } else {
-            "off"
-        };
+        let marker = if entry == cursor { '>' } else { ' ' };
         let mut line: String<16> = String::new();
-        let _ = write!(&mut line, "{} {:04} {}", marker, step + 1, state);
+        if entry == 0 {
+            let state = match fill_state {
+                PatternFillState::Empty => "off",
+                PatternFillState::Full => "ON",
+                PatternFillState::Mixed => "mix",
+            };
+            let _ = write!(&mut line, "{} All {}", marker, state);
+        } else {
+            let state = if enabled_rows[usize::from(row)] {
+                "ON"
+            } else {
+                "off"
+            };
+            let _ = write!(&mut line, "{} {:04} {}", marker, entry, state);
+        }
         let _ = Text::with_baseline(
             &line,
             Point::new(0, 14 + i32::from(row) * 10),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+
+    if division == 0 {
+        let _ = Text::with_baseline("No triggers", Point::new(0, 28), style, Baseline::Top)
+            .draw(display);
+    }
+}
+
+fn draw_pattern_all_menu<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    pad: usize,
+    selected: PatternAllChoice,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let mut header: String<24> = String::new();
+    let _ = write!(&mut header, "LoopTic P{} All", pad + 1);
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    for (row, (choice, label)) in [
+        (PatternAllChoice::Cancel, "Cancel"),
+        (PatternAllChoice::All, "All"),
+        (PatternAllChoice::None, "None"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let marker = if *choice == selected { '>' } else { ' ' };
+        let mut line: String<16> = String::new();
+        let _ = write!(&mut line, "{} {}", marker, label);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 16 + row as i32 * 14),
             style,
             Baseline::Top,
         )
@@ -741,7 +806,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         }
     }
 
-    let mut last_value: Option<(EncoderTarget, u32, u32, Option<AudioDisplayMetrics>)> = None;
+    let mut last_value: Option<DisplayStateKey> = None;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
@@ -791,7 +856,14 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             });
             (value.0, value.1, diagnostics)
         });
-        let value = (target, displayed_value, pattern_revision, diagnostics);
+        let pattern_all_choice = ui_state.pattern_editor.all_menu.map(|menu| menu.choice);
+        let value = DisplayStateKey {
+            target,
+            displayed_value,
+            pattern_revision,
+            pattern_all_choice,
+            diagnostics,
+        };
 
         if last_value != Some(value) {
             display.clear();
@@ -827,13 +899,17 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                             .draw(&mut display);
                     }
                     EncoderTarget::PatternStep(pad) => {
-                        draw_pattern_editor(
-                            &mut display,
-                            style,
-                            shared,
-                            pad,
-                            ui_state.pattern_editor.cursor,
-                        );
+                        if let Some(menu) = ui_state.pattern_editor.all_menu {
+                            draw_pattern_all_menu(&mut display, style, pad, menu.choice);
+                        } else {
+                            draw_pattern_editor(
+                                &mut display,
+                                style,
+                                shared,
+                                pad,
+                                ui_state.pattern_editor.cursor,
+                            );
+                        }
                     }
                     EncoderTarget::Volume(VolumeTarget::Global) => {
                         let _ =

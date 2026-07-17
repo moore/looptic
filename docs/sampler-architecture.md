@@ -79,6 +79,25 @@ voice constant-time, independently addressable XIP reads.
 
 ## Event and voice semantics
 
+### Pattern representation
+
+Each pad owns a fixed 2048-bit (256-byte) pattern, initially filled. At a beat
+division of `n`, scheduled step `s` reads stored bit `s` directly for
+`0 <= s < n`; there is no proportional range mapping or interpolation.
+Reducing a division exposes a shorter prefix without modifying the hidden
+suffix, and increasing it reveals the previous contents of those slots.
+
+Pattern mode presents a scrollable `All` row before the visible trigger rows.
+It reports the whole map as `ON`, `off`, or `mix`, not merely the currently
+visible prefix. Pressing it opens a three-choice confirmation containing
+`Cancel`, `All`, and `None`; `Cancel` is selected initially. The encoder moves
+the choice, and its button confirms it and returns to the pattern list. `All`
+fills all 2048 bits, `None` clears all 2048 bits, and `Cancel` leaves the map
+unchanged. Releasing every beat key while this choice is open is also a cancel.
+At division zero no trigger rows are visible, but `All` remains available and
+still operates on the complete map. Normal division changes and individual
+trigger edits never alter hidden slots.
+
 ### Exact-frame coalescing
 
 Only multiple scheduled ticks belonging to the **same pad** and landing on the
@@ -209,10 +228,10 @@ preview request.
 
 Normal contiguous scheduling uses a rational deadline accumulator: wide
 division is confined to a timing change or non-contiguous recovery, while the
-frame hot path advances with additions and comparisons. Pattern first-bit
-positions are advanced incrementally without a variable divide. These changes
-preserve the original ceiling-based global grid and 2048-bit pattern mapping;
-they change cost rather than musical phase.
+frame hot path advances with additions and comparisons. Pattern playback is a
+direct bit lookup by scheduled step. These changes preserve the original
+ceiling-based global clock grid while avoiding proportional pattern mapping;
+they change scheduling cost rather than musical phase.
 
 Full PWM dither makes sixteen carried-error decisions for each sample. The
 pressure fallback uses a 17-entry mask table to distribute the same number of
@@ -324,11 +343,11 @@ distinct from timing failure.
 | Resource | Budget or baseline |
 | --- | ---: |
 | RP2040 flash layout | 8 MiB |
-| Current release flash use | 1,156,944 bytes |
+| Current release flash use | 1,159,496 bytes |
 | Complete 24-sample bank | 1,064,964 bytes |
-| Free flash in 8 MiB layout | 7,231,664 bytes (about 6.90 MiB) |
-| Current linked static RAM span | 29,728 bytes |
-| RAM remaining before runtime stack | 240,608 bytes (about 235.0 KiB) |
+| Free flash in 8 MiB layout | 7,229,112 bytes (about 6.90 MiB) |
+| Current linked static RAM span | 29,296 bytes |
+| RAM remaining before runtime stack | 241,040 bytes (about 235.4 KiB) |
 | RP2040 SRAM | 264 KiB |
 | Primary voices | 24 physical slots; adaptive effective limit 1–24 |
 | Temporary steal tails | up to 9 fixed slots; adaptive limit 0 or 9 |
@@ -339,12 +358,12 @@ distinct from timing failure.
 | Emergency threshold | 5,225 µs service |
 
 These values come from the current optimized release ELF's loadable sections:
-flash is 256 bytes boot2 + 192 bytes vectors + 70,368 bytes text + 1,072,008
-bytes read-only data + the 14,120-byte data load image. Static RAM is 14,120
-bytes data + 14,584 bytes BSS + the 1,024-byte reserved uninitialized region.
-The data section includes the 11,740-byte hot renderer and 2,216-byte voice
-allocator copied to SRAM; their load images also consume flash. PCM consumes
-no SRAM beyond catalog references.
+flash is 256 bytes boot2 + 192 bytes vectors + 73,120 bytes text + 1,072,132
+bytes read-only data + the 13,796-byte data load image. Static RAM is 13,796
+bytes data + a 4-byte alignment gap + 14,472 bytes BSS + the 1,024-byte
+reserved uninitialized region. The data section includes the 11,416-byte hot
+renderer and 2,216-byte voice allocator copied to SRAM; their load images also
+consume flash. PCM consumes no SRAM beyond catalog references.
 Voice pools and diagnostics are fixed-size static state, and the firmware
 continues to have no heap. The RAM remainder is available to the runtime stack
 and does not claim a measured worst-case stack high-water mark. ELF and UF2
@@ -390,6 +409,13 @@ Exercise these cases separately and confirm their diagnostic counters:
 9. A recovery run long enough to observe Emergency/Pressure, voice-limit
    increments, RecoveryDither, RecoveryTails, RecoveryStarts, and Normal in
    order without chattering.
+10. At division 8, edit slots on both sides of the division-4 boundary, shrink
+    to 4, and return to 8; hidden slots must retain their prior state. Verify
+    that the `All` choice defaults to `Cancel`, that `All` fills and `None`
+    clears the complete map regardless of its prior state, and that both affect
+    hidden slots as well as visible ones. `Cancel` and releasing every beat key
+    from the choice must preserve the map. The choice must remain usable at
+    division zero.
 
 Then run the combined worst-case workload continuously for 10 minutes. Passing
 requires:

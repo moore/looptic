@@ -25,18 +25,28 @@ that key remains held; after it is released, the oldest remaining held key
 becomes primary.
 
 While a beat key is held, press the encoder button once to enter pattern mode.
-The OLED becomes a scrolling list with one entry per trigger point, and
-turning the encoder moves the selection. Subsequent encoder-button presses
-toggle the selected trigger off or on. Pattern mode remains active while any
-beat key is held and exits after all beat keys are released. A division of 0
-displays no triggers, so scrolling and toggling have no effect.
+The OLED becomes a scrolling list whose first entry is `All`, followed by one
+entry per trigger point. Turning the encoder moves the selection. Encoder-button
+presses toggle an individual selected trigger off or on. Selecting `All` instead
+opens a confirmation choice containing `Cancel`, `All`, and `None`, with
+`Cancel` selected by default. Turn the encoder to choose and press it again to
+confirm; the display then returns to the pattern list. Releasing every beat key
+while the choice is open cancels it without changing the pattern. Pattern mode
+otherwise remains active while any beat key is held and exits after all beat
+keys are released. At division 0, `All` remains as the only pattern-list entry.
 
 Each pad has a fixed 2048-bit (256-byte) pattern in RAM, initially with every
-bit enabled. Editing a trigger at a division below 2048 fills that trigger's
-proportional range on the fixed grid. Changing the division does not rescale
-or rewrite the stored pattern: playback maps each new trigger range onto the
-same grid and samples its first bit. This lets a pattern be viewed at other
-divisions without an interpolation step.
+bit enabled. A division of `n` reads and edits the first `n` bits directly:
+trigger 1 uses bit 0, trigger 2 uses bit 1, and so on. Reducing the division
+hides later slots without erasing them; increasing it reveals their previous
+settings. Normal division changes and individual edits never rewrite hidden
+slots.
+
+The `All` entry reports `All ON`, `All off`, or `All mix`. Its confirmation
+choice acts on the entire 2048-bit map, including slots hidden by the current
+division: `All` fills every bit, `None` clears every bit, and `Cancel` changes
+nothing. This makes the result explicit regardless of the map's current state.
+`All` also works at division 0.
 
 With no beat key held, turning the encoder changes the global base interval,
 starting at 1000 ms with a 50 ms safety minimum and no application-level
@@ -328,11 +338,16 @@ general brightness preview.
 Hold overlapping beat keys and verify that only the oldest held key is edited
 until it is released. Enter pattern mode, scroll its OLED list, toggle several
 entries, and verify that the mode persists across a change of primary key but
-exits once every beat key is released. Check that division 0 shows no trigger
-entries, that patterns start fully enabled after boot, and that edits made at
-one division are sampled consistently after changing the division. Verify
-that holding the encoder button changes brightness only when no pad is
-selected.
+exits once every beat key is released. At division 8, edit slots in both the
+first and second groups of four, reduce the division to 4, and verify that the
+later edits are hidden rather than erased; returning to 8 must reveal the same
+settings. Check that patterns start fully enabled after boot and that division
+0 shows `All` as its sole row. Open the `All` choice on full, mixed, and empty
+maps and verify that it defaults to `Cancel`; confirming `All` must fill the
+entire 2048-bit map, while confirming `None` must clear it, including currently
+hidden slots. Confirm that `Cancel` and releasing every beat key from the choice
+leave the complete map unchanged. Verify that holding the encoder button changes
+brightness only when no pad is selected.
 
 Test short Mute taps and 300 ms holds both globally and with a beat held;
 verify that the gesture keeps its original target if held keys change. Confirm
