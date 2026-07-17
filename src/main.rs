@@ -42,10 +42,11 @@ use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
 use looptic::{
-    AUDIO_BLOCK_FRAMES, EncoderAcceleration, EncoderTarget, HeldPadSelection, KeyDebouncer,
-    PAD_COUNT, PatternEditorAction, PatternEditorState, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer,
-    SharedState, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active, pattern_window_start,
-    scale_color,
+    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, EncoderAcceleration, EncoderTarget, HeldPadSelection,
+    KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState, MuteTarget, PatternEditorAction,
+    PatternEditorState, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, VOLUME_KEY_INDEX,
+    VolumeControlState, VolumeTarget, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active,
+    mute_led_color, pattern_window_start, scale_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -66,6 +67,8 @@ type UiShared = Mutex<CriticalSectionRawMutex, RefCell<UiState>>;
 struct UiState {
     selected_pad: Option<usize>,
     encoder_pressed: bool,
+    volume_pressed: bool,
+    volume_target: Option<VolumeTarget>,
     pattern_editor: PatternEditorState,
 }
 
@@ -165,11 +168,25 @@ async fn audio_task(
     let mut back = AUDIO_DMA_BACK.init([SILENCE_PWM_WORD; AUDIO_BLOCK_FRAMES]);
 
     let mut front_start = 0_u64;
-    let (initial_beats, initial_base_interval) = shared.lock(|state| {
+    let (
+        initial_beats,
+        initial_base_interval,
+        initial_mute_mask,
+        initial_global_volume,
+        initial_pad_volumes,
+    ) = shared.lock(|state| {
         let state = state.borrow();
-        (state.desired_beats, state.base_interval_ms)
+        (
+            state.desired_beats,
+            state.base_interval_ms,
+            state.effective_mute_mask(),
+            state.global_volume_percent(),
+            *state.pad_volume_percents(),
+        )
     });
     sequencer.apply_timing(&initial_beats, initial_base_interval, front_start);
+    sequencer.set_mute_mask(initial_mute_mask);
+    sequencer.set_volumes(initial_global_volume, &initial_pad_volumes);
     sync_pattern_updates(shared, &mut sequencer);
     let report = sequencer.render(front_start, front);
     publish_render(shared, &report);
@@ -186,11 +203,19 @@ async fn audio_task(
         let transfer = sm.tx().dma_push(&mut dma, front, false);
 
         let back_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
-        let (beats, base_interval) = shared.lock(|state| {
+        let (beats, base_interval, mute_mask, global_volume, pad_volumes) = shared.lock(|state| {
             let state = state.borrow();
-            (state.desired_beats, state.base_interval_ms)
+            (
+                state.desired_beats,
+                state.base_interval_ms,
+                state.effective_mute_mask(),
+                state.global_volume_percent(),
+                *state.pad_volume_percents(),
+            )
         });
         sequencer.apply_timing(&beats, base_interval, back_start);
+        sequencer.set_mute_mask(mute_mask);
+        sequencer.set_volumes(global_volume, &pad_volumes);
         sync_pattern_updates(shared, &mut sequencer);
         let report = sequencer.render(back_start, back);
         publish_render(shared, &report);
@@ -214,7 +239,7 @@ fn sync_pattern_updates(shared: &Shared, sequencer: &mut Sequencer<'_>) {
     shared.lock(|state| {
         let mut state = state.borrow_mut();
         let dirty = state.take_pattern_dirty_mask();
-        for pad in 0..PAD_COUNT {
+        for pad in 0..BEAT_PAD_COUNT {
             if dirty & (1 << pad) != 0
                 && let Some(pattern) = state.pattern(pad).copied()
             {
@@ -237,7 +262,7 @@ fn publish_render(shared: &Shared, report: &looptic::RenderReport) {
 
 #[embassy_executor::task]
 async fn controls_task(
-    mut keys: [Input<'static>; PAD_COUNT],
+    mut keys: [Input<'static>; KEY_COUNT],
     mut encoder: PioEncoder<'static, PIO1, 1>,
     encoder_button: Input<'static>,
     shared: &'static Shared,
@@ -246,6 +271,8 @@ async fn controls_task(
     let mut debouncer = KeyDebouncer::new(5);
     let mut encoder_button_debouncer = KeyDebouncer::new(5);
     let mut selection = HeldPadSelection::new();
+    let mut mute_button = MuteButtonState::new();
+    let mut volume_control = VolumeControlState::new();
     let mut next_scan = Instant::now();
     let mut encoder_acceleration = EncoderAcceleration::new();
 
@@ -256,6 +283,7 @@ async fn controls_task(
                 ui_state.selected_pad,
                 ui_state.encoder_pressed,
                 ui_state.pattern_editor.active,
+                ui_state.volume_target,
             );
             let direction_delta = match direction {
                 Direction::Clockwise => 1,
@@ -292,18 +320,42 @@ async fn controls_task(
                 encoder_button_debouncer.update(u16::from(encoder_button.is_low()));
             let encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
             let primary = selection.selected();
+            let volume_pressed = debouncer.stable_mask() & (1 << VOLUME_KEY_INDEX) != 0;
+            volume_control.update(volume_pressed, changes, primary);
+            let volume_target = volume_control.active_target();
+            let mut next_ui = ui.lock(|state| *state.borrow());
+            let volume_was_pressed = next_ui.volume_pressed;
+            let mute_bit = 1_u16 << MUTE_KEY_INDEX;
+            let now_ms = now.as_millis();
+            if changes.pressed & mute_bit != 0 {
+                let target = MuteTarget::for_selected_pad(primary);
+                if mute_button.press(target, now_ms) {
+                    shared.lock(|state| {
+                        state.borrow_mut().begin_mute_gesture(target);
+                    });
+                }
+            }
+            if changes.released & mute_bit != 0
+                && let Some(release) = mute_button.release(now_ms)
+            {
+                shared.lock(|state| {
+                    state.borrow_mut().end_mute_gesture(release);
+                });
+            }
             let division = primary.map_or(0, |pad| {
                 shared.lock(|state| state.borrow().desired_beats[pad])
             });
-            let mut next_ui = ui.lock(|state| *state.borrow());
             next_ui.selected_pad = primary;
             next_ui.encoder_pressed = encoder_pressed;
+            next_ui.volume_pressed = volume_pressed;
+            next_ui.volume_target = volume_target;
             next_ui.pattern_editor.update_primary(primary, division);
-            let editor_action = if button_changes.pressed & 1 != 0 {
-                next_ui.pattern_editor.button_pressed(primary, division)
-            } else {
-                None
-            };
+            let editor_action =
+                if !volume_pressed && !volume_was_pressed && button_changes.pressed & 1 != 0 {
+                    next_ui.pattern_editor.button_pressed(primary, division)
+                } else {
+                    None
+                };
             if let Some(PatternEditorAction::Toggle { pad, step }) = editor_action {
                 shared.lock(|state| {
                     state.borrow_mut().toggle_pattern_step(pad, step);
@@ -322,29 +374,35 @@ async fn controls_task(
 
 #[embassy_executor::task]
 async fn led_task(
-    mut pixels: PioWs2812<'static, PIO1, 0, PAD_COUNT, Grb>,
+    mut pixels: PioWs2812<'static, PIO1, 0, KEY_COUNT, Grb>,
     mut status_led: Output<'static>,
     shared: &'static Shared,
     ui: &'static UiShared,
 ) {
     let mut ticker = Ticker::every(LED_INTERVAL);
     loop {
-        let (playback_frame, triggers, underruns, brightness) = shared.lock(|state| {
-            let state = state.borrow();
-            (
-                state.playback_frame,
-                state.latest_trigger_frames,
-                state.underrun_count,
-                state.led_brightness_percent,
-            )
-        });
-        let brightness_preview = ui.lock(|state| {
-            let state = state.borrow();
-            state.selected_pad.is_none() && state.encoder_pressed
-        });
+        let ui_state = ui.lock(|state| *state.borrow());
+        let mute_target = MuteTarget::for_selected_pad(ui_state.selected_pad);
+        let volume_target = ui_state
+            .volume_target
+            .unwrap_or(VolumeTarget::for_selected_pad(ui_state.selected_pad));
+        let (playback_frame, triggers, underruns, brightness, mute_active, volume) =
+            shared.lock(|state| {
+                let state = state.borrow();
+                (
+                    state.playback_frame,
+                    state.latest_trigger_frames,
+                    state.underrun_count,
+                    state.led_brightness_percent,
+                    state.mute_indicator_active(mute_target).unwrap_or(false),
+                    state.volume_percent(volume_target).unwrap_or(0),
+                )
+            });
+        let brightness_preview =
+            ui_state.selected_pad.is_none() && ui_state.encoder_pressed && !ui_state.volume_pressed;
 
-        let mut colors = [RGB8::default(); PAD_COUNT];
-        for pad in 0..PAD_COUNT {
+        let mut colors = [RGB8::default(); KEY_COUNT];
+        for pad in 0..BEAT_PAD_COUNT {
             if brightness_preview
                 || led_pulse_active(playback_frame, triggers[pad], SAMPLE_RATE / 10)
             {
@@ -352,6 +410,10 @@ async fn led_task(
                 colors[pad] = RGB8 { r, g, b };
             }
         }
+        let (r, g, b) = mute_led_color(mute_active, brightness);
+        colors[MUTE_KEY_INDEX] = RGB8 { r, g, b };
+        let (r, g, b) = volume_led_color(volume, brightness);
+        colors[VOLUME_KEY_INDEX] = RGB8 { r, g, b };
         pixels.write(&colors).await;
 
         if underruns != 0 || FATAL_FAULT.load(Ordering::Relaxed) {
@@ -450,6 +512,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             ui_state.selected_pad,
             ui_state.encoder_pressed,
             ui_state.pattern_editor.active,
+            ui_state.volume_target,
         );
         let (displayed_value, pattern_revision) = shared.lock(|state| {
             let state = state.borrow();
@@ -461,6 +524,9 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     u32::from(ui_state.pattern_editor.cursor),
                     state.pattern_revision,
                 ),
+                EncoderTarget::Volume(target) => {
+                    (u32::from(state.volume_percent(target).unwrap_or(0)), 0)
+                }
             }
         });
         let value = (target, displayed_value, pattern_revision);
@@ -500,6 +566,22 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                         pad,
                         ui_state.pattern_editor.cursor,
                     );
+                }
+                EncoderTarget::Volume(VolumeTarget::Global) => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    let _ = write!(&mut line, "Master {}%", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                EncoderTarget::Volume(VolumeTarget::Pad(pad)) => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
                 }
             }
 

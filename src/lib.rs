@@ -5,7 +5,11 @@
 //! The RP2040 firmware lives in `main.rs`. Keeping this module free of HAL
 //! dependencies makes the timing and sample conversion code testable on a host.
 
-pub const PAD_COUNT: usize = 12;
+pub const KEY_COUNT: usize = 12;
+pub const BEAT_PAD_COUNT: usize = 9;
+pub const MUTE_KEY_INDEX: usize = 9;
+pub const VOLUME_KEY_INDEX: usize = 10;
+pub const BEAT_PAD_MASK: u16 = (1_u16 << BEAT_PAD_COUNT) - 1;
 pub const SAMPLE_RATE: u32 = 22_050;
 pub const AUDIO_BLOCK_FRAMES: usize = 128;
 pub const MAX_BEAT_MULTIPLIER: u16 = 2_048;
@@ -18,8 +22,12 @@ pub const BASE_INTERVAL_STEP_MS: u32 = 10;
 pub const FAST_ENCODER_MULTIPLIER: i32 = 10;
 pub const FAST_ENCODER_THRESHOLD_MS: u64 = 75;
 pub const DEFAULT_LED_BRIGHTNESS_PERCENT: u8 = 50;
+pub const DEFAULT_VOLUME_PERCENT: u8 = 100;
+pub const MUTE_TAP_THRESHOLD_MS: u64 = 300;
+pub const MUTE_LED_DIM_PERCENT: u8 = 20;
 
 const SAMPLE_COUNT: usize = 2;
+const KICK_PAD_COUNT: usize = 6;
 const KICK_INDEX: usize = 0;
 const OPEN_HAT_INDEX: usize = 1;
 const PWM_QUANTIZED_MAX: u32 = 127;
@@ -274,7 +282,7 @@ impl SampleId {
     }
 
     const fn for_pad(pad: usize) -> Self {
-        if pad < PAD_COUNT / 2 {
+        if pad < KICK_PAD_COUNT {
             Self::Kick
         } else {
             Self::OpenHat
@@ -342,7 +350,7 @@ impl PadState {
 /// Per-block events produced while rendering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RenderReport {
-    pub latest_visual_triggers: [Option<u64>; PAD_COUNT],
+    pub latest_visual_triggers: [Option<u64>; BEAT_PAD_COUNT],
     pub audible_trigger_counts: [u16; SAMPLE_COUNT],
 }
 
@@ -389,8 +397,11 @@ impl DitherEncoder {
 
 pub struct Sequencer<'a> {
     samples: [WavPcm16<'a>; SAMPLE_COUNT],
-    pads: [PadState; PAD_COUNT],
-    patterns: [Pattern; PAD_COUNT],
+    pads: [PadState; BEAT_PAD_COUNT],
+    patterns: [Pattern; BEAT_PAD_COUNT],
+    mute_mask: u16,
+    global_volume_percent: u8,
+    pad_volume_percents: [u8; BEAT_PAD_COUNT],
     base_interval_ms: u32,
     dither: DitherEncoder,
 }
@@ -400,13 +411,16 @@ impl<'a> Sequencer<'a> {
         Self {
             samples: [kick, open_hat],
             pads: core::array::from_fn(PadState::new),
-            patterns: [Pattern::all_enabled(); PAD_COUNT],
+            patterns: [Pattern::all_enabled(); BEAT_PAD_COUNT],
+            mute_mask: 0,
+            global_volume_percent: DEFAULT_VOLUME_PERCENT,
+            pad_volume_percents: [DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT],
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             dither: DitherEncoder::new(),
         }
     }
 
-    pub fn pads(&self) -> &[PadState; PAD_COUNT] {
+    pub fn pads(&self) -> &[PadState; BEAT_PAD_COUNT] {
         &self.pads
     }
 
@@ -426,13 +440,56 @@ impl<'a> Sequencer<'a> {
         self.patterns.get(pad)
     }
 
+    /// Apply the effective mute state at an audio render boundary.
+    ///
+    /// Pads that have just become muted stop immediately. Unmuting does not
+    /// retrigger a voice; playback resumes at that pad's next scheduled tick.
+    pub fn set_mute_mask(&mut self, mute_mask: u16) {
+        let mute_mask = mute_mask & BEAT_PAD_MASK;
+        let newly_muted = mute_mask & !self.mute_mask;
+        for (pad, state) in self.pads.iter_mut().enumerate() {
+            if newly_muted & (1_u16 << pad) != 0 {
+                state.voice.playing = false;
+            }
+        }
+        self.mute_mask = mute_mask;
+    }
+
+    pub const fn mute_mask(&self) -> u16 {
+        self.mute_mask
+    }
+
+    /// Apply master and per-pad gain at an audio render boundary.
+    pub fn set_volumes(
+        &mut self,
+        global_volume_percent: u8,
+        pad_volume_percents: &[u8; BEAT_PAD_COUNT],
+    ) {
+        self.global_volume_percent = global_volume_percent.min(100);
+        for (destination, requested) in self
+            .pad_volume_percents
+            .iter_mut()
+            .zip(pad_volume_percents.iter().copied())
+        {
+            *destination = requested.min(100);
+        }
+    }
+
+    pub const fn global_volume_percent(&self) -> u8 {
+        self.global_volume_percent
+    }
+
+    pub fn pad_volume_percent(&self, pad: usize) -> Option<u8> {
+        self.pad_volume_percents.get(pad).copied()
+    }
+
     /// Apply the base interval and per-pad beat multipliers at a render boundary.
     ///
     /// Changed timing is aligned to the global sample epoch and begins at the
     /// first tick strictly after `from_frame`. Unchanged timing retains phase.
     pub fn apply_timing(
         &mut self,
-        beats: &[u16; PAD_COUNT],
+        beats: &[u16; BEAT_PAD_COUNT],
         base_interval_ms: u32,
         from_frame: u64,
     ) {
@@ -474,7 +531,8 @@ impl<'a> Sequencer<'a> {
     }
 
     fn render_pcm_frame(&mut self, frame: u64, report: &mut RenderReport) -> i16 {
-        let mut sample_triggered = [false; SAMPLE_COUNT];
+        let mut first_due = [None; SAMPLE_COUNT];
+        let mut first_nonzero_due = [None; SAMPLE_COUNT];
 
         for (pad_index, pad) in self.pads.iter_mut().enumerate() {
             let mut enabled_step_due = false;
@@ -498,21 +556,40 @@ impl<'a> Sequencer<'a> {
 
             if enabled_step_due {
                 report.latest_visual_triggers[pad_index] = Some(frame);
+                if self.mute_mask & (1_u16 << pad_index) != 0 {
+                    continue;
+                }
                 let sample_index = pad.voice.sample.index();
-                if !sample_triggered[sample_index] {
-                    pad.voice.trigger();
-                    sample_triggered[sample_index] = true;
-                    report.audible_trigger_counts[sample_index] =
-                        report.audible_trigger_counts[sample_index].saturating_add(1);
+                if first_due[sample_index].is_none() {
+                    first_due[sample_index] = Some(pad_index);
+                }
+                if self.pad_volume_percents[pad_index] > 0
+                    && first_nonzero_due[sample_index].is_none()
+                {
+                    first_nonzero_due[sample_index] = Some(pad_index);
                 }
             }
         }
 
-        let mut total = 0_i32;
-        for pad in &mut self.pads {
-            total = total.saturating_add(i32::from(pad.voice.next(&self.samples)));
+        for sample_index in 0..SAMPLE_COUNT {
+            let candidate = first_nonzero_due[sample_index].or(first_due[sample_index]);
+            let Some(pad_index) = candidate else {
+                continue;
+            };
+            self.pads[pad_index].voice.trigger();
+            if self.global_volume_percent > 0 && self.pad_volume_percents[pad_index] > 0 {
+                report.audible_trigger_counts[sample_index] =
+                    report.audible_trigger_counts[sample_index].saturating_add(1);
+            }
         }
-        saturating_i16(total)
+
+        let mut total = 0_i32;
+        for (pad_index, pad) in self.pads.iter_mut().enumerate() {
+            let sample = i32::from(pad.voice.next(&self.samples));
+            let scaled = scale_audio_percent(sample, self.pad_volume_percents[pad_index]);
+            total = total.saturating_add(scaled);
+        }
+        saturating_i16(scale_audio_percent(total, self.global_volume_percent))
     }
 }
 
@@ -549,31 +626,143 @@ pub const fn saturating_i16(value: i32) -> i16 {
     }
 }
 
+/// Scale a signed audio accumulator by a linear percentage.
+///
+/// Division truncates toward zero, preserving symmetry for positive and
+/// negative sample values. The wider intermediate supports every `i32` input.
+#[inline]
+pub fn scale_audio_percent(value: i32, volume_percent: u8) -> i32 {
+    ((i64::from(value) * i64::from(volume_percent.min(100))) / 100) as i32
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MuteTarget {
+    Global,
+    Pad(usize),
+}
+
+impl MuteTarget {
+    pub const fn for_selected_pad(selected_pad: Option<usize>) -> Self {
+        match selected_pad {
+            Some(pad) if pad < BEAT_PAD_COUNT => Self::Pad(pad),
+            _ => Self::Global,
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Pad(pad) => pad < BEAT_PAD_COUNT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VolumeTarget {
+    Global,
+    Pad(usize),
+}
+
+impl VolumeTarget {
+    /// Select a pad-local volume when a valid beat key is held, otherwise the
+    /// global master volume. Calling this continuously provides live targeting.
+    pub const fn for_selected_pad(selected_pad: Option<usize>) -> Self {
+        match selected_pad {
+            Some(pad) if pad < BEAT_PAD_COUNT => Self::Pad(pad),
+            _ => Self::Global,
+        }
+    }
+
+    const fn is_valid(self) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Pad(pad) => pad < BEAT_PAD_COUNT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MuteRelease {
+    pub target: MuteTarget,
+    pub tapped: bool,
+}
+
+/// Tracks one debounced press of the physical mute key.
+///
+/// The target is captured at the press edge so changes to held beat keys do
+/// not retarget an in-progress gesture.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MuteButtonState {
+    active: Option<(MuteTarget, u64)>,
+}
+
+impl MuteButtonState {
+    pub const fn new() -> Self {
+        Self { active: None }
+    }
+
+    /// Capture a gesture. Returns false for an invalid target or duplicate
+    /// press while another gesture is active.
+    pub fn press(&mut self, target: MuteTarget, now_ms: u64) -> bool {
+        if self.active.is_some() || !target.is_valid() {
+            return false;
+        }
+        self.active = Some((target, now_ms));
+        true
+    }
+
+    pub const fn active_target(&self) -> Option<MuteTarget> {
+        match self.active {
+            Some((target, _)) => Some(target),
+            None => None,
+        }
+    }
+
+    /// Finish the active gesture. Exactly 300 ms is a hold, not a tap.
+    pub fn release(&mut self, now_ms: u64) -> Option<MuteRelease> {
+        let (target, pressed_at_ms) = self.active.take()?;
+        Some(MuteRelease {
+            target,
+            tapped: now_ms.wrapping_sub(pressed_at_ms) < MUTE_TAP_THRESHOLD_MS,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SharedState {
-    pub desired_beats: [u16; PAD_COUNT],
+    pub desired_beats: [u16; BEAT_PAD_COUNT],
     pub base_interval_ms: u32,
     pub led_brightness_percent: u8,
     pub playback_frame: u64,
-    pub latest_trigger_frames: [u64; PAD_COUNT],
+    pub latest_trigger_frames: [u64; BEAT_PAD_COUNT],
     pub underrun_count: u32,
-    patterns: [Pattern; PAD_COUNT],
+    patterns: [Pattern; BEAT_PAD_COUNT],
     pattern_dirty_mask: u16,
     pub pattern_revision: u32,
+    global_mute_latched: bool,
+    pad_mute_latched: [bool; BEAT_PAD_COUNT],
+    momentary_mute_target: Option<MuteTarget>,
+    global_volume_percent: u8,
+    pad_volume_percents: [u8; BEAT_PAD_COUNT],
 }
 
 impl Default for SharedState {
     fn default() -> Self {
         Self {
-            desired_beats: [0; PAD_COUNT],
+            desired_beats: [0; BEAT_PAD_COUNT],
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             led_brightness_percent: DEFAULT_LED_BRIGHTNESS_PERCENT,
             playback_frame: 0,
-            latest_trigger_frames: [0; PAD_COUNT],
+            latest_trigger_frames: [0; BEAT_PAD_COUNT],
             underrun_count: 0,
-            patterns: [Pattern::all_enabled(); PAD_COUNT],
+            patterns: [Pattern::all_enabled(); BEAT_PAD_COUNT],
             pattern_dirty_mask: 0,
             pattern_revision: 0,
+            global_mute_latched: false,
+            pad_mute_latched: [false; BEAT_PAD_COUNT],
+            momentary_mute_target: None,
+            global_volume_percent: DEFAULT_VOLUME_PERCENT,
+            pad_volume_percents: [DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT],
         }
     }
 }
@@ -596,6 +785,89 @@ impl SharedState {
         self.pattern_dirty_mask = 0;
         dirty
     }
+
+    pub fn latched_mute(&self, target: MuteTarget) -> Option<bool> {
+        match target {
+            MuteTarget::Global => Some(self.global_mute_latched),
+            MuteTarget::Pad(pad) => self.pad_mute_latched.get(pad).copied(),
+        }
+    }
+
+    /// Start the momentary overlay for a captured gesture.
+    pub fn begin_mute_gesture(&mut self, target: MuteTarget) -> bool {
+        if !target.is_valid() || self.momentary_mute_target.is_some() {
+            return false;
+        }
+        self.momentary_mute_target = Some(target);
+        true
+    }
+
+    /// Atomically clear the momentary overlay and, for a tap, toggle its
+    /// captured persistent mute.
+    pub fn end_mute_gesture(&mut self, release: MuteRelease) -> bool {
+        if self.momentary_mute_target != Some(release.target) {
+            return false;
+        }
+        if release.tapped {
+            match release.target {
+                MuteTarget::Global => self.global_mute_latched = !self.global_mute_latched,
+                MuteTarget::Pad(pad) => {
+                    self.pad_mute_latched[pad] = !self.pad_mute_latched[pad];
+                }
+            }
+        }
+        self.momentary_mute_target = None;
+        true
+    }
+
+    /// The local status shown by the mute key: global state for the global
+    /// target, or only the selected pad's state for a pad target.
+    pub fn mute_indicator_active(&self, target: MuteTarget) -> Option<bool> {
+        Some(self.latched_mute(target)? || self.momentary_mute_target == Some(target))
+    }
+
+    /// Produce the pad mask consumed by the real-time sequencer.
+    pub fn effective_mute_mask(&self) -> u16 {
+        if self.global_mute_latched || self.momentary_mute_target == Some(MuteTarget::Global) {
+            return BEAT_PAD_MASK;
+        }
+
+        let mut mask = 0_u16;
+        for (pad, muted) in self.pad_mute_latched.iter().copied().enumerate() {
+            if muted || self.momentary_mute_target == Some(MuteTarget::Pad(pad)) {
+                mask |= 1_u16 << pad;
+            }
+        }
+        mask
+    }
+
+    pub const fn global_volume_percent(&self) -> u8 {
+        self.global_volume_percent
+    }
+
+    pub const fn pad_volume_percents(&self) -> &[u8; BEAT_PAD_COUNT] {
+        &self.pad_volume_percents
+    }
+
+    pub fn volume_percent(&self, target: VolumeTarget) -> Option<u8> {
+        match target {
+            VolumeTarget::Global => Some(self.global_volume_percent),
+            VolumeTarget::Pad(pad) => self.pad_volume_percents.get(pad).copied(),
+        }
+    }
+
+    /// Adjust a master or per-pad percentage, clamped to the supported range.
+    pub fn adjust_volume(&mut self, target: VolumeTarget, delta: i32) -> Option<u8> {
+        if !target.is_valid() {
+            return None;
+        }
+        let volume = match target {
+            VolumeTarget::Global => &mut self.global_volume_percent,
+            VolumeTarget::Pad(pad) => &mut self.pad_volume_percents[pad],
+        };
+        *volume = adjust_volume_percent(*volume, delta);
+        Some(*volume)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -604,11 +876,74 @@ pub struct KeyChanges {
     pub released: u16,
 }
 
+/// Resolves the live target of one held Volume-modifier gesture.
+///
+/// Later beat presses are ignored while a pad is targeted. Releasing that pad
+/// falls back to master volume without promoting beat keys that were already
+/// held; one of those keys must be released and pressed again to become local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VolumeControlState {
+    active: bool,
+    target: VolumeTarget,
+}
+
+impl VolumeControlState {
+    pub const fn new() -> Self {
+        Self {
+            active: false,
+            target: VolumeTarget::Global,
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        volume_pressed: bool,
+        changes: KeyChanges,
+        current_primary: Option<usize>,
+    ) {
+        if !volume_pressed {
+            self.active = false;
+            self.target = VolumeTarget::Global;
+            return;
+        }
+
+        if !self.active {
+            self.active = true;
+            self.target = VolumeTarget::for_selected_pad(current_primary);
+            return;
+        }
+
+        match self.target {
+            VolumeTarget::Pad(pad) => {
+                if changes.released & (1_u16 << pad) != 0 {
+                    self.target = VolumeTarget::Global;
+                }
+            }
+            VolumeTarget::Global => {
+                let newly_pressed_beats = changes.pressed & BEAT_PAD_MASK;
+                if newly_pressed_beats != 0 {
+                    self.target = VolumeTarget::Pad(newly_pressed_beats.trailing_zeros() as usize);
+                }
+            }
+        }
+    }
+
+    pub const fn active_target(&self) -> Option<VolumeTarget> {
+        if self.active { Some(self.target) } else { None }
+    }
+}
+
+impl Default for VolumeControlState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Debounces twelve active-high logical key bits using consecutive samples.
 pub struct KeyDebouncer {
     threshold: u8,
     stable_mask: u16,
-    counters: [u8; PAD_COUNT],
+    counters: [u8; KEY_COUNT],
 }
 
 impl KeyDebouncer {
@@ -616,7 +951,7 @@ impl KeyDebouncer {
         Self {
             threshold: stable_samples.max(1),
             stable_mask: 0,
-            counters: [0; PAD_COUNT],
+            counters: [0; KEY_COUNT],
         }
     }
 
@@ -626,18 +961,18 @@ impl KeyDebouncer {
 
     pub fn update(&mut self, raw_mask: u16) -> KeyChanges {
         let mut changes = KeyChanges::default();
-        for pad in 0..PAD_COUNT {
-            let bit = 1_u16 << pad;
+        for key in 0..KEY_COUNT {
+            let bit = 1_u16 << key;
             let raw = raw_mask & bit != 0;
             let stable = self.stable_mask & bit != 0;
             if raw == stable {
-                self.counters[pad] = 0;
+                self.counters[key] = 0;
                 continue;
             }
 
-            self.counters[pad] = self.counters[pad].saturating_add(1);
-            if self.counters[pad] >= self.threshold {
-                self.counters[pad] = 0;
+            self.counters[key] = self.counters[key].saturating_add(1);
+            if self.counters[key] >= self.threshold {
+                self.counters[key] = 0;
                 if raw {
                     self.stable_mask |= bit;
                     changes.pressed |= bit;
@@ -654,7 +989,7 @@ impl KeyDebouncer {
 /// Tracks the oldest pressed key that is still held as the primary pad.
 pub struct HeldPadSelection {
     held_mask: u16,
-    press_order: [u32; PAD_COUNT],
+    press_order: [u32; BEAT_PAD_COUNT],
     sequence: u32,
 }
 
@@ -662,20 +997,20 @@ impl HeldPadSelection {
     pub const fn new() -> Self {
         Self {
             held_mask: 0,
-            press_order: [0; PAD_COUNT],
+            press_order: [0; BEAT_PAD_COUNT],
             sequence: 0,
         }
     }
 
     pub fn apply(&mut self, changes: KeyChanges) {
-        self.held_mask &= !changes.released;
-        for pad in 0..PAD_COUNT {
+        self.held_mask &= !(changes.released & BEAT_PAD_MASK);
+        for pad in 0..BEAT_PAD_COUNT {
             let bit = 1_u16 << pad;
             if changes.pressed & bit != 0 {
                 self.sequence = self.sequence.wrapping_add(1);
                 if self.sequence == 0 {
                     self.renumber();
-                    self.sequence = PAD_COUNT as u32 + 1;
+                    self.sequence = BEAT_PAD_COUNT as u32 + 1;
                 }
                 self.press_order[pad] = self.sequence;
                 self.held_mask |= bit;
@@ -686,7 +1021,7 @@ impl HeldPadSelection {
     pub fn selected(&self) -> Option<usize> {
         let mut selected = None;
         let mut oldest = u32::MAX;
-        for pad in 0..PAD_COUNT {
+        for pad in 0..BEAT_PAD_COUNT {
             if self.held_mask & (1 << pad) != 0 && self.press_order[pad] < oldest {
                 oldest = self.press_order[pad];
                 selected = Some(pad);
@@ -703,7 +1038,7 @@ impl HeldPadSelection {
         // Overflow is practically unreachable; preserving relative pad order is
         // sufficient if it ever occurs.
         let mut next = 1_u32;
-        for pad in 0..PAD_COUNT {
+        for pad in 0..BEAT_PAD_COUNT {
             if self.held_mask & (1 << pad) != 0 {
                 self.press_order[pad] = next;
                 next += 1;
@@ -738,6 +1073,12 @@ pub fn adjust_base_interval(current_ms: u32, delta_steps: i32) -> u32 {
 
 pub fn adjust_led_brightness(current_percent: u8, delta: i32) -> u8 {
     i32::from(current_percent)
+        .saturating_add(delta)
+        .clamp(0, 100) as u8
+}
+
+pub fn adjust_volume_percent(current_percent: u8, delta: i32) -> u8 {
+    i32::from(current_percent.min(100))
         .saturating_add(delta)
         .clamp(0, 100) as u8
 }
@@ -829,6 +1170,7 @@ pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncoderTarget {
+    Volume(VolumeTarget),
     BaseInterval,
     LedBrightness,
     Pad(usize),
@@ -840,7 +1182,11 @@ impl EncoderTarget {
         selected_pad: Option<usize>,
         encoder_pressed: bool,
         pattern_mode: bool,
+        volume_target: Option<VolumeTarget>,
     ) -> Self {
+        if let Some(target) = volume_target {
+            return Self::Volume(target);
+        }
         match selected_pad {
             Some(pad) if pattern_mode => Self::PatternStep(pad),
             Some(pad) => Self::Pad(pad),
@@ -877,7 +1223,10 @@ impl EncoderAcceleration {
 /// Apply one or more encoder steps to the currently selected timing control.
 pub fn apply_encoder_delta(state: &mut SharedState, target: EncoderTarget, delta: i32) {
     match target {
-        EncoderTarget::Pad(pad) if pad < PAD_COUNT => {
+        EncoderTarget::Volume(target) => {
+            let _ = state.adjust_volume(target, delta);
+        }
+        EncoderTarget::Pad(pad) if pad < BEAT_PAD_COUNT => {
             state.desired_beats[pad] = adjust_beat_multiplier(state.desired_beats[pad], delta);
         }
         EncoderTarget::Pad(_) | EncoderTarget::PatternStep(_) => {}
@@ -895,6 +1244,26 @@ pub fn scale_color(color: (u8, u8, u8), brightness_percent: u8) -> (u8, u8, u8) 
     let brightness = u16::from(brightness_percent.min(100));
     let scale = |channel: u8| ((u16::from(channel) * brightness + 50) / 100) as u8;
     (scale(color.0), scale(color.1), scale(color.2))
+}
+
+/// Red mute-control LED, scaled by the configured brightness. Active mute is
+/// shown at a fixed fraction of the unmuted red level.
+pub fn mute_led_color(muted: bool, brightness_percent: u8) -> (u8, u8, u8) {
+    let brightness = brightness_percent.min(100);
+    let brightness = if muted {
+        ((u16::from(brightness) * u16::from(MUTE_LED_DIM_PERCENT) + 50) / 100) as u8
+    } else {
+        brightness
+    };
+    scale_color((u8::MAX, 0, 0), brightness)
+}
+
+/// Yellow volume-control LED. Its level combines the selected stored volume
+/// with the configured LED brightness.
+pub fn volume_led_color(volume_percent: u8, brightness_percent: u8) -> (u8, u8, u8) {
+    let combined_percent =
+        (u16::from(volume_percent.min(100)) * u16::from(brightness_percent.min(100)) + 50) / 100;
+    scale_color((u8::MAX, u8::MAX, 0), combined_percent as u8)
 }
 
 /// CircuitPython `rainbowio.colorwheel` for an 8-bit wheel position.
@@ -1054,7 +1423,7 @@ mod tests {
         for pad in 0..6 {
             assert_eq!(sequencer.pads[pad].voice.sample, SampleId::Kick);
         }
-        for pad in 6..PAD_COUNT {
+        for pad in 6..BEAT_PAD_COUNT {
             assert_eq!(sequencer.pads[pad].voice.sample, SampleId::OpenHat);
         }
 
@@ -1174,7 +1543,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
         assert_eq!(sequencer.pads()[0].next_frame, Some(22_050));
@@ -1208,7 +1577,7 @@ mod tests {
         assert!(pattern.set_step_enabled(0, 4, false));
         assert!(sequencer.set_pattern(0, pattern));
 
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 4;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
 
@@ -1232,7 +1601,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1;
         beats[6] = 2;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
@@ -1259,7 +1628,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 71;
         beats[6] = 73;
 
@@ -1278,7 +1647,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, u64::MAX - 10);
         let deadline = sequencer.pads()[0].next_frame.unwrap();
@@ -1301,7 +1670,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = MAX_BEAT_MULTIPLIER;
         sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
 
@@ -1326,7 +1695,7 @@ mod tests {
         assert!(pattern.set_step_enabled(2, MAX_BEAT_MULTIPLIER, true));
         assert!(sequencer.set_pattern(0, pattern));
 
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = MAX_BEAT_MULTIPLIER;
         sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
 
@@ -1351,7 +1720,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         beats[1] = 1_000;
         beats[6] = 1_000;
@@ -1369,6 +1738,205 @@ mod tests {
     }
 
     #[test]
+    fn muting_stops_voice_but_preserves_scheduler_phase_and_visuals() {
+        let kick_bytes = wav(&[100, 50, 25], false);
+        let hat_bytes = wav(&[200], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+
+        let mut output = [0_u32; 1];
+        let first = sequencer.render(23, &mut output);
+        assert_eq!(first.latest_visual_triggers[0], Some(23));
+        assert_eq!(first.audible_trigger_counts[0], 1);
+        assert!(sequencer.pads()[0].voice.playing);
+
+        sequencer.set_mute_mask(1 << 0);
+        assert!(!sequencer.pads()[0].voice.playing);
+        let muted = sequencer.render(45, &mut output);
+        assert_eq!(muted.latest_visual_triggers[0], Some(45));
+        assert_eq!(muted.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 3);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(67));
+
+        sequencer.set_mute_mask(0);
+        assert!(!sequencer.pads()[0].voice.playing);
+        let unmuted = sequencer.render(67, &mut output);
+        assert_eq!(unmuted.latest_visual_triggers[0], Some(67));
+        assert_eq!(unmuted.audible_trigger_counts[0], 1);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
+    }
+
+    #[test]
+    fn muted_pad_does_not_claim_duplicate_sample_trigger() {
+        let kick_bytes = wav(&[100, 50], false);
+        let hat_bytes = wav(&[200], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        beats[1] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.set_mute_mask((1 << 0) | (1 << 15));
+        assert_eq!(sequencer.mute_mask(), 1 << 0);
+
+        let mut output = [0_u32; 1];
+        let report = sequencer.render(23, &mut output);
+        assert_eq!(report.latest_visual_triggers[0], Some(23));
+        assert_eq!(report.latest_visual_triggers[1], Some(23));
+        assert_eq!(report.audible_trigger_counts[0], 1);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
+        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
+    }
+
+    #[test]
+    fn per_pad_gain_is_applied_before_master_and_final_saturation() {
+        assert_eq!(scale_audio_percent(101, 50), 50);
+        assert_eq!(scale_audio_percent(-101, 50), -50);
+        assert_eq!(scale_audio_percent(i32::MAX, 100), i32::MAX);
+        assert_eq!(scale_audio_percent(i32::MIN, 100), i32::MIN);
+        assert_eq!(scale_audio_percent(123, u8::MAX), 123);
+
+        let kick_bytes = wav(&[20_000], false);
+        let hat_bytes = wav(&[-20_000], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let full = [100; BEAT_PAD_COUNT];
+        sequencer.set_volumes(50, &full);
+        sequencer.pads[0].voice.trigger();
+        sequencer.pads[1].voice.trigger();
+
+        // The 40,000 local sum is halved before i16 saturation. Saturating
+        // first and then applying master gain would incorrectly produce 16,383.
+        assert_eq!(
+            sequencer.render_pcm_frame(0, &mut RenderReport::default()),
+            20_000
+        );
+
+        sequencer.pads[6].voice.trigger();
+        sequencer.pads[7].voice.trigger();
+        assert_eq!(
+            sequencer.render_pcm_frame(1, &mut RenderReport::default()),
+            -20_000
+        );
+
+        let over_range = [u8::MAX; BEAT_PAD_COUNT];
+        sequencer.set_volumes(u8::MAX, &over_range);
+        assert_eq!(sequencer.global_volume_percent(), 100);
+        assert_eq!(sequencer.pad_volume_percent(0), Some(100));
+        assert_eq!(sequencer.pad_volume_percent(BEAT_PAD_COUNT), None);
+    }
+
+    #[test]
+    fn zero_volume_triggers_and_advances_a_voice_silently() {
+        let kick_bytes = wav(&[100, 50, 25], false);
+        let hat_bytes = wav(&[200], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        let mut volumes = [100; BEAT_PAD_COUNT];
+        volumes[0] = 0;
+        sequencer.set_volumes(100, &volumes);
+
+        let mut report = RenderReport::default();
+        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
+        assert_eq!(report.latest_visual_triggers[0], Some(23));
+        assert_eq!(report.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
+        assert!(sequencer.pads()[0].voice.playing);
+
+        volumes[0] = 100;
+        sequencer.set_volumes(100, &volumes);
+        assert_eq!(
+            sequencer.render_pcm_frame(24, &mut RenderReport::default()),
+            50
+        );
+        assert_eq!(sequencer.pads()[0].voice.cursor, 2);
+    }
+
+    #[test]
+    fn nonzero_pad_wins_duplicate_trigger_but_all_zero_retains_one_voice() {
+        let kick_bytes = wav(&[100, 50], false);
+        let hat_bytes = wav(&[200], false);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        beats[1] = 1_000;
+
+        let mut mixed_volumes = [100; BEAT_PAD_COUNT];
+        mixed_volumes[0] = 0;
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.set_volumes(100, &mixed_volumes);
+        let mixed = sequencer.render_pcm_frame(23, &mut RenderReport::default());
+        assert_eq!(mixed, 100);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
+        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
+
+        let zero_volumes = [0; BEAT_PAD_COUNT];
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.set_volumes(100, &zero_volumes);
+        let mut report = RenderReport::default();
+        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
+        assert_eq!(report.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
+        assert_eq!(sequencer.pads()[1].voice.cursor, 0);
+
+        // Master zero affects audibility, not which local candidate wins.
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.set_volumes(0, &mixed_volumes);
+        let mut report = RenderReport::default();
+        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
+        assert_eq!(report.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
+        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
+    }
+
+    #[test]
+    fn mute_remains_authoritative_over_nonzero_volume() {
+        let kick_bytes = wav(&[100, 50], false);
+        let hat_bytes = wav(&[200], false);
+        let mut sequencer = Sequencer::new(
+            WavPcm16::parse(&kick_bytes).unwrap(),
+            WavPcm16::parse(&hat_bytes).unwrap(),
+        );
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.set_volumes(100, &[100; BEAT_PAD_COUNT]);
+        sequencer.set_mute_mask(1);
+
+        let mut report = RenderReport::default();
+        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
+        assert_eq!(report.latest_visual_triggers[0], Some(23));
+        assert_eq!(report.audible_trigger_counts[0], 0);
+        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
+        assert!(!sequencer.pads()[0].voice.playing);
+    }
+
+    #[test]
     fn long_run_trigger_counts_do_not_drift() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
@@ -1376,7 +1944,7 @@ mod tests {
             WavPcm16::parse(&kick_bytes).unwrap(),
             WavPcm16::parse(&hat_bytes).unwrap(),
         );
-        let mut beats = [0; PAD_COUNT];
+        let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 3;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
 
@@ -1431,7 +1999,292 @@ mod tests {
     }
 
     #[test]
-    fn pattern_editor_enters_then_toggles_and_resets_only_when_all_keys_are_up() {
+    fn physical_control_keys_debounce_but_never_become_selected_beats() {
+        assert_eq!(KEY_COUNT, 12);
+        assert_eq!(BEAT_PAD_COUNT, 9);
+        assert_eq!(MUTE_KEY_INDEX, 9);
+        assert_eq!(VOLUME_KEY_INDEX, 10);
+        assert_eq!(BEAT_PAD_MASK, 0x01ff);
+
+        let controls = (1 << MUTE_KEY_INDEX) | (1 << VOLUME_KEY_INDEX) | (1 << 11);
+        let mut debounce = KeyDebouncer::new(2);
+        assert_eq!(debounce.update(controls), KeyChanges::default());
+        let changes = debounce.update(controls);
+        assert_eq!(changes.pressed, controls);
+        assert_eq!(debounce.stable_mask(), controls);
+
+        let mut selection = HeldPadSelection::new();
+        selection.apply(changes);
+        assert_eq!(selection.selected(), None);
+        assert_eq!(selection.held_mask(), 0);
+        assert_eq!(
+            MuteTarget::for_selected_pad(selection.selected()),
+            MuteTarget::Global
+        );
+
+        // Controls applies the beat-key changes before capturing the mute
+        // target, so a beat and Mute reaching debounce together target the beat.
+        selection.apply(KeyChanges {
+            pressed: (1 << 4) | controls,
+            released: 0,
+        });
+        assert_eq!(selection.selected(), Some(4));
+        assert_eq!(selection.held_mask(), 1 << 4);
+        assert_eq!(
+            MuteTarget::for_selected_pad(selection.selected()),
+            MuteTarget::Pad(4)
+        );
+    }
+
+    #[test]
+    fn mute_button_captures_target_and_uses_exclusive_tap_threshold() {
+        let mut button = MuteButtonState::new();
+        assert!(button.press(MuteTarget::Pad(2), 100));
+        assert_eq!(button.active_target(), Some(MuteTarget::Pad(2)));
+        assert!(!button.press(MuteTarget::Global, 110));
+        assert_eq!(button.active_target(), Some(MuteTarget::Pad(2)));
+        assert_eq!(
+            button.release(399),
+            Some(MuteRelease {
+                target: MuteTarget::Pad(2),
+                tapped: true,
+            })
+        );
+        assert_eq!(button.active_target(), None);
+        assert_eq!(button.release(400), None);
+
+        assert!(button.press(MuteTarget::Global, 1_000));
+        assert_eq!(
+            button.release(1_300),
+            Some(MuteRelease {
+                target: MuteTarget::Global,
+                tapped: false,
+            })
+        );
+        assert!(!button.press(MuteTarget::Pad(BEAT_PAD_COUNT), 2_000));
+    }
+
+    #[test]
+    fn shared_mutes_combine_global_pad_latched_and_momentary_state() {
+        let mut state = SharedState::default();
+        assert_eq!(state.effective_mute_mask(), 0);
+        assert_eq!(state.latched_mute(MuteTarget::Global), Some(false));
+        assert_eq!(state.latched_mute(MuteTarget::Pad(3)), Some(false));
+        assert_eq!(state.latched_mute(MuteTarget::Pad(BEAT_PAD_COUNT)), None);
+
+        assert!(state.begin_mute_gesture(MuteTarget::Pad(3)));
+        assert!(!state.begin_mute_gesture(MuteTarget::Global));
+        assert_eq!(state.effective_mute_mask(), 1 << 3);
+        assert_eq!(state.mute_indicator_active(MuteTarget::Pad(3)), Some(true));
+        assert_eq!(state.mute_indicator_active(MuteTarget::Global), Some(false));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Pad(3),
+            tapped: true,
+        }));
+        assert_eq!(state.latched_mute(MuteTarget::Pad(3)), Some(true));
+        assert_eq!(state.effective_mute_mask(), 1 << 3);
+
+        // A hold over an already latched mute is momentary-only and must not
+        // clear that persistent setting on release.
+        assert!(state.begin_mute_gesture(MuteTarget::Pad(3)));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Pad(3),
+            tapped: false,
+        }));
+        assert_eq!(state.latched_mute(MuteTarget::Pad(3)), Some(true));
+        assert_eq!(state.effective_mute_mask(), 1 << 3);
+
+        assert!(state.begin_mute_gesture(MuteTarget::Global));
+        assert_eq!(state.effective_mute_mask(), BEAT_PAD_MASK);
+        // A selected pad indicator deliberately ignores global state.
+        assert_eq!(state.mute_indicator_active(MuteTarget::Pad(2)), Some(false));
+        assert_eq!(state.mute_indicator_active(MuteTarget::Global), Some(true));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Global,
+            tapped: false,
+        }));
+        assert_eq!(state.effective_mute_mask(), 1 << 3);
+
+        assert!(state.begin_mute_gesture(MuteTarget::Global));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Global,
+            tapped: true,
+        }));
+        assert_eq!(state.latched_mute(MuteTarget::Global), Some(true));
+        assert_eq!(state.effective_mute_mask(), BEAT_PAD_MASK);
+
+        assert!(state.begin_mute_gesture(MuteTarget::Pad(3)));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Pad(3),
+            tapped: true,
+        }));
+        assert_eq!(state.latched_mute(MuteTarget::Pad(3)), Some(false));
+        assert_eq!(state.effective_mute_mask(), BEAT_PAD_MASK);
+
+        assert!(state.begin_mute_gesture(MuteTarget::Global));
+        assert!(!state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Pad(0),
+            tapped: true,
+        }));
+        assert_eq!(state.effective_mute_mask(), BEAT_PAD_MASK);
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Global,
+            tapped: true,
+        }));
+        assert_eq!(state.effective_mute_mask(), 0);
+    }
+
+    #[test]
+    fn volume_targets_are_live_and_shared_values_default_and_clamp() {
+        assert_eq!(VolumeTarget::for_selected_pad(None), VolumeTarget::Global);
+        assert_eq!(
+            VolumeTarget::for_selected_pad(Some(4)),
+            VolumeTarget::Pad(4)
+        );
+        assert_eq!(
+            VolumeTarget::for_selected_pad(Some(BEAT_PAD_COUNT)),
+            VolumeTarget::Global
+        );
+
+        let mut state = SharedState::default();
+        assert_eq!(state.global_volume_percent(), DEFAULT_VOLUME_PERCENT);
+        assert_eq!(
+            state.pad_volume_percents(),
+            &[DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT]
+        );
+        assert_eq!(state.volume_percent(VolumeTarget::Global), Some(100));
+        assert_eq!(state.volume_percent(VolumeTarget::Pad(3)), Some(100));
+        assert_eq!(
+            state.volume_percent(VolumeTarget::Pad(BEAT_PAD_COUNT)),
+            None
+        );
+
+        assert_eq!(state.adjust_volume(VolumeTarget::Global, -1), Some(99));
+        assert_eq!(state.adjust_volume(VolumeTarget::Pad(3), -10), Some(90));
+        assert_eq!(state.adjust_volume(VolumeTarget::Pad(3), -1_000), Some(0));
+        assert_eq!(state.adjust_volume(VolumeTarget::Pad(3), 1_000), Some(100));
+        assert_eq!(
+            state.adjust_volume(VolumeTarget::Pad(BEAT_PAD_COUNT), -10),
+            None
+        );
+        assert_eq!(state.global_volume_percent(), 99);
+    }
+
+    #[test]
+    fn volume_control_handles_both_chord_orders_and_simultaneous_press() {
+        let mut volume = VolumeControlState::new();
+        assert_eq!(volume.active_target(), None);
+
+        // Volume first starts on master, then the first newly pressed beat
+        // becomes the local target without releasing Volume.
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << VOLUME_KEY_INDEX,
+                released: 0,
+            },
+            None,
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Global));
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << 3,
+                released: 0,
+            },
+            Some(3),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(3)));
+
+        volume.update(false, KeyChanges::default(), Some(3));
+        assert_eq!(volume.active_target(), None);
+
+        // Beat first is captured as soon as Volume is pressed.
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << VOLUME_KEY_INDEX,
+                released: 0,
+            },
+            Some(2),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(2)));
+        volume.update(false, KeyChanges::default(), Some(2));
+
+        // Controls applies beat selection before this update, so simultaneous
+        // Volume and beat press also captures that beat.
+        let simultaneous = KeyChanges {
+            pressed: (1 << VOLUME_KEY_INDEX) | (1 << 5),
+            released: 0,
+        };
+        let mut selection = HeldPadSelection::new();
+        selection.apply(simultaneous);
+        volume.update(true, simultaneous, selection.selected());
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(5)));
+    }
+
+    #[test]
+    fn volume_control_falls_back_to_global_until_a_held_secondary_is_repressed() {
+        let mut volume = VolumeControlState::new();
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << VOLUME_KEY_INDEX,
+                released: 0,
+            },
+            Some(1),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(1)));
+
+        // A later press is ignored while the original local target is held.
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << 4,
+                released: 0,
+            },
+            Some(1),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(1)));
+
+        // Releasing pad 1 must not automatically promote already-held pad 4.
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 0,
+                released: 1 << 1,
+            },
+            Some(4),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Global));
+        volume.update(true, KeyChanges::default(), Some(4));
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Global));
+
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 0,
+                released: 1 << 4,
+            },
+            None,
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Global));
+        volume.update(
+            true,
+            KeyChanges {
+                pressed: 1 << 4,
+                released: 0,
+            },
+            Some(4),
+        );
+        assert_eq!(volume.active_target(), Some(VolumeTarget::Pad(4)));
+
+        volume.update(false, KeyChanges::default(), Some(4));
+        assert_eq!(volume.active_target(), None);
+    }
+
+    #[test]
+    fn pattern_editor_enters_then_toggles_and_resets_only_when_all_beat_keys_are_up() {
         let mut editor = PatternEditorState::new();
         editor.update_primary(Some(2), 4);
         assert_eq!(
@@ -1450,7 +2303,7 @@ mod tests {
         assert_eq!(editor.cursor, 3);
 
         // A later-held pad becomes primary only after the older key is
-        // released; pattern mode itself persists until every key is released.
+        // released; pattern mode itself persists until every beat key is released.
         editor.update_primary(Some(7), 2);
         assert!(editor.active);
         assert_eq!(editor.cursor, 1);
@@ -1497,22 +2350,42 @@ mod tests {
         assert_eq!(accelerated_encoder_delta(1, Some(76)), 1);
         assert_eq!(accelerated_encoder_delta(1, Some(75)), 10);
         assert_eq!(accelerated_encoder_delta(-1, Some(20)), -10);
+        assert_eq!(adjust_volume_percent(100, -1), 99);
+        assert_eq!(adjust_volume_percent(5, -10), 0);
+        assert_eq!(adjust_volume_percent(95, 10), 100);
 
         assert_eq!(
-            EncoderTarget::for_controls(None, false, false),
+            EncoderTarget::for_controls(None, false, false, None),
             EncoderTarget::BaseInterval
         );
         assert_eq!(
-            EncoderTarget::for_controls(None, true, false),
+            EncoderTarget::for_controls(None, true, false, None),
             EncoderTarget::LedBrightness
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true, false),
+            EncoderTarget::for_controls(Some(3), true, false, None),
             EncoderTarget::Pad(3)
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true, true),
+            EncoderTarget::for_controls(Some(3), true, true, None),
             EncoderTarget::PatternStep(3)
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(None, true, true, Some(VolumeTarget::Global),),
+            EncoderTarget::Volume(VolumeTarget::Global)
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), true, true, Some(VolumeTarget::Pad(3)),),
+            EncoderTarget::Volume(VolumeTarget::Pad(3))
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(
+                Some(BEAT_PAD_COUNT),
+                false,
+                false,
+                Some(VolumeTarget::Global),
+            ),
+            EncoderTarget::Volume(VolumeTarget::Global)
         );
 
         let mut acceleration = EncoderAcceleration::new();
@@ -1520,6 +2393,10 @@ mod tests {
         assert_eq!(acceleration.update(1_050, EncoderTarget::Pad(3), 1), 10);
         assert_eq!(
             acceleration.update(1_060, EncoderTarget::LedBrightness, 1),
+            1
+        );
+        assert_eq!(
+            acceleration.update(1_065, EncoderTarget::Volume(VolumeTarget::Pad(3)), 1),
             1
         );
         assert_eq!(
@@ -1543,6 +2420,10 @@ mod tests {
         apply_encoder_delta(&mut state, EncoderTarget::Pad(3), 10);
         assert_eq!(state.desired_beats[3], 10);
         assert_eq!(state.base_interval_ms, 1_110);
+        apply_encoder_delta(&mut state, EncoderTarget::Volume(VolumeTarget::Pad(3)), -10);
+        assert_eq!(state.volume_percent(VolumeTarget::Pad(3)), Some(90));
+        apply_encoder_delta(&mut state, EncoderTarget::Volume(VolumeTarget::Global), -1);
+        assert_eq!(state.volume_percent(VolumeTarget::Global), Some(99));
         apply_encoder_delta(&mut state, EncoderTarget::LedBrightness, -10);
         assert_eq!(state.led_brightness_percent, 40);
         apply_encoder_delta(&mut state, EncoderTarget::LedBrightness, -1_000);
@@ -1553,6 +2434,17 @@ mod tests {
         assert_eq!(scale_color((200, 100, 50), 100), (200, 100, 50));
         assert_eq!(scale_color((200, 100, 50), 50), (100, 50, 25));
         assert_eq!(scale_color((200, 100, 50), 0), (0, 0, 0));
+        assert_eq!(mute_led_color(false, 100), (255, 0, 0));
+        assert_eq!(mute_led_color(true, 100), (51, 0, 0));
+        assert_eq!(mute_led_color(false, 50), (128, 0, 0));
+        assert_eq!(mute_led_color(true, 50), (26, 0, 0));
+        assert_eq!(mute_led_color(false, 0), (0, 0, 0));
+        assert_eq!(volume_led_color(100, 100), (255, 255, 0));
+        assert_eq!(volume_led_color(50, 100), (128, 128, 0));
+        assert_eq!(volume_led_color(100, 50), (128, 128, 0));
+        assert_eq!(volume_led_color(50, 50), (64, 64, 0));
+        assert_eq!(volume_led_color(0, 100), (0, 0, 0));
+        assert_eq!(volume_led_color(100, 0), (0, 0, 0));
         assert_eq!(colorwheel(0), (255, 0, 0));
         assert_eq!(colorwheel(85), (0, 255, 0));
         assert_eq!(colorwheel(170), (0, 0, 255));
