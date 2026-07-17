@@ -5,10 +5,16 @@
 //! The RP2040 firmware lives in `main.rs`. Keeping this module free of HAL
 //! dependencies makes the timing and sample conversion code testable on a host.
 
+pub mod load_control;
+pub mod sample_assets;
+
+use load_control::{DitherQuality, LoadLevel, RenderPolicy};
+
 pub const KEY_COUNT: usize = 12;
 pub const BEAT_PAD_COUNT: usize = 9;
 pub const MUTE_KEY_INDEX: usize = 9;
 pub const VOLUME_KEY_INDEX: usize = 10;
+pub const SAMPLE_KEY_INDEX: usize = 11;
 pub const BEAT_PAD_MASK: u16 = (1_u16 << BEAT_PAD_COUNT) - 1;
 pub const SAMPLE_RATE: u32 = 22_050;
 pub const AUDIO_BLOCK_FRAMES: usize = 128;
@@ -25,15 +31,45 @@ pub const DEFAULT_LED_BRIGHTNESS_PERCENT: u8 = 50;
 pub const DEFAULT_VOLUME_PERCENT: u8 = 100;
 pub const MUTE_TAP_THRESHOLD_MS: u64 = 300;
 pub const MUTE_LED_DIM_PERCENT: u8 = 20;
+pub const SAMPLE_COUNT: usize = 24;
+pub const PRIMARY_VOICE_COUNT: usize = 24;
+pub const FADE_TAIL_COUNT: usize = 9;
+pub const DECLICK_FRAMES: u8 = 32;
+pub const GAIN_RAMP_FRAMES: u8 = 64;
 
-const SAMPLE_COUNT: usize = 2;
-const KICK_PAD_COUNT: usize = 6;
-const KICK_INDEX: usize = 0;
-const OPEN_HAT_INDEX: usize = 1;
+const DECLICK_SHIFT: u32 = DECLICK_FRAMES.trailing_zeros();
+const GAIN_RAMP_SHIFT: u32 = GAIN_RAMP_FRAMES.trailing_zeros();
+const _: () = assert!(DECLICK_FRAMES.is_power_of_two());
+const _: () = assert!(GAIN_RAMP_FRAMES.is_power_of_two());
+
+const DEFAULT_KICK_INDEX: usize = 16;
+const DEFAULT_OPEN_HAT_INDEX: usize = 18;
 const PWM_QUANTIZED_MAX: u32 = 127;
 const PWM_FRACTION_MASK: u32 = 0x1ff;
 const PWM_COMMAND_BITS: u32 = 14;
 const PWM_DITHER_CYCLES: u32 = 16;
+const COARSE_DITHER_MASKS: [u16; PWM_DITHER_CYCLES as usize + 1] = coarse_dither_masks();
+
+const fn coarse_dither_masks() -> [u16; PWM_DITHER_CYCLES as usize + 1] {
+    let mut masks = [0_u16; PWM_DITHER_CYCLES as usize + 1];
+    let mut ones = 1_u32;
+    while ones <= PWM_DITHER_CYCLES {
+        let mut accumulator = 0_u32;
+        let mut mask = 0_u16;
+        let mut cycle = 0_u32;
+        while cycle < PWM_DITHER_CYCLES {
+            accumulator += ones;
+            if accumulator >= PWM_DITHER_CYCLES {
+                accumulator -= PWM_DITHER_CYCLES;
+                mask |= 1 << cycle;
+            }
+            cycle += 1;
+        }
+        masks[ones as usize] = mask;
+        ones += 1;
+    }
+    masks
+}
 
 /// Centered PWM command used while no PCM data is available.
 pub const SILENCE_PWM_WORD: u32 = 64 | (63 << 7);
@@ -267,64 +303,105 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SampleId {
-    Kick,
-    OpenHat,
-}
+/// Stable index into the firmware's fixed sample catalog.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SampleId(u8);
 
 impl SampleId {
-    const fn index(self) -> usize {
-        match self {
-            Self::Kick => KICK_INDEX,
-            Self::OpenHat => OPEN_HAT_INDEX,
-        }
-    }
-
-    const fn for_pad(pad: usize) -> Self {
-        if pad < KICK_PAD_COUNT {
-            Self::Kick
+    pub const fn from_index(index: usize) -> Option<Self> {
+        if index < SAMPLE_COUNT {
+            Some(Self(index as u8))
         } else {
-            Self::OpenHat
+            None
         }
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    pub fn wrapping_offset(self, delta: i32) -> Self {
+        let index = (self.index() as i64 + i64::from(delta)).rem_euclid(SAMPLE_COUNT as i64);
+        Self(index as u8)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Voice {
-    pub sample: SampleId,
-    pub cursor: usize,
-    pub playing: bool,
+/// Apply one physical sample-selector detent without encoder acceleration.
+pub fn adjust_sample_selection(current: SampleId, direction: i32) -> SampleId {
+    current.wrapping_offset(direction.signum())
 }
 
-impl Voice {
-    pub const fn new(sample: SampleId) -> Self {
+/// One immutable entry in the fixed firmware sample bank.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleDefinition<'a> {
+    pub id: SampleId,
+    pub short_name: &'static str,
+    pub pcm: WavPcm16<'a>,
+}
+
+/// Validated PCM data and display names for all stable sample IDs.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleCatalog<'a> {
+    samples: [WavPcm16<'a>; SAMPLE_COUNT],
+    short_names: &'static [&'static str; SAMPLE_COUNT],
+}
+
+impl<'a> SampleCatalog<'a> {
+    pub const fn new(
+        samples: [WavPcm16<'a>; SAMPLE_COUNT],
+        short_names: &'static [&'static str; SAMPLE_COUNT],
+    ) -> Self {
         Self {
-            sample,
-            cursor: 0,
-            playing: false,
+            samples,
+            short_names,
+        }
+    }
+
+    pub const fn samples(&self) -> &[WavPcm16<'a>; SAMPLE_COUNT] {
+        &self.samples
+    }
+
+    pub fn definition(&self, id: SampleId) -> SampleDefinition<'a> {
+        SampleDefinition {
+            id,
+            short_name: self.short_names[id.index()],
+            pcm: self.samples[id.index()],
         }
     }
 
     #[inline]
-    pub fn trigger(&mut self) {
-        self.cursor = 0;
-        self.playing = true;
+    fn pcm(&self, id: SampleId) -> WavPcm16<'a> {
+        self.samples[id.index()]
     }
+}
 
-    fn next(&mut self, samples: &[WavPcm16<'_>; SAMPLE_COUNT]) -> i16 {
-        if !self.playing {
-            return 0;
+pub const DEFAULT_KICK_SAMPLE: SampleId = SampleId(DEFAULT_KICK_INDEX as u8);
+pub const DEFAULT_OPEN_HAT_SAMPLE: SampleId = SampleId(DEFAULT_OPEN_HAT_INDEX as u8);
+pub const DEFAULT_PAD_SAMPLES: [SampleId; BEAT_PAD_COUNT] = [
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_KICK_SAMPLE,
+    DEFAULT_OPEN_HAT_SAMPLE,
+    DEFAULT_OPEN_HAT_SAMPLE,
+    DEFAULT_OPEN_HAT_SAMPLE,
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreviewRequest {
+    pub pad: usize,
+    pub sample: SampleId,
+}
+
+impl PreviewRequest {
+    pub const fn new(pad: usize, sample: SampleId) -> Option<Self> {
+        if pad < BEAT_PAD_COUNT {
+            Some(Self { pad, sample })
+        } else {
+            None
         }
-        let Some(sample) = samples[self.sample.index()].sample(self.cursor) else {
-            self.playing = false;
-            return 0;
-        };
-        self.cursor += 1;
-        if self.cursor >= samples[self.sample.index()].len() {
-            self.playing = false;
-        }
-        sample
     }
 }
 
@@ -333,7 +410,20 @@ pub struct PadState {
     pub beats_per_interval: u16,
     pub tick_ordinal: u128,
     pub next_frame: Option<u64>,
-    pub voice: Voice,
+    pub sample: SampleId,
+    // `next_frame` is the exact ceil-scheduled deadline for `tick_ordinal`.
+    // These private fields advance that deadline as a rational accumulator,
+    // avoiding wide division and modulo in the audio-frame hot path.
+    period_numerator: u64,
+    period_denominator: u32,
+    whole_frames: u64,
+    period_remainder: u32,
+    deadline_error: u32,
+    next_step: u16,
+    pattern_bit_index: u16,
+    pattern_phase: u16,
+    pattern_whole_bits: u16,
+    pattern_remainder: u16,
 }
 
 impl PadState {
@@ -342,16 +432,996 @@ impl PadState {
             beats_per_interval: 0,
             tick_ordinal: 0,
             next_frame: None,
-            voice: Voice::new(SampleId::for_pad(pad)),
+            sample: DEFAULT_PAD_SAMPLES[pad],
+            period_numerator: 0,
+            period_denominator: 0,
+            whole_frames: 0,
+            period_remainder: 0,
+            deadline_error: 0,
+            next_step: 0,
+            pattern_bit_index: 0,
+            pattern_phase: 0,
+            pattern_whole_bits: 0,
+            pattern_remainder: 0,
+        }
+    }
+
+    fn disable_clock(&mut self) {
+        self.tick_ordinal = 0;
+        self.next_frame = None;
+        self.period_numerator = 0;
+        self.period_denominator = 0;
+        self.whole_frames = 0;
+        self.period_remainder = 0;
+        self.deadline_error = 0;
+        self.next_step = 0;
+        self.pattern_bit_index = 0;
+        self.pattern_phase = 0;
+        self.pattern_whole_bits = 0;
+        self.pattern_remainder = 0;
+    }
+
+    /// Align this pad to the first global-grid tick strictly after `from_frame`.
+    ///
+    /// Wide arithmetic is intentionally confined to timing changes. Once
+    /// aligned, normal rendering advances deadlines with additions and
+    /// comparisons only.
+    fn align_clock(&mut self, beats_per_interval: u16, base_interval_ms: u32, from_frame: u64) {
+        debug_assert!(beats_per_interval != 0);
+
+        let period_numerator = u64::from(SAMPLE_RATE) * u64::from(base_interval_ms);
+        let period_denominator = 1_000_u32 * u32::from(beats_per_interval);
+        let denominator = u128::from(period_denominator);
+        let ordinal = (u128::from(from_frame) * denominator) / u128::from(period_numerator) + 1;
+        let tick_numerator = ordinal * u128::from(period_numerator);
+        let deadline = tick_numerator.div_ceil(denominator);
+        let deadline_error = deadline * denominator - tick_numerator;
+
+        self.tick_ordinal = ordinal;
+        self.next_frame = Some(deadline as u64);
+        self.period_numerator = period_numerator;
+        self.period_denominator = period_denominator;
+        self.whole_frames = period_numerator / u64::from(period_denominator);
+        self.period_remainder = (period_numerator % u64::from(period_denominator)) as u32;
+        self.deadline_error = deadline_error as u32;
+        self.next_step = ((ordinal - 1) % u128::from(beats_per_interval)) as u16;
+        self.pattern_whole_bits = (PATTERN_BITS / usize::from(beats_per_interval)) as u16;
+        self.pattern_remainder = (PATTERN_BITS % usize::from(beats_per_interval)) as u16;
+        self.realign_pattern_cursor();
+    }
+
+    /// Consume every tick due at `frame`, coalescing their pattern states.
+    fn take_due(&mut self, frame: u64, pattern: &Pattern) -> bool {
+        let Some(next_frame) = self.next_frame else {
+            return false;
+        };
+        if !frame_has_reached(frame, next_frame) {
+            return false;
+        }
+
+        let mut enabled = false;
+
+        // In contiguous rendering, deadlines equal the current frame. Under
+        // the supported extrema, at most two ticks can share an output frame.
+        if next_frame == frame {
+            for _ in 0..2 {
+                if self.next_frame != Some(frame) {
+                    break;
+                }
+                enabled |= self.current_step_enabled(pattern);
+                self.advance_one();
+            }
+
+            // Retain an exact bounded recovery path if constraints are ever
+            // widened enough for more than two ticks to share one frame.
+            if self
+                .next_frame
+                .is_some_and(|deadline| frame_has_reached(frame, deadline))
+            {
+                enabled |= self.take_due_fast(frame, pattern);
+            }
+            return enabled;
+        }
+
+        // A non-contiguous render coalesces the entire missed range exactly,
+        // without replaying an unbounded number of logical ticks.
+        self.take_due_fast(frame, pattern)
+    }
+
+    fn current_step_enabled(&self, pattern: &Pattern) -> bool {
+        pattern
+            .bit(usize::from(self.pattern_bit_index))
+            .unwrap_or(false)
+    }
+
+    fn advance_one(&mut self) {
+        let deadline = self
+            .next_frame
+            .expect("an enabled pad always has a deadline");
+        let carry = self.period_remainder > self.deadline_error;
+        let frame_delta = self.whole_frames + u64::from(carry);
+
+        self.deadline_error = if carry {
+            self.deadline_error + self.period_denominator - self.period_remainder
+        } else {
+            self.deadline_error - self.period_remainder
+        };
+        self.next_frame = Some(deadline.wrapping_add(frame_delta));
+        self.tick_ordinal = self.tick_ordinal.wrapping_add(1);
+        advance_pattern_position(
+            &mut self.next_step,
+            &mut self.pattern_bit_index,
+            &mut self.pattern_phase,
+            self.beats_per_interval,
+            self.pattern_whole_bits,
+            self.pattern_remainder,
+        );
+    }
+
+    fn take_due_fast(&mut self, frame: u64, pattern: &Pattern) -> bool {
+        let deadline = self
+            .next_frame
+            .expect("an enabled pad always has a deadline");
+        let lag = frame.wrapping_sub(deadline);
+        debug_assert!(lag < (1_u64 << 63));
+
+        // If e = deadline * B - ordinal * A, then the number of additional
+        // deadlines through deadline + lag is floor((e + lag * B) / A).
+        let due = (u128::from(self.deadline_error)
+            + u128::from(lag) * u128::from(self.period_denominator))
+            / u128::from(self.period_numerator)
+            + 1;
+        let enabled = self.any_enabled_steps(pattern, due);
+        self.advance_many(due);
+        enabled
+    }
+
+    fn any_enabled_steps(&self, pattern: &Pattern, due: u128) -> bool {
+        let division = self.beats_per_interval;
+        let unique_steps = if due >= u128::from(division) {
+            division
+        } else {
+            due as u16
+        };
+
+        let mut step = self.next_step;
+        let mut bit_index = self.pattern_bit_index;
+        let mut phase = self.pattern_phase;
+        for _ in 0..unique_steps {
+            if pattern.bit(usize::from(bit_index)).unwrap_or(false) {
+                return true;
+            }
+            advance_pattern_position(
+                &mut step,
+                &mut bit_index,
+                &mut phase,
+                division,
+                self.pattern_whole_bits,
+                self.pattern_remainder,
+            );
+        }
+        false
+    }
+
+    fn advance_many(&mut self, due: u128) {
+        debug_assert!(due != 0);
+        let denominator = u128::from(self.period_denominator);
+        let elapsed_numerator = due * u128::from(self.period_numerator);
+        let rounding_bias = denominator - 1 - u128::from(self.deadline_error);
+        let frame_delta = (elapsed_numerator + rounding_bias) / denominator;
+        let new_error =
+            u128::from(self.deadline_error) + frame_delta * denominator - elapsed_numerator;
+
+        let deadline = self
+            .next_frame
+            .expect("an enabled pad always has a deadline");
+        self.next_frame = Some(deadline.wrapping_add(frame_delta as u64));
+        self.deadline_error = new_error as u32;
+        self.tick_ordinal = self.tick_ordinal.wrapping_add(due);
+
+        let division = u128::from(self.beats_per_interval);
+        let step_advance = (due % division) as u16;
+        let next_step = u32::from(self.next_step) + u32::from(step_advance);
+        self.next_step = (next_step % u32::from(self.beats_per_interval)) as u16;
+        self.realign_pattern_cursor();
+    }
+
+    fn realign_pattern_cursor(&mut self) {
+        let division = u32::from(self.beats_per_interval);
+        let scaled_step = u32::from(self.next_step) * PATTERN_BITS as u32;
+        self.pattern_bit_index = (scaled_step / division) as u16;
+        self.pattern_phase = (scaled_step % division) as u16;
+    }
+}
+
+/// Advance `floor(step * PATTERN_BITS / division)` without a variable divide.
+#[inline]
+fn advance_pattern_position(
+    step: &mut u16,
+    bit_index: &mut u16,
+    phase: &mut u16,
+    division: u16,
+    whole_bits: u16,
+    remainder: u16,
+) {
+    *step += 1;
+    if *step == division {
+        *step = 0;
+        *bit_index = 0;
+        *phase = 0;
+        return;
+    }
+
+    *bit_index += whole_bits;
+    *phase += remainder;
+    if *phase >= division {
+        *phase -= division;
+        *bit_index += 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VoicePhase {
+    Idle,
+    Playing,
+    Releasing(u8),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlaybackVoice {
+    phase: VoicePhase,
+    owner_pad: u8,
+    sample: SampleId,
+    cursor: usize,
+    started_serial: u64,
+}
+
+impl PlaybackVoice {
+    const fn idle() -> Self {
+        Self {
+            phase: VoicePhase::Idle,
+            owner_pad: 0,
+            sample: SampleId(0),
+            cursor: 0,
+            started_serial: 0,
+        }
+    }
+
+    const fn is_active(&self) -> bool {
+        !matches!(self.phase, VoicePhase::Idle)
+    }
+
+    const fn owner_pad(&self) -> usize {
+        self.owner_pad as usize
+    }
+
+    fn start(&mut self, pad: usize, sample: SampleId, serial: u64) {
+        self.phase = VoicePhase::Playing;
+        self.owner_pad = pad as u8;
+        self.sample = sample;
+        self.cursor = 0;
+        self.started_serial = serial;
+    }
+
+    fn force_release(&mut self) -> bool {
+        if self.phase != VoicePhase::Playing {
+            return false;
+        }
+        self.phase = VoicePhase::Releasing(DECLICK_FRAMES);
+        true
+    }
+
+    const fn fade_frames(&self) -> u8 {
+        match self.phase {
+            VoicePhase::Releasing(remaining) => remaining,
+            VoicePhase::Idle | VoicePhase::Playing => DECLICK_FRAMES,
+        }
+    }
+
+    fn render(&mut self, catalog: &SampleCatalog<'_>, gain_q16: u32) -> i32 {
+        if !self.is_active() {
+            return 0;
+        }
+
+        let pcm = catalog.pcm(self.sample);
+        let Some(raw) = pcm.sample(self.cursor) else {
+            self.phase = VoicePhase::Idle;
+            return 0;
+        };
+        self.cursor += 1;
+
+        let mut contribution = apply_sample_gain_q16(raw, gain_q16);
+        if let VoicePhase::Releasing(remaining) = self.phase {
+            contribution = scale_declick(contribution, remaining);
+            if remaining <= 1 {
+                self.phase = VoicePhase::Idle;
+            } else {
+                self.phase = VoicePhase::Releasing(remaining - 1);
+            }
+        }
+
+        if self.cursor >= pcm.len() {
+            self.phase = VoicePhase::Idle;
+        }
+        contribution
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FadeTail {
+    active: bool,
+    owner_pad: u8,
+    sample: SampleId,
+    cursor: usize,
+    remaining: u8,
+    started_serial: u64,
+}
+
+impl FadeTail {
+    const fn idle() -> Self {
+        Self {
+            active: false,
+            owner_pad: 0,
+            sample: SampleId(0),
+            cursor: 0,
+            remaining: 0,
+            started_serial: 0,
+        }
+    }
+
+    fn start_from(&mut self, voice: PlaybackVoice) {
+        self.active = true;
+        self.owner_pad = voice.owner_pad;
+        self.sample = voice.sample;
+        self.cursor = voice.cursor;
+        self.remaining = voice.fade_frames();
+        self.started_serial = voice.started_serial;
+    }
+
+    fn render(&mut self, catalog: &SampleCatalog<'_>, gain_q16: u32) -> i32 {
+        if !self.active {
+            return 0;
+        }
+
+        let pcm = catalog.pcm(self.sample);
+        let Some(raw) = pcm.sample(self.cursor) else {
+            self.active = false;
+            return 0;
+        };
+        self.cursor += 1;
+        let contribution = scale_declick(apply_sample_gain_q16(raw, gain_q16), self.remaining);
+        if self.remaining <= 1 || self.cursor >= pcm.len() {
+            self.active = false;
+        } else {
+            self.remaining -= 1;
+        }
+        contribution
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartPriority {
+    Scheduled,
+    Preview,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GainRamp {
+    start_q16: u32,
+    current_q16: u32,
+    target_q16: u32,
+    target_percent: u8,
+    elapsed: u8,
+}
+
+impl GainRamp {
+    const fn new(percent: u8) -> Self {
+        let q16 = percent_to_q16(percent);
+        Self {
+            start_q16: q16,
+            current_q16: q16,
+            target_q16: q16,
+            target_percent: percent,
+            elapsed: GAIN_RAMP_FRAMES,
+        }
+    }
+
+    fn set_percent(&mut self, percent: u8) {
+        let percent = percent.min(100);
+        if percent == self.target_percent {
+            return;
+        }
+        self.start_q16 = self.current_q16;
+        self.target_q16 = percent_to_q16(percent);
+        self.target_percent = percent;
+        self.elapsed = 0;
+    }
+
+    fn next_q16(&mut self) -> u32 {
+        if self.elapsed >= GAIN_RAMP_FRAMES {
+            return self.current_q16;
+        }
+        self.elapsed += 1;
+        let start = self.start_q16 as i32;
+        let delta = self.target_q16 as i32 - start;
+        let interpolated = trunc_div_pow2_i32(delta * i32::from(self.elapsed), GAIN_RAMP_SHIFT);
+        self.current_q16 = (start + interpolated) as u32;
+        self.current_q16
+    }
+
+    const fn target_percent(&self) -> u8 {
+        self.target_percent
+    }
+
+    const fn current_q16(&self) -> u32 {
+        self.current_q16
+    }
+}
+
+const fn percent_to_q16(percent: u8) -> u32 {
+    (percent as u32 * 65_536) / 100
+}
+
+#[inline]
+fn trunc_div_pow2_i32(value: i32, shift: u32) -> i32 {
+    debug_assert!(shift > 0 && shift < i32::BITS);
+    let truncated_down = value >> shift;
+    let discarded_mask = (1_i32 << shift) - 1;
+    truncated_down + i32::from(value < 0 && value & discarded_mask != 0)
+}
+
+#[inline]
+fn apply_sample_gain_q16(sample: i16, gain_q16: u32) -> i32 {
+    debug_assert!(gain_q16 <= 65_536);
+    match gain_q16 {
+        0 => 0,
+        65_536 => i32::from(sample),
+        _ => trunc_div_pow2_i32(i32::from(sample) * gain_q16 as i32, 16),
+    }
+}
+
+#[inline]
+fn scale_declick(value: i32, remaining: u8) -> i32 {
+    debug_assert!(remaining <= DECLICK_FRAMES);
+    // `value` is a gain-scaled i16 and `remaining` is at most 32, so the
+    // product is bounded by +/-1,048,576 and cannot overflow an i32.
+    trunc_div_pow2_i32(value * i32::from(remaining), DECLICK_SHIFT)
+}
+
+#[inline]
+fn apply_mix_gain_q16(value: i32, gain_q16: u32) -> i32 {
+    debug_assert!(gain_q16 <= 65_536);
+    match gain_q16 {
+        0 => 0,
+        65_536 => value,
+        _ => {
+            // Split the magnitude at the Q16 radix so both products fit u32:
+            // `(2^15 * 65_535)` and `(65_535 * 65_535)` are each below
+            // `u32::MAX`. Applying the sign last preserves division's
+            // truncation toward zero, including for `i32::MIN`.
+            let magnitude = value.unsigned_abs();
+            let whole = (magnitude >> 16) * gain_q16;
+            let fraction = ((magnitude & 0xffff) * gain_q16) >> 16;
+            let scaled = (whole + fraction) as i32;
+            if value < 0 { -scaled } else { scaled }
         }
     }
 }
 
-/// Per-block events produced while rendering.
+#[derive(Clone, Copy, Debug)]
+struct VoiceAllocationState {
+    target_silent_mask: u16,
+    current_silent_mask: u16,
+}
+
+impl VoiceAllocationState {
+    fn new(
+        master_target_percent: u8,
+        pad_target_percents: &[u8; BEAT_PAD_COUNT],
+        master_current_q16: u32,
+        pad_current_q16: &[u32; BEAT_PAD_COUNT],
+    ) -> Self {
+        let target_silent_mask = if master_target_percent == 0 {
+            BEAT_PAD_MASK
+        } else {
+            pad_target_percents
+                .iter()
+                .enumerate()
+                .fold(0_u16, |mask, (pad, volume)| {
+                    mask | (u16::from(*volume == 0) << pad)
+                })
+        };
+        let current_silent_mask = if master_current_q16 == 0 {
+            BEAT_PAD_MASK
+        } else {
+            pad_current_q16
+                .iter()
+                .enumerate()
+                .fold(0_u16, |mask, (pad, gain)| {
+                    mask | (u16::from(*gain == 0) << pad)
+                })
+        };
+        Self {
+            target_silent_mask,
+            current_silent_mask,
+        }
+    }
+
+    #[cfg(test)]
+    fn settled(master_percent: u8, pad_percents: &[u8; BEAT_PAD_COUNT]) -> Self {
+        let master_q16 = percent_to_q16(master_percent);
+        let pad_q16 = core::array::from_fn(|pad| percent_to_q16(pad_percents[pad]));
+        Self::new(master_percent, pad_percents, master_q16, &pad_q16)
+    }
+
+    const fn target_is_silent(self, pad: usize) -> bool {
+        self.target_silent_mask & (1_u16 << pad) != 0
+    }
+
+    const fn current_is_silent(self, pad: usize) -> bool {
+        self.current_silent_mask & (1_u16 << pad) != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VoicePool {
+    primaries: [PlaybackVoice; PRIMARY_VOICE_COUNT],
+    tails: [FadeTail; FADE_TAIL_COUNT],
+    next_serial: u64,
+    active_primary_count: u8,
+    active_tail_count: u8,
+}
+
+impl VoicePool {
+    const fn new() -> Self {
+        Self {
+            primaries: [PlaybackVoice::idle(); PRIMARY_VOICE_COUNT],
+            tails: [FadeTail::idle(); FADE_TAIL_COUNT],
+            next_serial: 0,
+            active_primary_count: 0,
+            active_tail_count: 0,
+        }
+    }
+
+    fn active_voice_count(&self) -> usize {
+        usize::from(self.active_primary_count)
+    }
+
+    fn active_voice_count_for_pad(&self, pad: usize) -> usize {
+        self.primaries
+            .iter()
+            .filter(|voice| voice.is_active() && voice.owner_pad() == pad)
+            .count()
+    }
+
+    fn active_tail_count(&self) -> usize {
+        usize::from(self.active_tail_count)
+    }
+
+    fn oldest_primary_matching(
+        &self,
+        mut predicate: impl FnMut(&PlaybackVoice) -> bool,
+    ) -> Option<usize> {
+        let mut selected = None;
+        let mut greatest_age = 0_u64;
+        for (index, voice) in self.primaries.iter().enumerate() {
+            if !voice.is_active() || !predicate(voice) {
+                continue;
+            }
+            let age = self.next_serial.wrapping_sub(voice.started_serial);
+            if selected.is_none() || age > greatest_age {
+                selected = Some(index);
+                greatest_age = age;
+            }
+        }
+        selected
+    }
+
+    fn preserve_stolen_voice(
+        &mut self,
+        voice: PlaybackVoice,
+        max_fade_tails: u8,
+        report: &mut RenderReport,
+    ) {
+        if max_fade_tails == 0 {
+            report.load_shed_fade_tail_count = report.load_shed_fade_tail_count.saturating_add(1);
+            return;
+        }
+        let tail_limit = max_fade_tails.min(FADE_TAIL_COUNT as u8);
+        let free = (self.active_tail_count < tail_limit)
+            .then(|| self.tails.iter().position(|tail| !tail.active))
+            .flatten();
+        let index = free.unwrap_or_else(|| {
+            report.fade_tail_overflow_count = report.fade_tail_overflow_count.saturating_add(1);
+            let mut selected = self.tails.iter().position(|tail| tail.active).unwrap_or(0);
+            for candidate in selected + 1..FADE_TAIL_COUNT {
+                let current = &self.tails[selected];
+                let other = &self.tails[candidate];
+                if !other.active {
+                    continue;
+                }
+                let current_age = self.next_serial.wrapping_sub(current.started_serial);
+                let other_age = self.next_serial.wrapping_sub(other.started_serial);
+                if other.remaining < current.remaining
+                    || (other.remaining == current.remaining
+                        && (other_age > current_age
+                            || (other_age == current_age && candidate < selected)))
+                {
+                    selected = candidate;
+                }
+            }
+            selected
+        });
+        let was_active = self.tails[index].active;
+        self.tails[index].start_from(voice);
+        if !was_active {
+            self.active_tail_count += 1;
+            debug_assert!(usize::from(self.active_tail_count) <= FADE_TAIL_COUNT);
+        }
+    }
+
+    #[cfg(test)]
+    fn start(
+        &mut self,
+        pad: usize,
+        sample: SampleId,
+        priority: StartPriority,
+        allocation: VoiceAllocationState,
+        report: &mut RenderReport,
+    ) -> bool {
+        self.start_with_policy(
+            pad,
+            sample,
+            priority,
+            allocation,
+            RenderPolicy::FULL,
+            report,
+        )
+    }
+
+    #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_func"))]
+    #[inline(never)]
+    fn start_with_policy(
+        &mut self,
+        pad: usize,
+        sample: SampleId,
+        priority: StartPriority,
+        allocation: VoiceAllocationState,
+        policy: RenderPolicy,
+        report: &mut RenderReport,
+    ) -> bool {
+        let primary_limit = policy
+            .max_primary_voices
+            .clamp(1, PRIMARY_VOICE_COUNT as u8);
+        // A pressure transition may have placed excess voices into their
+        // short in-place release. Do not immediately reuse one and defeat the
+        // contraction; admit new work again after the releases finish.
+        if self.active_primary_count > primary_limit {
+            match priority {
+                StartPriority::Scheduled => {
+                    report.load_shed_trigger_count =
+                        report.load_shed_trigger_count.saturating_add(1);
+                }
+                StartPriority::Preview => {
+                    report.load_shed_preview_count =
+                        report.load_shed_preview_count.saturating_add(1);
+                }
+            }
+            return false;
+        }
+        let mut victim = if self.active_primary_count < primary_limit {
+            self.primaries.iter().position(|voice| !voice.is_active())
+        } else {
+            None
+        };
+        let mut steal_kind = None;
+        let silent_scheduled_request =
+            priority == StartPriority::Scheduled && allocation.target_is_silent(pad);
+
+        if victim.is_none() && (!silent_scheduled_request || allocation.current_is_silent(pad)) {
+            victim = self.oldest_primary_matching(|voice| voice.owner_pad() == pad);
+            if victim.is_some() {
+                steal_kind = Some(0_u8);
+            }
+        }
+
+        if victim.is_none() && priority == StartPriority::Scheduled {
+            victim = self.oldest_primary_matching(|voice| {
+                allocation.target_is_silent(voice.owner_pad())
+                    && (!silent_scheduled_request
+                        || allocation.current_is_silent(voice.owner_pad()))
+            });
+            if victim.is_some() {
+                steal_kind = Some(1_u8);
+            }
+        }
+
+        if victim.is_none() && priority == StartPriority::Scheduled {
+            if silent_scheduled_request {
+                report.silent_trigger_drop_count =
+                    report.silent_trigger_drop_count.saturating_add(1);
+                return false;
+            }
+            victim = self.oldest_primary_matching(|_| true);
+            if victim.is_some() {
+                steal_kind = Some(2_u8);
+            }
+        }
+
+        let Some(index) = victim else {
+            report.preview_drop_count = report.preview_drop_count.saturating_add(1);
+            return false;
+        };
+
+        if let Some(kind) = steal_kind {
+            let stolen = self.primaries[index];
+            let tail_limit = if policy.preserve_stolen_fade_tails {
+                policy.max_fade_tails
+            } else {
+                0
+            };
+            self.preserve_stolen_voice(stolen, tail_limit, report);
+            match kind {
+                0 => report.same_pad_steal_count = report.same_pad_steal_count.saturating_add(1),
+                1 => {
+                    report.zero_volume_steal_count =
+                        report.zero_volume_steal_count.saturating_add(1)
+                }
+                _ => report.global_steal_count = report.global_steal_count.saturating_add(1),
+            }
+        }
+
+        let was_active = self.primaries[index].is_active();
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
+        self.primaries[index].start(pad, sample, serial);
+        if !was_active {
+            self.active_primary_count += 1;
+            debug_assert!(usize::from(self.active_primary_count) <= PRIMARY_VOICE_COUNT);
+        }
+        true
+    }
+
+    fn enforce_policy(&mut self, policy: RenderPolicy, report: &mut RenderReport) {
+        let primary_limit = policy
+            .max_primary_voices
+            .clamp(1, PRIMARY_VOICE_COUNT as u8);
+        if policy.release_excess_primaries && self.active_primary_count > primary_limit {
+            let excess = self.active_primary_count - primary_limit;
+            let already_releasing = self
+                .primaries
+                .iter()
+                .filter(|voice| matches!(voice.phase, VoicePhase::Releasing(_)))
+                .count()
+                .min(usize::from(u8::MAX)) as u8;
+            let mut to_release = excess.saturating_sub(already_releasing);
+            while to_release != 0 {
+                let victim =
+                    self.oldest_primary_matching(|voice| voice.phase == VoicePhase::Playing);
+                let Some(index) = victim else {
+                    break;
+                };
+                if self.primaries[index].force_release() {
+                    report.load_shed_primary_count =
+                        report.load_shed_primary_count.saturating_add(1);
+                    to_release -= 1;
+                }
+            }
+        }
+        while policy.trim_excess_primaries && self.active_primary_count > primary_limit {
+            let victim = self
+                .oldest_primary_matching(|voice| matches!(voice.phase, VoicePhase::Releasing(_)))
+                .or_else(|| self.oldest_primary_matching(|_| true));
+            let Some(index) = victim else {
+                break;
+            };
+            self.primaries[index].phase = VoicePhase::Idle;
+            self.active_primary_count -= 1;
+            report.load_shed_primary_count = report.load_shed_primary_count.saturating_add(1);
+        }
+
+        let tail_limit = policy.max_fade_tails.min(FADE_TAIL_COUNT as u8);
+        while self.active_tail_count > tail_limit {
+            let mut victim = None;
+            for (index, tail) in self.tails.iter().enumerate() {
+                if !tail.active {
+                    continue;
+                }
+                let Some(current) = victim else {
+                    victim = Some(index);
+                    continue;
+                };
+                if tail.remaining < self.tails[current].remaining
+                    || (tail.remaining == self.tails[current].remaining
+                        && tail.started_serial < self.tails[current].started_serial)
+                {
+                    victim = Some(index);
+                }
+            }
+            let Some(index) = victim else {
+                break;
+            };
+            self.tails[index].active = false;
+            self.active_tail_count -= 1;
+            report.load_shed_fade_tail_count = report.load_shed_fade_tail_count.saturating_add(1);
+        }
+    }
+
+    fn release_mask(&mut self, mask: u16) -> u16 {
+        let mut released = 0_u16;
+        for voice in &mut self.primaries {
+            if voice.is_active()
+                && mask & (1_u16 << voice.owner_pad()) != 0
+                && voice.force_release()
+            {
+                released = released.saturating_add(1);
+            }
+        }
+        released
+    }
+
+    fn render(
+        &mut self,
+        catalog: &SampleCatalog<'_>,
+        pad_gains_q16: &[u32; BEAT_PAD_COUNT],
+    ) -> i32 {
+        let mut total = 0_i32;
+        let mut ended_primaries = 0_u8;
+        for voice in &mut self.primaries {
+            if !voice.is_active() {
+                continue;
+            }
+            let gain = pad_gains_q16[voice.owner_pad()];
+            total += voice.render(catalog, gain);
+            ended_primaries += u8::from(!voice.is_active());
+        }
+        debug_assert!(ended_primaries <= self.active_primary_count);
+        self.active_primary_count -= ended_primaries;
+
+        let mut ended_tails = 0_u8;
+        for tail in &mut self.tails {
+            if !tail.active {
+                continue;
+            }
+            let gain = pad_gains_q16[tail.owner_pad as usize];
+            total += tail.render(catalog, gain);
+            ended_tails += u8::from(!tail.active);
+        }
+        debug_assert!(ended_tails <= self.active_tail_count);
+        self.active_tail_count -= ended_tails;
+
+        // At most 24 primaries and nine tails can each contribute one
+        // gain-bounded i16 sample, so the accumulator is within
+        // -1,081,344..=1,081,311 and cannot overflow i32.
+        total
+    }
+}
+
+/// Per-block events and bounded-pool diagnostics produced while rendering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RenderReport {
     pub latest_visual_triggers: [Option<u64>; BEAT_PAD_COUNT],
     pub audible_trigger_counts: [u16; SAMPLE_COUNT],
+    pub scheduled_voice_start_count: u16,
+    pub preview_voice_start_count: u16,
+    pub same_pad_steal_count: u16,
+    pub zero_volume_steal_count: u16,
+    pub global_steal_count: u16,
+    pub silent_trigger_drop_count: u16,
+    pub preview_drop_count: u16,
+    pub fade_tail_overflow_count: u16,
+    pub muted_voice_release_count: u16,
+    pub clipped_frame_count: u16,
+    pub load_shed_preview_count: u16,
+    pub load_shed_fade_tail_count: u16,
+    pub load_shed_trigger_count: u16,
+    pub load_shed_primary_count: u16,
+    pub coarse_dither_frame_count: u16,
+    pub peak_primary_voice_count: u8,
+    pub peak_fade_tail_count: u8,
+    pub peak_total_voice_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SamplerDiagnostics {
+    pub scheduled_voice_start_count: u32,
+    pub preview_voice_start_count: u32,
+    pub same_pad_steal_count: u32,
+    pub zero_volume_steal_count: u32,
+    pub global_steal_count: u32,
+    pub silent_trigger_drop_count: u32,
+    pub preview_drop_count: u32,
+    pub fade_tail_overflow_count: u32,
+    pub muted_voice_release_count: u32,
+    pub clipped_frame_count: u32,
+    pub load_shed_preview_count: u32,
+    pub load_shed_fade_tail_count: u32,
+    pub load_shed_trigger_count: u32,
+    pub load_shed_primary_count: u32,
+    pub coarse_dither_frame_count: u32,
+    pub peak_primary_voice_count: u8,
+    pub peak_fade_tail_count: u8,
+    pub peak_total_voice_count: u8,
+}
+
+impl SamplerDiagnostics {
+    pub fn record(&mut self, report: &RenderReport) {
+        self.scheduled_voice_start_count = self
+            .scheduled_voice_start_count
+            .saturating_add(u32::from(report.scheduled_voice_start_count));
+        self.preview_voice_start_count = self
+            .preview_voice_start_count
+            .saturating_add(u32::from(report.preview_voice_start_count));
+        self.same_pad_steal_count = self
+            .same_pad_steal_count
+            .saturating_add(u32::from(report.same_pad_steal_count));
+        self.zero_volume_steal_count = self
+            .zero_volume_steal_count
+            .saturating_add(u32::from(report.zero_volume_steal_count));
+        self.global_steal_count = self
+            .global_steal_count
+            .saturating_add(u32::from(report.global_steal_count));
+        self.silent_trigger_drop_count = self
+            .silent_trigger_drop_count
+            .saturating_add(u32::from(report.silent_trigger_drop_count));
+        self.preview_drop_count = self
+            .preview_drop_count
+            .saturating_add(u32::from(report.preview_drop_count));
+        self.fade_tail_overflow_count = self
+            .fade_tail_overflow_count
+            .saturating_add(u32::from(report.fade_tail_overflow_count));
+        self.muted_voice_release_count = self
+            .muted_voice_release_count
+            .saturating_add(u32::from(report.muted_voice_release_count));
+        self.clipped_frame_count = self
+            .clipped_frame_count
+            .saturating_add(u32::from(report.clipped_frame_count));
+        self.load_shed_preview_count = self
+            .load_shed_preview_count
+            .saturating_add(u32::from(report.load_shed_preview_count));
+        self.load_shed_fade_tail_count = self
+            .load_shed_fade_tail_count
+            .saturating_add(u32::from(report.load_shed_fade_tail_count));
+        self.load_shed_trigger_count = self
+            .load_shed_trigger_count
+            .saturating_add(u32::from(report.load_shed_trigger_count));
+        self.load_shed_primary_count = self
+            .load_shed_primary_count
+            .saturating_add(u32::from(report.load_shed_primary_count));
+        self.coarse_dither_frame_count = self
+            .coarse_dither_frame_count
+            .saturating_add(u32::from(report.coarse_dither_frame_count));
+        self.peak_primary_voice_count = self
+            .peak_primary_voice_count
+            .max(report.peak_primary_voice_count);
+        self.peak_fade_tail_count = self.peak_fade_tail_count.max(report.peak_fade_tail_count);
+        self.peak_total_voice_count = self
+            .peak_total_voice_count
+            .max(report.peak_total_voice_count);
+    }
+}
+
+fn record_voice_start(
+    report: &mut RenderReport,
+    sample: SampleId,
+    pad_volume_percent: u8,
+    master_volume_percent: u8,
+    sample_is_empty: bool,
+    priority: StartPriority,
+) {
+    match priority {
+        StartPriority::Scheduled => {
+            report.scheduled_voice_start_count =
+                report.scheduled_voice_start_count.saturating_add(1);
+        }
+        StartPriority::Preview => {
+            report.preview_voice_start_count = report.preview_voice_start_count.saturating_add(1);
+        }
+    }
+    if master_volume_percent > 0 && pad_volume_percent > 0 && !sample_is_empty {
+        report.audible_trigger_counts[sample.index()] =
+            report.audible_trigger_counts[sample.index()].saturating_add(1);
+    }
 }
 
 /// Stateful conversion from signed PCM to Raspberry Pi's PIO PWM command.
@@ -390,33 +1460,65 @@ impl DitherEncoder {
         command
     }
 
+    /// Encode a cheaper, spectrally coarser dither pattern.
+    ///
+    /// This bounded fallback is used only when the audio service approaches
+    /// its DMA deadline. The number of fractional one-bit extensions and the frame-end error are
+    /// identical to [`Self::encode`]. A small lookup table merely distributes
+    /// those extensions evenly instead of making all sixteen decisions in the
+    /// hot path.
+    #[inline]
+    pub fn encode_coarse(&mut self, sample: i16) -> u32 {
+        let unsigned = (i32::from(sample) + 32_768) as u32;
+        let quantized = unsigned >> 9;
+        let fraction = unsigned & PWM_FRACTION_MASK;
+        let total_error = u32::from(self.error) + (fraction << 4);
+        let ones = total_error >> 9;
+        self.error = (total_error & PWM_FRACTION_MASK) as u16;
+        quantized
+            | ((PWM_QUANTIZED_MAX - quantized) << 7)
+            | (u32::from(COARSE_DITHER_MASKS[ones as usize]) << PWM_COMMAND_BITS)
+    }
+
     pub const fn error(&self) -> u16 {
         self.error
     }
 }
 
 pub struct Sequencer<'a> {
-    samples: [WavPcm16<'a>; SAMPLE_COUNT],
+    catalog: SampleCatalog<'a>,
     pads: [PadState; BEAT_PAD_COUNT],
     patterns: [Pattern; BEAT_PAD_COUNT],
+    voices: VoicePool,
+    pending_preview: Option<PreviewRequest>,
+    pending_muted_voice_releases: u16,
     mute_mask: u16,
-    global_volume_percent: u8,
-    pad_volume_percents: [u8; BEAT_PAD_COUNT],
+    global_gain: GainRamp,
+    pad_gains: [GainRamp; BEAT_PAD_COUNT],
     base_interval_ms: u32,
     dither: DitherEncoder,
+    render_policy: RenderPolicy,
+    block_starts_per_pad: [u8; BEAT_PAD_COUNT],
+    block_frame_offset: u8,
 }
 
 impl<'a> Sequencer<'a> {
-    pub fn new(kick: WavPcm16<'a>, open_hat: WavPcm16<'a>) -> Self {
+    pub fn new(catalog: SampleCatalog<'a>) -> Self {
         Self {
-            samples: [kick, open_hat],
+            catalog,
             pads: core::array::from_fn(PadState::new),
             patterns: [Pattern::all_enabled(); BEAT_PAD_COUNT],
+            voices: VoicePool::new(),
+            pending_preview: None,
+            pending_muted_voice_releases: 0,
             mute_mask: 0,
-            global_volume_percent: DEFAULT_VOLUME_PERCENT,
-            pad_volume_percents: [DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT],
+            global_gain: GainRamp::new(DEFAULT_VOLUME_PERCENT),
+            pad_gains: [GainRamp::new(DEFAULT_VOLUME_PERCENT); BEAT_PAD_COUNT],
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             dither: DitherEncoder::new(),
+            render_policy: RenderPolicy::FULL,
+            block_starts_per_pad: [0; BEAT_PAD_COUNT],
+            block_frame_offset: 0,
         }
     }
 
@@ -426,6 +1528,58 @@ impl<'a> Sequencer<'a> {
 
     pub const fn base_interval_ms(&self) -> u32 {
         self.base_interval_ms
+    }
+
+    pub fn pad_sample(&self, pad: usize) -> Option<SampleId> {
+        self.pads.get(pad).map(|state| state.sample)
+    }
+
+    pub fn set_pad_sample(&mut self, pad: usize, sample: SampleId) -> bool {
+        let Some(state) = self.pads.get_mut(pad) else {
+            return false;
+        };
+        state.sample = sample;
+        true
+    }
+
+    pub fn set_pad_samples(&mut self, samples: &[SampleId; BEAT_PAD_COUNT]) {
+        for (pad, sample) in self.pads.iter_mut().zip(samples.iter().copied()) {
+            pad.sample = sample;
+        }
+    }
+
+    /// Publish a latest-wins preview request for the next rendered block.
+    ///
+    /// The returned request, when present, was superseded before consumption.
+    pub fn queue_preview(&mut self, request: PreviewRequest) -> Option<PreviewRequest> {
+        self.pending_preview.replace(request)
+    }
+
+    pub fn active_voice_count(&self) -> usize {
+        self.voices.active_voice_count()
+    }
+
+    pub fn active_voice_count_for_pad(&self, pad: usize) -> Option<usize> {
+        (pad < BEAT_PAD_COUNT).then(|| self.voices.active_voice_count_for_pad(pad))
+    }
+
+    pub fn active_fade_tail_count(&self) -> usize {
+        self.voices.active_tail_count()
+    }
+
+    /// Select bounded work limits for the next and subsequent render blocks.
+    pub fn set_render_policy(&mut self, policy: RenderPolicy) {
+        self.render_policy = RenderPolicy {
+            max_primary_voices: policy
+                .max_primary_voices
+                .clamp(1, PRIMARY_VOICE_COUNT as u8),
+            max_fade_tails: policy.max_fade_tails.min(FADE_TAIL_COUNT as u8),
+            ..policy
+        };
+    }
+
+    pub const fn render_policy(&self) -> RenderPolicy {
+        self.render_policy
     }
 
     pub fn set_pattern(&mut self, pad: usize, pattern: Pattern) -> bool {
@@ -442,16 +1596,14 @@ impl<'a> Sequencer<'a> {
 
     /// Apply the effective mute state at an audio render boundary.
     ///
-    /// Pads that have just become muted stop immediately. Unmuting does not
-    /// retrigger a voice; playback resumes at that pad's next scheduled tick.
+    /// Newly muted voices begin a short in-place release. Unmuting does not
+    /// cancel that release or retrigger a voice.
     pub fn set_mute_mask(&mut self, mute_mask: u16) {
         let mute_mask = mute_mask & BEAT_PAD_MASK;
         let newly_muted = mute_mask & !self.mute_mask;
-        for (pad, state) in self.pads.iter_mut().enumerate() {
-            if newly_muted & (1_u16 << pad) != 0 {
-                state.voice.playing = false;
-            }
-        }
+        self.pending_muted_voice_releases = self
+            .pending_muted_voice_releases
+            .saturating_add(self.voices.release_mask(newly_muted));
         self.mute_mask = mute_mask;
     }
 
@@ -465,22 +1617,22 @@ impl<'a> Sequencer<'a> {
         global_volume_percent: u8,
         pad_volume_percents: &[u8; BEAT_PAD_COUNT],
     ) {
-        self.global_volume_percent = global_volume_percent.min(100);
-        for (destination, requested) in self
-            .pad_volume_percents
+        self.global_gain.set_percent(global_volume_percent);
+        for (gain, requested) in self
+            .pad_gains
             .iter_mut()
             .zip(pad_volume_percents.iter().copied())
         {
-            *destination = requested.min(100);
+            gain.set_percent(requested);
         }
     }
 
     pub const fn global_volume_percent(&self) -> u8 {
-        self.global_volume_percent
+        self.global_gain.target_percent()
     }
 
     pub fn pad_volume_percent(&self, pad: usize) -> Option<u8> {
-        self.pad_volume_percents.get(pad).copied()
+        self.pad_gains.get(pad).map(GainRamp::target_percent)
     }
 
     /// Apply the base interval and per-pad beat multipliers at a render boundary.
@@ -505,100 +1657,158 @@ impl<'a> Sequencer<'a> {
 
             pad.beats_per_interval = beats_per_interval;
             if beats_per_interval == 0 {
-                pad.tick_ordinal = 0;
-                pad.next_frame = None;
+                pad.disable_clock();
             } else {
-                let ordinal = next_ordinal_after(from_frame, beats_per_interval, base_interval_ms);
-                pad.tick_ordinal = ordinal;
-                pad.next_frame = Some(frame_for_tick(
-                    ordinal,
-                    beats_per_interval,
-                    base_interval_ms,
-                ));
+                pad.align_clock(beats_per_interval, base_interval_ms, from_frame);
             }
         }
     }
 
     /// Render a block of PIO PWM commands beginning at an absolute frame.
+    #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_func"))]
+    #[inline(never)]
     pub fn render(&mut self, start_frame: u64, output: &mut [u32]) -> RenderReport {
-        let mut report = RenderReport::default();
+        let mut report = RenderReport {
+            muted_voice_release_count: core::mem::take(&mut self.pending_muted_voice_releases),
+            ..RenderReport::default()
+        };
+        self.block_starts_per_pad.fill(0);
+        self.voices.enforce_policy(self.render_policy, &mut report);
         for (offset, word) in output.iter_mut().enumerate() {
+            self.block_frame_offset = offset.min(u8::MAX as usize) as u8;
             let frame = start_frame.wrapping_add(offset as u64);
             let mixed = self.render_pcm_frame(frame, &mut report);
-            *word = self.dither.encode(mixed);
+            *word = match self.render_policy.dither_quality {
+                DitherQuality::Full => self.dither.encode(mixed),
+                DitherQuality::Coarse => {
+                    report.coarse_dither_frame_count =
+                        report.coarse_dither_frame_count.saturating_add(1);
+                    self.dither.encode_coarse(mixed)
+                }
+            };
         }
         report
     }
 
     fn render_pcm_frame(&mut self, frame: u64, report: &mut RenderReport) -> i16 {
-        let mut first_due = [None; SAMPLE_COUNT];
-        let mut first_nonzero_due = [None; SAMPLE_COUNT];
+        let mut scheduled = [None; BEAT_PAD_COUNT];
 
         for (pad_index, pad) in self.pads.iter_mut().enumerate() {
-            let mut enabled_step_due = false;
-            while pad
-                .next_frame
-                .is_some_and(|next| frame_has_reached(frame, next))
-            {
-                let division = pad.beats_per_interval;
-                let logical_step = pad.tick_ordinal.wrapping_sub(1) % u128::from(division);
-                enabled_step_due |= self.patterns[pad_index]
-                    .step_enabled(logical_step as u16, division)
-                    .unwrap_or(false);
-
-                pad.tick_ordinal = pad.tick_ordinal.wrapping_add(1);
-                pad.next_frame = Some(frame_for_tick(
-                    pad.tick_ordinal,
-                    division,
-                    self.base_interval_ms,
-                ));
-            }
+            let enabled_step_due = pad.take_due(frame, &self.patterns[pad_index]);
 
             if enabled_step_due {
                 report.latest_visual_triggers[pad_index] = Some(frame);
                 if self.mute_mask & (1_u16 << pad_index) != 0 {
                     continue;
                 }
-                let sample_index = pad.voice.sample.index();
-                if first_due[sample_index].is_none() {
-                    first_due[sample_index] = Some(pad_index);
+                scheduled[pad_index] = Some(pad.sample);
+            }
+        }
+
+        let preview = self.pending_preview.take();
+        if scheduled.iter().any(Option::is_some) || preview.is_some() {
+            let pad_volume_percents =
+                core::array::from_fn(|pad| self.pad_gains[pad].target_percent());
+            let master_volume_percent = self.global_gain.target_percent();
+            let pad_current_gains_q16 =
+                core::array::from_fn(|pad| self.pad_gains[pad].current_q16());
+            let allocation = VoiceAllocationState::new(
+                master_volume_percent,
+                &pad_volume_percents,
+                self.global_gain.current_q16(),
+                &pad_current_gains_q16,
+            );
+
+            for (pad, sample) in scheduled.iter().copied().enumerate() {
+                let Some(sample) = sample else {
+                    continue;
+                };
+                let admitted = self.block_starts_per_pad[pad];
+                let quota = self.render_policy.max_starts_per_pad;
+                let earliest_offset = if quota == 0 {
+                    u16::MAX
+                } else {
+                    u16::from(admitted) * AUDIO_BLOCK_FRAMES as u16 / u16::from(quota)
+                };
+                if admitted >= quota || u16::from(self.block_frame_offset) < earliest_offset {
+                    report.load_shed_trigger_count =
+                        report.load_shed_trigger_count.saturating_add(1);
+                    continue;
                 }
-                if self.pad_volume_percents[pad_index] > 0
-                    && first_nonzero_due[sample_index].is_none()
-                {
-                    first_nonzero_due[sample_index] = Some(pad_index);
+                self.block_starts_per_pad[pad] = self.block_starts_per_pad[pad].saturating_add(1);
+                if self.voices.start_with_policy(
+                    pad,
+                    sample,
+                    StartPriority::Scheduled,
+                    allocation,
+                    self.render_policy,
+                    report,
+                ) {
+                    record_voice_start(
+                        report,
+                        sample,
+                        pad_volume_percents[pad],
+                        master_volume_percent,
+                        self.catalog.pcm(sample).is_empty(),
+                        StartPriority::Scheduled,
+                    );
+                }
+            }
+
+            if let Some(preview) = preview {
+                report.latest_visual_triggers[preview.pad] = Some(frame);
+                if !self.render_policy.allow_preview {
+                    report.load_shed_preview_count =
+                        report.load_shed_preview_count.saturating_add(1);
+                } else if self.mute_mask & (1_u16 << preview.pad) != 0 {
+                    report.preview_drop_count = report.preview_drop_count.saturating_add(1);
+                } else if self.voices.start_with_policy(
+                    preview.pad,
+                    preview.sample,
+                    StartPriority::Preview,
+                    allocation,
+                    self.render_policy,
+                    report,
+                ) {
+                    record_voice_start(
+                        report,
+                        preview.sample,
+                        pad_volume_percents[preview.pad],
+                        master_volume_percent,
+                        self.catalog.pcm(preview.sample).is_empty(),
+                        StartPriority::Preview,
+                    );
                 }
             }
         }
 
-        for sample_index in 0..SAMPLE_COUNT {
-            let candidate = first_nonzero_due[sample_index].or(first_due[sample_index]);
-            let Some(pad_index) = candidate else {
-                continue;
-            };
-            self.pads[pad_index].voice.trigger();
-            if self.global_volume_percent > 0 && self.pad_volume_percents[pad_index] > 0 {
-                report.audible_trigger_counts[sample_index] =
-                    report.audible_trigger_counts[sample_index].saturating_add(1);
-            }
-        }
+        let active_primaries = self.voices.active_voice_count() as u8;
+        let active_tails = self.voices.active_tail_count() as u8;
+        report.peak_primary_voice_count = report.peak_primary_voice_count.max(active_primaries);
+        report.peak_fade_tail_count = report.peak_fade_tail_count.max(active_tails);
+        report.peak_total_voice_count = report
+            .peak_total_voice_count
+            .max(active_primaries.saturating_add(active_tails));
 
-        let mut total = 0_i32;
-        for (pad_index, pad) in self.pads.iter_mut().enumerate() {
-            let sample = i32::from(pad.voice.next(&self.samples));
-            let scaled = scale_audio_percent(sample, self.pad_volume_percents[pad_index]);
-            total = total.saturating_add(scaled);
+        let pad_gains_q16 = core::array::from_fn(|pad| self.pad_gains[pad].next_q16());
+        let master_gain_q16 = self.global_gain.next_q16();
+        let total = self.voices.render(&self.catalog, &pad_gains_q16);
+        let mastered = apply_mix_gain_q16(total, master_gain_q16);
+        if mastered > i32::from(i16::MAX) || mastered < i32::from(i16::MIN) {
+            report.clipped_frame_count = report.clipped_frame_count.saturating_add(1);
         }
-        saturating_i16(scale_audio_percent(total, self.global_volume_percent))
+        saturating_i16(mastered)
     }
 }
 
+#[cfg(test)]
 fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u32) -> u128 {
     let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
     let denominator = u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
     numerator / denominator + 1
 }
 
+#[cfg(test)]
 fn frame_for_tick(ordinal: u128, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
     if beats_per_interval == 0 {
         return u64::MAX;
@@ -731,11 +1941,33 @@ impl MuteButtonState {
 #[derive(Clone, Copy, Debug)]
 pub struct SharedState {
     pub desired_beats: [u16; BEAT_PAD_COUNT],
+    pad_samples: [SampleId; BEAT_PAD_COUNT],
+    pending_preview: Option<PreviewRequest>,
     pub base_interval_ms: u32,
     pub led_brightness_percent: u8,
     pub playback_frame: u64,
     pub latest_trigger_frames: [u64; BEAT_PAD_COUNT],
     pub underrun_count: u32,
+    pub last_render_time_us: u32,
+    pub max_render_time_us: u32,
+    pub render_deadline_miss_count: u32,
+    pub last_audio_service_time_us: u32,
+    pub max_audio_service_time_us: u32,
+    pub audio_service_deadline_miss_count: u32,
+    pub max_dma_cadence_us: u32,
+    pub max_dma_handoff_us: u32,
+    pub audio_load_level: LoadLevel,
+    pub effective_voice_limit: u8,
+    pub min_effective_voice_limit: u8,
+    pub audio_load_ewma_us: u32,
+    pub audio_load_window_max_us: u32,
+    pub audio_load_transition_count: u32,
+    pub last_peak_primary_voices: u8,
+    pub max_peak_primary_voices: u8,
+    pub worst_service_primary_voices: u8,
+    pub worst_service_voice_limit: u8,
+    pub worst_service_load_level: LoadLevel,
+    pub sampler_diagnostics: SamplerDiagnostics,
     patterns: [Pattern; BEAT_PAD_COUNT],
     pattern_dirty_mask: u16,
     pub pattern_revision: u32,
@@ -750,11 +1982,33 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             desired_beats: [0; BEAT_PAD_COUNT],
+            pad_samples: DEFAULT_PAD_SAMPLES,
+            pending_preview: None,
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             led_brightness_percent: DEFAULT_LED_BRIGHTNESS_PERCENT,
             playback_frame: 0,
             latest_trigger_frames: [0; BEAT_PAD_COUNT],
             underrun_count: 0,
+            last_render_time_us: 0,
+            max_render_time_us: 0,
+            render_deadline_miss_count: 0,
+            last_audio_service_time_us: 0,
+            max_audio_service_time_us: 0,
+            audio_service_deadline_miss_count: 0,
+            max_dma_cadence_us: 0,
+            max_dma_handoff_us: 0,
+            audio_load_level: LoadLevel::Normal,
+            effective_voice_limit: PRIMARY_VOICE_COUNT as u8,
+            min_effective_voice_limit: PRIMARY_VOICE_COUNT as u8,
+            audio_load_ewma_us: 0,
+            audio_load_window_max_us: 0,
+            audio_load_transition_count: 0,
+            last_peak_primary_voices: 0,
+            max_peak_primary_voices: 0,
+            worst_service_primary_voices: 0,
+            worst_service_voice_limit: PRIMARY_VOICE_COUNT as u8,
+            worst_service_load_level: LoadLevel::Normal,
+            sampler_diagnostics: SamplerDiagnostics::default(),
             patterns: [Pattern::all_enabled(); BEAT_PAD_COUNT],
             pattern_dirty_mask: 0,
             pattern_revision: 0,
@@ -768,6 +2022,34 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    pub const fn pad_samples(&self) -> &[SampleId; BEAT_PAD_COUNT] {
+        &self.pad_samples
+    }
+
+    pub fn pad_sample(&self, pad: usize) -> Option<SampleId> {
+        self.pad_samples.get(pad).copied()
+    }
+
+    pub fn set_pad_sample(&mut self, pad: usize, sample: SampleId) -> bool {
+        let Some(destination) = self.pad_samples.get_mut(pad) else {
+            return false;
+        };
+        *destination = sample;
+        true
+    }
+
+    pub fn queue_preview(&mut self, request: PreviewRequest) -> Option<PreviewRequest> {
+        self.pending_preview.replace(request)
+    }
+
+    pub fn take_preview(&mut self) -> Option<PreviewRequest> {
+        self.pending_preview.take()
+    }
+
+    pub fn record_sampler_report(&mut self, report: &RenderReport) {
+        self.sampler_diagnostics.record(report);
+    }
+
     pub fn pattern(&self, pad: usize) -> Option<&Pattern> {
         self.patterns.get(pad)
     }
@@ -1140,6 +2422,19 @@ impl PatternEditorState {
     }
 }
 
+/// Whether an encoder-button press may enter or edit pattern mode.
+///
+/// The previous modifier state suppresses a coincident release scan as well,
+/// preventing a button held under a modifier from leaking into pattern mode.
+pub const fn pattern_button_allowed(
+    volume_pressed: bool,
+    volume_was_pressed: bool,
+    sample_pressed: bool,
+    sample_was_pressed: bool,
+) -> bool {
+    !volume_pressed && !volume_was_pressed && !sample_pressed && !sample_was_pressed
+}
+
 pub fn wrap_pattern_cursor(cursor: u16, division: u16, delta: i32) -> u16 {
     if division == 0 {
         return 0;
@@ -1171,6 +2466,7 @@ pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EncoderTarget {
     Volume(VolumeTarget),
+    Sample(Option<usize>),
     BaseInterval,
     LedBrightness,
     Pad(usize),
@@ -1183,9 +2479,16 @@ impl EncoderTarget {
         encoder_pressed: bool,
         pattern_mode: bool,
         volume_target: Option<VolumeTarget>,
+        sample_pressed: bool,
     ) -> Self {
         if let Some(target) = volume_target {
             return Self::Volume(target);
+        }
+        if sample_pressed {
+            return Self::Sample(match selected_pad {
+                Some(pad) if pad < BEAT_PAD_COUNT => Some(pad),
+                _ => None,
+            });
         }
         match selected_pad {
             Some(pad) if pattern_mode => Self::PatternStep(pad),
@@ -1226,6 +2529,7 @@ pub fn apply_encoder_delta(state: &mut SharedState, target: EncoderTarget, delta
         EncoderTarget::Volume(target) => {
             let _ = state.adjust_volume(target, delta);
         }
+        EncoderTarget::Sample(_) => {}
         EncoderTarget::Pad(pad) if pad < BEAT_PAD_COUNT => {
             state.desired_beats[pad] = adjust_beat_multiplier(state.desired_beats[pad], delta);
         }
@@ -1266,6 +2570,11 @@ pub fn volume_led_color(volume_percent: u8, brightness_percent: u8) -> (u8, u8, 
     scale_color((u8::MAX, u8::MAX, 0), combined_percent as u8)
 }
 
+/// Blue Sample-control LED, scaled only by the configured key brightness.
+pub fn sample_led_color(brightness_percent: u8) -> (u8, u8, u8) {
+    scale_color((0, 0, u8::MAX), brightness_percent)
+}
+
 /// CircuitPython `rainbowio.colorwheel` for an 8-bit wheel position.
 pub fn colorwheel(position: u8) -> (u8, u8, u8) {
     if position < 85 {
@@ -1298,6 +2607,7 @@ mod tests {
 
     const KICK_WAV: &[u8] = include_bytes!("../samples/00_kick02.wav");
     const HAT_WAV: &[u8] = include_bytes!("../samples/02_ho02.wav");
+    static TEST_SAMPLE_NAMES: [&str; SAMPLE_COUNT] = ["Test"; SAMPLE_COUNT];
 
     fn wav(samples: &[i16], extra_chunk: bool) -> Vec<u8> {
         let extra_len = if extra_chunk { 10 } else { 0 };
@@ -1328,6 +2638,65 @@ mod tests {
         bytes
     }
 
+    fn test_catalog<'a>(kick_bytes: &'a [u8], hat_bytes: &'a [u8]) -> SampleCatalog<'a> {
+        let kick = WavPcm16::parse(kick_bytes).unwrap();
+        let hat = WavPcm16::parse(hat_bytes).unwrap();
+        let mut samples = [kick; SAMPLE_COUNT];
+        samples[DEFAULT_OPEN_HAT_SAMPLE.index()] = hat;
+        SampleCatalog::new(samples, &TEST_SAMPLE_NAMES)
+    }
+
+    fn test_sequencer<'a>(kick_bytes: &'a [u8], hat_bytes: &'a [u8]) -> Sequencer<'a> {
+        Sequencer::new(test_catalog(kick_bytes, hat_bytes))
+    }
+
+    fn sample(index: usize) -> SampleId {
+        SampleId::from_index(index).unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ReferencePadClock {
+        division: u16,
+        tick_ordinal: u128,
+        next_frame: u64,
+    }
+
+    impl ReferencePadClock {
+        fn aligned(division: u16, base_interval_ms: u32, from_frame: u64) -> Self {
+            let tick_ordinal = next_ordinal_after(from_frame, division, base_interval_ms);
+            Self {
+                division,
+                tick_ordinal,
+                next_frame: frame_for_tick(tick_ordinal, division, base_interval_ms),
+            }
+        }
+
+        fn take_due(&mut self, frame: u64, base_interval_ms: u32, pattern: &Pattern) -> bool {
+            let mut enabled = false;
+            while frame_has_reached(frame, self.next_frame) {
+                let step = self.tick_ordinal.wrapping_sub(1) % u128::from(self.division);
+                enabled |= pattern
+                    .step_enabled(step as u16, self.division)
+                    .unwrap_or(false);
+                self.tick_ordinal = self.tick_ordinal.wrapping_add(1);
+                self.next_frame =
+                    frame_for_tick(self.tick_ordinal, self.division, base_interval_ms);
+            }
+            enabled
+        }
+    }
+
+    fn patterned_clock_fixture() -> Pattern {
+        let mut pattern = Pattern::default();
+        pattern.fill(false);
+        for bit in 0..PATTERN_BITS {
+            if bit % 7 == 1 || bit % 19 == 3 {
+                assert!(pattern.set_bit(bit, true));
+            }
+        }
+        pattern
+    }
+
     #[test]
     fn parses_repository_samples() {
         let kick = WavPcm16::parse(KICK_WAV).unwrap();
@@ -1336,6 +2705,75 @@ mod tests {
         assert_eq!(hat.len(), 6_852);
         assert!(kick.sample(0).is_some());
         assert_eq!(kick.sample(kick.len()), None);
+        let catalog = sample_assets::parse_catalog().unwrap();
+        assert!(catalog.samples().iter().all(|sample| !sample.is_empty()));
+
+        let expected_names = [
+            "909 Kick",
+            "909 Snare",
+            "909 Hat Closed",
+            "909 Hat Open",
+            "909 Clap",
+            "909 Tom",
+            "909 Blip",
+            "909 Cymbal",
+            "Tac Kick",
+            "Tac Snare",
+            "Tac Hat Closed",
+            "Tac Hat Open",
+            "Tac Snare Roll",
+            "Tac Tom",
+            "Tac Ride Bell",
+            "Tac Cymbal",
+            "AKU Kick",
+            "AKU Snare",
+            "AKU Hat 1",
+            "AKU Hat 2",
+            "AKU Clq",
+            "AKU Pcq 06",
+            "AKU Pcq 10",
+            "AKU Cymbal",
+        ];
+        let expected_paths = [
+            "kit0_909/00_909kick4.wav",
+            "kit0_909/01_909snare2.wav",
+            "kit0_909/02_909hatclosed2a.wav",
+            "kit0_909/03_909hatopen5.wav",
+            "kit0_909/04_909clap1.wav",
+            "kit0_909/05_909tommed.wav",
+            "kit0_909/06_909blip.wav",
+            "kit0_909/07_909cym2.wav",
+            "kit1_tac/00tictac_kick.wav",
+            "kit1_tac/01tictac_snare.wav",
+            "kit1_tac/02tictac_hatc2.wav",
+            "kit1_tac/03tictac_hato3.wav",
+            "kit1_tac/04tictac_snareroll.wav",
+            "kit1_tac/05tictac_tomlight.wav",
+            "kit1_tac/06tictac_ridebell.wav",
+            "kit1_tac/07tictac_cymbal1.wav",
+            "kit2_aku/00_kick02.wav",
+            "kit2_aku/01_sd02.wav",
+            "kit2_aku/02_ho02.wav",
+            "kit2_aku/03_ho02.wav",
+            "kit2_aku/04_clq02.wav",
+            "kit2_aku/05_pcq06.wav",
+            "kit2_aku/06_pcq10.wav",
+            "kit2_aku/07_cyq01.wav",
+        ];
+        let expected_frames = [
+            11_577, 13_024, 6_582, 13_230, 22_326, 8_720, 2_561, 19_845, 26_368, 25_024, 6_822,
+            40_961, 25_088, 67_328, 31_420, 66_058, 11_265, 15_776, 6_852, 24_370, 11_773, 18_178,
+            12_641, 44_165,
+        ];
+        assert_eq!(sample_assets::SAMPLE_NAMES, expected_names);
+        assert_eq!(sample_assets::SAMPLE_PATHS, expected_paths);
+        for index in 0..SAMPLE_COUNT {
+            let id = sample(index);
+            let definition = catalog.definition(id);
+            assert_eq!(definition.id, id);
+            assert_eq!(definition.short_name, expected_names[index]);
+            assert_eq!(definition.pcm.len(), expected_frames[index]);
+        }
     }
 
     #[test]
@@ -1391,55 +2829,68 @@ mod tests {
     }
 
     #[test]
-    fn voice_retriggers_and_stops_at_sample_end() {
+    fn voice_starts_and_stops_at_sample_end() {
         let kick_bytes = wav(&[10, 20], false);
         let hat_bytes = wav(&[-10], false);
-        let samples = [
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        ];
-        let mut voice = Voice::new(SampleId::Kick);
+        let catalog = test_catalog(&kick_bytes, &hat_bytes);
+        let mut voice = PlaybackVoice::idle();
 
-        assert_eq!(voice.next(&samples), 0);
-        voice.trigger();
-        assert_eq!(voice.next(&samples), 10);
-        assert!(voice.playing);
-        assert_eq!(voice.next(&samples), 20);
-        assert!(!voice.playing);
-        assert_eq!(voice.next(&samples), 0);
-        voice.trigger();
-        assert_eq!(voice.next(&samples), 10);
+        assert_eq!(voice.render(&catalog, 65_536), 0);
+        voice.start(0, DEFAULT_KICK_SAMPLE, 1);
+        assert_eq!(voice.render(&catalog, 65_536), 10);
+        assert!(voice.is_active());
+        assert_eq!(voice.render(&catalog, 65_536), 20);
+        assert!(!voice.is_active());
+        assert_eq!(voice.render(&catalog, 65_536), 0);
     }
 
     #[test]
     fn pads_map_to_samples_and_mixing_saturates() {
         let kick_bytes = wav(&[20_000], false);
         let hat_bytes = wav(&[-20_000], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
 
         for pad in 0..6 {
-            assert_eq!(sequencer.pads[pad].voice.sample, SampleId::Kick);
+            assert_eq!(sequencer.pads[pad].sample, DEFAULT_KICK_SAMPLE);
         }
         for pad in 6..BEAT_PAD_COUNT {
-            assert_eq!(sequencer.pads[pad].voice.sample, SampleId::OpenHat);
+            assert_eq!(sequencer.pads[pad].sample, DEFAULT_OPEN_HAT_SAMPLE);
         }
 
-        sequencer.pads[0].voice.trigger();
-        sequencer.pads[1].voice.trigger();
-        assert_eq!(
-            sequencer.render_pcm_frame(0, &mut RenderReport::default()),
-            i16::MAX
-        );
+        let mut report = RenderReport::default();
+        let allocation = VoiceAllocationState::settled(100, &[100; BEAT_PAD_COUNT]);
+        assert!(sequencer.voices.start(
+            0,
+            DEFAULT_KICK_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert!(sequencer.voices.start(
+            1,
+            DEFAULT_KICK_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(sequencer.render_pcm_frame(0, &mut report), i16::MAX);
+        assert_eq!(report.clipped_frame_count, 1);
 
-        sequencer.pads[6].voice.trigger();
-        sequencer.pads[7].voice.trigger();
-        assert_eq!(
-            sequencer.render_pcm_frame(1, &mut RenderReport::default()),
-            i16::MIN
-        );
+        assert!(sequencer.voices.start(
+            6,
+            DEFAULT_OPEN_HAT_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert!(sequencer.voices.start(
+            7,
+            DEFAULT_OPEN_HAT_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(sequencer.render_pcm_frame(1, &mut report), i16::MIN);
     }
 
     #[test]
@@ -1474,6 +2925,33 @@ mod tests {
         }
         assert_eq!(actual, expected);
         assert_eq!(split.error(), continuous.error());
+    }
+
+    #[test]
+    fn coarse_dither_preserves_duty_count_and_cross_frame_error() {
+        const BASE_MASK: u32 = (1 << PWM_COMMAND_BITS) - 1;
+        const DITHER_MASK: u32 = ((1 << PWM_DITHER_CYCLES) - 1) << PWM_COMMAND_BITS;
+
+        for starting_error in 0_u16..512 {
+            for fraction in 0_i16..512 {
+                // Quantized level 64 keeps every possible nine-bit fraction
+                // inside the signed-i16 range.
+                let sample = fraction;
+                let mut full = DitherEncoder {
+                    error: starting_error,
+                };
+                let mut coarse = full;
+                let full_word = full.encode(sample);
+                let coarse_word = coarse.encode_coarse(sample);
+                assert_eq!(coarse_word & BASE_MASK, full_word & BASE_MASK);
+                assert_eq!(
+                    (coarse_word & DITHER_MASK).count_ones(),
+                    (full_word & DITHER_MASK).count_ones()
+                );
+                assert_eq!(coarse.error(), full.error());
+                assert_eq!(coarse_word >> 30, 0);
+            }
+        }
     }
 
     #[test]
@@ -1536,13 +3014,135 @@ mod tests {
     }
 
     #[test]
+    fn rational_clock_matches_the_reference_ceil_grid() {
+        let pattern = patterned_clock_fixture();
+        let divisions = [1, 2, 3, 71, 73, 1_000, 2_047, MAX_BEAT_MULTIPLIER];
+        let base_intervals = [
+            MIN_BASE_INTERVAL_MS,
+            MIN_BASE_INTERVAL_MS + 1,
+            999,
+            DEFAULT_BASE_INTERVAL_MS,
+            106_500,
+            u32::MAX,
+        ];
+        let starts = [0, 12_345, u64::MAX - 96];
+
+        for division in divisions {
+            for base_interval_ms in base_intervals {
+                for from_frame in starts {
+                    let mut actual = PadState::new(0);
+                    actual.beats_per_interval = division;
+                    actual.align_clock(division, base_interval_ms, from_frame);
+                    let mut reference =
+                        ReferencePadClock::aligned(division, base_interval_ms, from_frame);
+
+                    assert_eq!(actual.tick_ordinal, reference.tick_ordinal);
+                    assert_eq!(actual.next_frame, Some(reference.next_frame));
+                    for offset in 0..384_u64 {
+                        let frame = from_frame.wrapping_add(offset);
+                        assert_eq!(
+                            actual.take_due(frame, &pattern),
+                            reference.take_due(frame, base_interval_ms, &pattern),
+                            "division={division}, base={base_interval_ms}, frame={frame}"
+                        );
+                        assert_eq!(actual.tick_ordinal, reference.tick_ordinal);
+                        assert_eq!(actual.next_frame, Some(reference.next_frame));
+                        assert!(actual.deadline_error < actual.period_denominator);
+                        assert!(actual.next_step < division);
+                        let (expected_bit, _) =
+                            pattern_step_range(actual.next_step, division).unwrap();
+                        assert_eq!(usize::from(actual.pattern_bit_index), expected_bit);
+                        assert_eq!(
+                            usize::from(actual.pattern_phase),
+                            usize::from(actual.next_step) * PATTERN_BITS % usize::from(division)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_pattern_cursor_matches_every_division() {
+        let pattern = patterned_clock_fixture();
+
+        for division in 1..=MAX_BEAT_MULTIPLIER {
+            let mut clock = PadState::new(0);
+            clock.beats_per_interval = division;
+            clock.align_clock(division, DEFAULT_BASE_INTERVAL_MS, 0);
+
+            for expected_step in 0..division {
+                assert_eq!(clock.next_step, expected_step, "division={division}");
+                let (expected_bit, _) = pattern_step_range(expected_step, division).unwrap();
+                assert_eq!(
+                    usize::from(clock.pattern_bit_index),
+                    expected_bit,
+                    "division={division}, step={expected_step}"
+                );
+                assert_eq!(
+                    clock.current_step_enabled(&pattern),
+                    pattern.step_enabled(expected_step, division).unwrap(),
+                    "division={division}, step={expected_step}"
+                );
+                clock.advance_one();
+            }
+
+            assert_eq!(clock.next_step, 0);
+            assert_eq!(clock.pattern_bit_index, 0);
+            assert_eq!(clock.pattern_phase, 0);
+        }
+    }
+
+    #[test]
+    fn rational_clock_fast_forward_matches_reference_coalescing() {
+        let pattern = patterned_clock_fixture();
+        let division = MAX_BEAT_MULTIPLIER;
+        let base_interval_ms = MIN_BASE_INTERVAL_MS;
+        let mut actual = PadState::new(0);
+        actual.beats_per_interval = division;
+        actual.align_clock(division, base_interval_ms, 0);
+        let mut reference = ReferencePadClock::aligned(division, base_interval_ms, 0);
+
+        // Every jump after the first takes the bounded fast-forward path. The
+        // longer gaps cross full pattern cycles and exercise cyclic OR logic.
+        for frame in [0, 2, 127, 2_000, 10_000, 65_535] {
+            assert_eq!(
+                actual.take_due(frame, &pattern),
+                reference.take_due(frame, base_interval_ms, &pattern),
+                "frame={frame}"
+            );
+            assert_eq!(actual.tick_ordinal, reference.tick_ordinal);
+            assert_eq!(actual.next_frame, Some(reference.next_frame));
+        }
+    }
+
+    #[test]
+    fn rational_clock_fast_forward_is_exact_across_frame_wrap() {
+        let pattern = patterned_clock_fixture();
+        let division = MAX_BEAT_MULTIPLIER;
+        let base_interval_ms = MIN_BASE_INTERVAL_MS;
+        let from_frame = u64::MAX - 1_000;
+        let mut actual = PadState::new(0);
+        actual.beats_per_interval = division;
+        actual.align_clock(division, base_interval_ms, from_frame);
+        let mut reference = ReferencePadClock::aligned(division, base_interval_ms, from_frame);
+
+        for frame in [from_frame, u64::MAX - 10, 0, 1_024] {
+            assert_eq!(
+                actual.take_due(frame, &pattern),
+                reference.take_due(frame, base_interval_ms, &pattern),
+                "frame={frame}"
+            );
+            assert_eq!(actual.tick_ordinal, reference.tick_ordinal);
+            assert_eq!(actual.next_frame, Some(reference.next_frame));
+        }
+    }
+
+    #[test]
     fn scheduling_is_global_phase_aligned_and_zero_stops_new_triggers() {
         let kick_bytes = wav(&[1, 2, 3], false);
         let hat_bytes = wav(&[4, 5, 6], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
@@ -1569,10 +3169,7 @@ mod tests {
     fn disabled_pattern_ticks_advance_without_triggering_audio_or_visuals() {
         let kick_bytes = wav(&[100], false);
         let hat_bytes = wav(&[200], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut pattern = Pattern::default();
         assert!(pattern.set_step_enabled(0, 4, false));
         assert!(sequencer.set_pattern(0, pattern));
@@ -1584,34 +3181,44 @@ mod tests {
         let mut output = [0_u32; 1];
         let disabled = sequencer.render(5_513, &mut output);
         assert_eq!(disabled.latest_visual_triggers[0], None);
-        assert_eq!(disabled.audible_trigger_counts[0], 0);
+        assert_eq!(
+            disabled.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            0
+        );
         assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
         assert_eq!(sequencer.pads()[0].next_frame, Some(11_025));
 
         let enabled = sequencer.render(11_025, &mut output);
         assert_eq!(enabled.latest_visual_triggers[0], Some(11_025));
-        assert_eq!(enabled.audible_trigger_counts[0], 1);
+        assert_eq!(
+            enabled.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
     }
 
     #[test]
     fn changing_base_interval_reschedules_all_enabled_pads() {
-        let kick_bytes = wav(&[1, 2, 3], false);
+        let kick_bytes = wav(&[1; 64], false);
         let hat_bytes = wav(&[4, 5, 6], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1;
         beats[6] = 2;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
-        sequencer.pads[0].voice.trigger();
+        assert_eq!(
+            sequencer.queue_preview(PreviewRequest::new(0, DEFAULT_KICK_SAMPLE).unwrap()),
+            None
+        );
+        let mut output = [0_u32; 1];
+        let preview = sequencer.render(0, &mut output);
+        assert_eq!(preview.preview_voice_start_count, 1);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
 
         sequencer.apply_timing(&beats, 500, 10_000);
         assert_eq!(sequencer.base_interval_ms(), 500);
         assert_eq!(sequencer.pads()[0].next_frame, Some(11_025));
         assert_eq!(sequencer.pads()[6].next_frame, Some(11_025));
-        assert!(sequencer.pads()[0].voice.playing);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
 
         // Changing timing exactly on a new-grid boundary selects the following one.
         sequencer.apply_timing(&beats, 1_000, 11_025);
@@ -1624,10 +3231,7 @@ mod tests {
     fn long_base_interval_supports_large_polyrhythm_divisions() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 71;
         beats[6] = 73;
@@ -1643,10 +3247,7 @@ mod tests {
     fn scheduler_is_safe_across_playback_frame_wrap() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, u64::MAX - 10);
@@ -1658,7 +3259,7 @@ mod tests {
 
         let mut output = [0_u32; 64];
         let report = sequencer.render(u64::MAX - 10, &mut output);
-        assert!(report.audible_trigger_counts[0] >= 2);
+        assert!(report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()] >= 2);
         assert!(sequencer.pads()[0].next_frame.unwrap() > deadline);
     }
 
@@ -1666,10 +3267,7 @@ mod tests {
     fn fastest_supported_timing_never_builds_a_frame_backlog() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = MAX_BEAT_MULTIPLIER;
         sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
@@ -1678,18 +3276,44 @@ mod tests {
         let report = sequencer.render(0, &mut output);
         let next = sequencer.pads()[0].next_frame.unwrap();
         assert_eq!(sequencer.pads()[0].tick_ordinal, 236);
-        assert_eq!(report.audible_trigger_counts[0], 127);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            u16::from(sequencer.render_policy().max_starts_per_pad)
+        );
+        assert_eq!(report.load_shed_trigger_count, 119);
         assert!(!frame_has_reached((AUDIO_BLOCK_FRAMES - 1) as u64, next));
+    }
+
+    #[test]
+    fn full_policy_spreads_dense_admissions_across_the_block() {
+        let kick_bytes = wav(&[1], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = MAX_BEAT_MULTIPLIER;
+        sequencer.apply_timing(&beats, MIN_BASE_INTERVAL_MS, 0);
+
+        let mut admitted = [u8::MAX; load_control::FULL_QUALITY_MAX_STARTS_PER_PAD as usize];
+        let mut count = 0;
+        for offset in 0..AUDIO_BLOCK_FRAMES {
+            sequencer.block_frame_offset = offset as u8;
+            let mut report = RenderReport::default();
+            let _ = sequencer.render_pcm_frame(offset as u64, &mut report);
+            if report.scheduled_voice_start_count != 0 {
+                admitted[count] = offset as u8;
+                count += 1;
+            }
+        }
+
+        assert_eq!(count, admitted.len());
+        assert_eq!(admitted, [1, 16, 32, 48, 64, 80, 96, 112]);
     }
 
     #[test]
     fn coalesced_ticks_trigger_when_any_due_pattern_entry_is_enabled() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut pattern = Pattern::default();
         pattern.fill(false);
         assert!(pattern.set_step_enabled(2, MAX_BEAT_MULTIPLIER, true));
@@ -1701,25 +3325,28 @@ mod tests {
 
         let mut output = [0_u32; 1];
         let first_frame = sequencer.render(1, &mut output);
-        assert_eq!(first_frame.audible_trigger_counts[0], 0);
+        assert_eq!(
+            first_frame.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            0
+        );
         assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
 
         // Ordinals 2 and 3 both land on frame 2. Step 1 is disabled and
         // step 2 is enabled, so the pair coalesces into exactly one trigger.
         let coalesced = sequencer.render(2, &mut output);
         assert_eq!(coalesced.latest_visual_triggers[0], Some(2));
-        assert_eq!(coalesced.audible_trigger_counts[0], 1);
+        assert_eq!(
+            coalesced.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
         assert_eq!(sequencer.pads()[0].tick_ordinal, 4);
     }
 
     #[test]
-    fn rendering_suppresses_duplicate_samples_but_not_visuals() {
+    fn same_wav_starts_are_independent_even_on_the_same_frame() {
         let kick_bytes = wav(&[100, 50], false);
         let hat_bytes = wav(&[200, 100], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         beats[1] = 1_000;
@@ -1731,68 +3358,184 @@ mod tests {
         assert_eq!(report.latest_visual_triggers[0], Some(23));
         assert_eq!(report.latest_visual_triggers[1], Some(23));
         assert_eq!(report.latest_visual_triggers[6], Some(23));
-        assert_eq!(report.audible_trigger_counts, [1, 1]);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
-        assert_eq!(sequencer.pads()[1].voice.cursor, 0);
-        assert_eq!(sequencer.pads()[6].voice.cursor, 1);
+        assert_eq!(report.scheduled_voice_start_count, 3);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            2
+        );
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_OPEN_HAT_SAMPLE.index()],
+            1
+        );
+        assert_eq!(sequencer.active_voice_count(), 3);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
+        assert_eq!(sequencer.active_voice_count_for_pad(1), Some(1));
+        assert_eq!(sequencer.active_voice_count_for_pad(6), Some(1));
     }
 
     #[test]
-    fn muting_stops_voice_but_preserves_scheduler_phase_and_visuals() {
-        let kick_bytes = wav(&[100, 50, 25], false);
+    fn muting_releases_voices_in_place_but_preserves_phase_and_visuals() {
+        let kick_bytes = wav(&[3_200; 128], false);
         let hat_bytes = wav(&[200], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
 
-        let mut output = [0_u32; 1];
-        let first = sequencer.render(23, &mut output);
+        let mut one_frame = [0_u32; 1];
+        let first = sequencer.render(23, &mut one_frame);
         assert_eq!(first.latest_visual_triggers[0], Some(23));
-        assert_eq!(first.audible_trigger_counts[0], 1);
-        assert!(sequencer.pads()[0].voice.playing);
+        assert_eq!(first.scheduled_voice_start_count, 1);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
 
-        sequencer.set_mute_mask(1 << 0);
-        assert!(!sequencer.pads()[0].voice.playing);
-        let muted = sequencer.render(45, &mut output);
-        assert_eq!(muted.latest_visual_triggers[0], Some(45));
-        assert_eq!(muted.audible_trigger_counts[0], 0);
-        assert_eq!(sequencer.pads()[0].tick_ordinal, 3);
-        assert_eq!(sequencer.pads()[0].next_frame, Some(67));
+        sequencer.set_mute_mask((1 << 0) | (1 << 15));
+        assert_eq!(sequencer.mute_mask(), 1 << 0);
+        // Muting never destroys a voice at the control boundary. It starts a
+        // 32-frame release that is owned and rendered by the audio task.
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
+        let mut release = [0_u32; DECLICK_FRAMES as usize];
+        let muted = sequencer.render(45, &mut release);
+        assert_eq!(muted.muted_voice_release_count, 1);
+        assert_eq!(muted.latest_visual_triggers[0], Some(67));
+        assert_eq!(muted.scheduled_voice_start_count, 0);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 4);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(89));
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(0));
 
         sequencer.set_mute_mask(0);
-        assert!(!sequencer.pads()[0].voice.playing);
-        let unmuted = sequencer.render(67, &mut output);
-        assert_eq!(unmuted.latest_visual_triggers[0], Some(67));
-        assert_eq!(unmuted.audible_trigger_counts[0], 1);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(0));
+        let unmuted = sequencer.render(89, &mut one_frame);
+        assert_eq!(unmuted.latest_visual_triggers[0], Some(89));
+        assert_eq!(unmuted.scheduled_voice_start_count, 1);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
     }
 
     #[test]
-    fn muted_pad_does_not_claim_duplicate_sample_trigger() {
+    fn muted_pad_does_not_prevent_an_independent_same_sample_start() {
         let kick_bytes = wav(&[100, 50], false);
         let hat_bytes = wav(&[200], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         beats[1] = 1_000;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
-        sequencer.set_mute_mask((1 << 0) | (1 << 15));
-        assert_eq!(sequencer.mute_mask(), 1 << 0);
+        sequencer.set_mute_mask(1 << 0);
 
         let mut output = [0_u32; 1];
         let report = sequencer.render(23, &mut output);
         assert_eq!(report.latest_visual_triggers[0], Some(23));
         assert_eq!(report.latest_visual_triggers[1], Some(23));
-        assert_eq!(report.audible_trigger_counts[0], 1);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
-        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
+        assert_eq!(report.scheduled_voice_start_count, 1);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(0));
+        assert_eq!(sequencer.active_voice_count_for_pad(1), Some(1));
+    }
+
+    #[test]
+    fn gain_ramps_take_exactly_64_frames() {
+        let mut gain = GainRamp::new(100);
+        gain.set_percent(0);
+        assert_eq!(gain.next_q16(), 64_512);
+        for expected_remaining in (0_u32..63).rev() {
+            assert_eq!(gain.next_q16(), expected_remaining * 1_024);
+        }
+        assert_eq!(gain.next_q16(), 0);
+
+        gain.set_percent(100);
+        assert_eq!(gain.next_q16(), 1_024);
+        for _ in 1..GAIN_RAMP_FRAMES {
+            gain.next_q16();
+        }
+        assert_eq!(gain.next_q16(), 65_536);
+    }
+
+    #[test]
+    fn optimized_fixed_point_math_matches_wide_truncating_reference() {
+        let samples = [i16::MIN, -32_767, -101, -1, 0, 1, 101, 32_767];
+        let gains = [0, 1, 17_891, 32_768, 65_535, 65_536];
+        for sample in samples {
+            for gain in gains {
+                let expected = (i64::from(sample) * i64::from(gain) / i64::from(65_536)) as i32;
+                assert_eq!(apply_sample_gain_q16(sample, gain), expected);
+            }
+        }
+
+        let mix_values = [
+            i32::MIN,
+            -1_081_344,
+            -65_537,
+            -1,
+            0,
+            1,
+            65_537,
+            1_081_311,
+            i32::MAX,
+        ];
+        for value in mix_values {
+            for gain in gains {
+                let expected = (i64::from(value) * i64::from(gain) / i64::from(65_536)) as i32;
+                assert_eq!(apply_mix_gain_q16(value, gain), expected);
+            }
+        }
+
+        for value in [i32::from(i16::MIN), -1_001, -1, 0, 1, 1_001, 32_767] {
+            for remaining in 0..=DECLICK_FRAMES {
+                let expected = value * i32::from(remaining) / i32::from(DECLICK_FRAMES);
+                assert_eq!(scale_declick(value, remaining), expected);
+            }
+        }
+
+        let mut ramp = GainRamp::new(100);
+        ramp.set_percent(33);
+        let start = 65_536_i32;
+        let target = percent_to_q16(33) as i32;
+        for elapsed in 1..=GAIN_RAMP_FRAMES {
+            let expected =
+                start + (target - start) * i32::from(elapsed) / i32::from(GAIN_RAMP_FRAMES);
+            assert_eq!(ramp.next_q16(), expected as u32);
+        }
+    }
+
+    #[test]
+    fn voice_pool_caches_active_counts_and_accumulates_its_bounded_range() {
+        let sample_bytes = wav(&[i16::MIN], false);
+        let catalog = test_catalog(&sample_bytes, &sample_bytes);
+        let gains = [65_536; BEAT_PAD_COUNT];
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut pool = VoicePool::new();
+
+        // An inactive slot's stale owner is never used to index the gain table.
+        pool.primaries[0].owner_pad = u8::MAX;
+        assert_eq!(pool.render(&catalog, &gains), 0);
+
+        let mut report = RenderReport::default();
+        for serial in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                serial % BEAT_PAD_COUNT,
+                sample(0),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+        assert_eq!(pool.active_voice_count(), PRIMARY_VOICE_COUNT);
+
+        for serial in 0..FADE_TAIL_COUNT {
+            let mut voice = PlaybackVoice::idle();
+            voice.start(serial % BEAT_PAD_COUNT, sample(0), serial as u64);
+            pool.preserve_stolen_voice(voice, FADE_TAIL_COUNT as u8, &mut report);
+        }
+        assert_eq!(pool.active_tail_count(), FADE_TAIL_COUNT);
+
+        // The most-negative contribution from every bounded stream still fits
+        // comfortably in i32, so accumulation needs no per-voice saturation.
+        assert_eq!(pool.render(&catalog, &gains), -1_081_344);
+        assert_eq!(pool.active_voice_count(), 0);
+        assert_eq!(pool.active_tail_count(), 0);
     }
 
     #[test]
@@ -1803,30 +3546,40 @@ mod tests {
         assert_eq!(scale_audio_percent(i32::MIN, 100), i32::MIN);
         assert_eq!(scale_audio_percent(123, u8::MAX), 123);
 
-        let kick_bytes = wav(&[20_000], false);
-        let hat_bytes = wav(&[-20_000], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
-        let full = [100; BEAT_PAD_COUNT];
-        sequencer.set_volumes(50, &full);
-        sequencer.pads[0].voice.trigger();
-        sequencer.pads[1].voice.trigger();
+        let kick_bytes = wav(&[20_000; 128], false);
+        let hat_bytes = wav(&[-20_000; 128], false);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
+        let mut volumes = [100; BEAT_PAD_COUNT];
+        volumes[0] = 50;
+        sequencer.set_volumes(50, &volumes);
+        for frame in 0..GAIN_RAMP_FRAMES {
+            assert_eq!(
+                sequencer.render_pcm_frame(u64::from(frame), &mut RenderReport::default()),
+                0
+            );
+        }
 
-        // The 40,000 local sum is halved before i16 saturation. Saturating
-        // first and then applying master gain would incorrectly produce 16,383.
-        assert_eq!(
-            sequencer.render_pcm_frame(0, &mut RenderReport::default()),
-            20_000
-        );
+        let mut report = RenderReport::default();
+        let allocation = VoiceAllocationState::settled(50, &volumes);
+        assert!(sequencer.voices.start(
+            0,
+            DEFAULT_KICK_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert!(sequencer.voices.start(
+            1,
+            DEFAULT_KICK_SAMPLE,
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
 
-        sequencer.pads[6].voice.trigger();
-        sequencer.pads[7].voice.trigger();
-        assert_eq!(
-            sequencer.render_pcm_frame(1, &mut RenderReport::default()),
-            -20_000
-        );
+        // Pad 0 contributes 10,000 and pad 1 contributes 20,000. The 30,000
+        // local sum is mastered to 15,000 before the final i16 saturation.
+        assert_eq!(sequencer.render_pcm_frame(64, &mut report), 15_000);
+        assert_eq!(report.clipped_frame_count, 0);
 
         let over_range = [u8::MAX; BEAT_PAD_COUNT];
         sequencer.set_volumes(u8::MAX, &over_range);
@@ -1836,92 +3589,61 @@ mod tests {
     }
 
     #[test]
-    fn zero_volume_triggers_and_advances_a_voice_silently() {
-        let kick_bytes = wav(&[100, 50, 25], false);
+    fn zero_volume_starts_and_advances_a_voice_silently() {
+        let kick_bytes = wav(&[32_000; 128], false);
         let hat_bytes = wav(&[200], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
-        let mut beats = [0; BEAT_PAD_COUNT];
-        beats[0] = 1_000;
-        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut volumes = [100; BEAT_PAD_COUNT];
         volumes[0] = 0;
         sequencer.set_volumes(100, &volumes);
 
+        // Settle the block-aligned gain change before scheduling the voice.
+        for frame in 0..GAIN_RAMP_FRAMES {
+            assert_eq!(
+                sequencer.render_pcm_frame(u64::from(frame), &mut RenderReport::default()),
+                0
+            );
+        }
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 63);
+
         let mut report = RenderReport::default();
-        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
-        assert_eq!(report.latest_visual_triggers[0], Some(23));
-        assert_eq!(report.audible_trigger_counts[0], 0);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
-        assert!(sequencer.pads()[0].voice.playing);
+        assert_eq!(sequencer.render_pcm_frame(67, &mut report), 0);
+        assert_eq!(report.latest_visual_triggers[0], Some(67));
+        assert_eq!(report.scheduled_voice_start_count, 1);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            0
+        );
+        let voice = sequencer
+            .voices
+            .primaries
+            .iter()
+            .find(|voice| voice.is_active() && voice.owner_pad() == 0)
+            .unwrap();
+        assert_eq!(voice.cursor, 1);
 
         volumes[0] = 100;
         sequencer.set_volumes(100, &volumes);
         assert_eq!(
-            sequencer.render_pcm_frame(24, &mut RenderReport::default()),
-            50
+            sequencer.render_pcm_frame(68, &mut RenderReport::default()),
+            500
         );
-        assert_eq!(sequencer.pads()[0].voice.cursor, 2);
-    }
-
-    #[test]
-    fn nonzero_pad_wins_duplicate_trigger_but_all_zero_retains_one_voice() {
-        let kick_bytes = wav(&[100, 50], false);
-        let hat_bytes = wav(&[200], false);
-        let mut beats = [0; BEAT_PAD_COUNT];
-        beats[0] = 1_000;
-        beats[1] = 1_000;
-
-        let mut mixed_volumes = [100; BEAT_PAD_COUNT];
-        mixed_volumes[0] = 0;
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
-        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
-        sequencer.set_volumes(100, &mixed_volumes);
-        let mixed = sequencer.render_pcm_frame(23, &mut RenderReport::default());
-        assert_eq!(mixed, 100);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
-        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
-
-        let zero_volumes = [0; BEAT_PAD_COUNT];
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
-        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
-        sequencer.set_volumes(100, &zero_volumes);
-        let mut report = RenderReport::default();
-        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
-        assert_eq!(report.audible_trigger_counts[0], 0);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 1);
-        assert_eq!(sequencer.pads()[1].voice.cursor, 0);
-
-        // Master zero affects audibility, not which local candidate wins.
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
-        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
-        sequencer.set_volumes(0, &mixed_volumes);
-        let mut report = RenderReport::default();
-        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
-        assert_eq!(report.audible_trigger_counts[0], 0);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
-        assert_eq!(sequencer.pads()[1].voice.cursor, 1);
+        let voice = sequencer
+            .voices
+            .primaries
+            .iter()
+            .find(|voice| voice.is_active() && voice.owner_pad() == 0)
+            .unwrap();
+        assert_eq!(voice.cursor, 2);
     }
 
     #[test]
     fn mute_remains_authoritative_over_nonzero_volume() {
         let kick_bytes = wav(&[100, 50], false);
         let hat_bytes = wav(&[200], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 1_000;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
@@ -1931,19 +3653,634 @@ mod tests {
         let mut report = RenderReport::default();
         assert_eq!(sequencer.render_pcm_frame(23, &mut report), 0);
         assert_eq!(report.latest_visual_triggers[0], Some(23));
-        assert_eq!(report.audible_trigger_counts[0], 0);
-        assert_eq!(sequencer.pads()[0].voice.cursor, 0);
-        assert!(!sequencer.pads()[0].voice.playing);
+        assert_eq!(report.scheduled_voice_start_count, 0);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(0));
+    }
+
+    #[test]
+    fn sample_ids_wrap_and_pad_defaults_use_the_aku_assets() {
+        assert_eq!(SampleId::from_index(0), Some(sample(0)));
+        assert_eq!(SampleId::from_index(SAMPLE_COUNT - 1), Some(sample(23)));
+        assert_eq!(SampleId::from_index(SAMPLE_COUNT), None);
+        assert_eq!(sample(23).wrapping_offset(1), sample(0));
+        assert_eq!(sample(0).wrapping_offset(-1), sample(23));
+        assert_eq!(sample(2).wrapping_offset(49), sample(3));
+        assert_eq!(sample(2).wrapping_offset(-51), sample(23));
+
+        assert_eq!(DEFAULT_KICK_SAMPLE, sample(16));
+        assert_eq!(DEFAULT_OPEN_HAT_SAMPLE, sample(18));
+        assert_eq!(DEFAULT_PAD_SAMPLES[..6], [sample(16); 6]);
+        assert_eq!(DEFAULT_PAD_SAMPLES[6..], [sample(18); 3]);
+    }
+
+    #[test]
+    fn pad_sample_changes_only_affect_future_voice_starts() {
+        let first_bytes = wav(&[100; 64], false);
+        let second_bytes = wav(&[-200; 64], false);
+        let first = WavPcm16::parse(&first_bytes).unwrap();
+        let second = WavPcm16::parse(&second_bytes).unwrap();
+        let mut samples = [first; SAMPLE_COUNT];
+        samples[1] = second;
+        let mut sequencer = Sequencer::new(SampleCatalog::new(samples, &TEST_SAMPLE_NAMES));
+        assert!(sequencer.set_pad_sample(0, sample(0)));
+        assert!(!sequencer.set_pad_sample(BEAT_PAD_COUNT, sample(0)));
+
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.block_frame_offset = 23;
+        assert_eq!(
+            sequencer.render_pcm_frame(23, &mut RenderReport::default()),
+            100
+        );
+        assert!(sequencer.set_pad_sample(0, sample(1)));
+        assert_eq!(sequencer.pad_sample(0), Some(sample(1)));
+
+        // The old voice retains sample 0 while the new exact-frame start
+        // captures sample 1, so both contribute independently.
+        let mut report = RenderReport::default();
+        sequencer.block_frame_offset = 45;
+        assert_eq!(sequencer.render_pcm_frame(45, &mut report), -100);
+        assert_eq!(report.audible_trigger_counts[sample(1).index()], 1);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(2));
+        assert!(
+            sequencer
+                .voices
+                .primaries
+                .iter()
+                .any(|voice| voice.is_active() && voice.sample == sample(0))
+        );
+        assert!(
+            sequencer
+                .voices
+                .primaries
+                .iter()
+                .any(|voice| voice.is_active() && voice.sample == sample(1))
+        );
+    }
+
+    #[test]
+    fn primary_pool_allows_24_same_pad_voices_then_steals_oldest() {
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut pool = VoicePool::new();
+        let mut report = RenderReport::default();
+        for index in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                0,
+                sample(index % SAMPLE_COUNT),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+        assert_eq!(pool.active_voice_count(), PRIMARY_VOICE_COUNT);
+        assert_eq!(pool.active_voice_count_for_pad(0), PRIMARY_VOICE_COUNT);
+        assert_eq!(report.same_pad_steal_count, 0);
+        assert_eq!(pool.primaries[0].started_serial, 0);
+
+        assert!(pool.start(
+            0,
+            sample(5),
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.same_pad_steal_count, 1);
+        assert_eq!(pool.primaries[0].sample, sample(5));
+        assert_eq!(pool.primaries[0].started_serial, 24);
+        assert_eq!(pool.active_tail_count(), 1);
+        assert_eq!(pool.tails[0].started_serial, 0);
+
+        // Nine tails are retained. A tenth simultaneous steal replaces the
+        // oldest equally-long tail and records the bounded overflow.
+        for _ in 1..=FADE_TAIL_COUNT {
+            assert!(pool.start(
+                0,
+                sample(6),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+        assert_eq!(pool.active_tail_count(), FADE_TAIL_COUNT);
+        assert_eq!(report.same_pad_steal_count, 10);
+        assert_eq!(report.fade_tail_overflow_count, 1);
+        assert_eq!(pool.tails[0].started_serial, 9);
+    }
+
+    #[test]
+    fn render_policy_bounds_primary_and_intermediate_tail_counts() {
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut pool = VoicePool::new();
+        let mut report = RenderReport::default();
+        for _ in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                0,
+                sample(0),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+
+        let policy = RenderPolicy {
+            max_primary_voices: PRIMARY_VOICE_COUNT as u8,
+            max_fade_tails: 2,
+            ..RenderPolicy::FULL
+        };
+        for _ in 0..6 {
+            assert!(pool.start_with_policy(
+                0,
+                sample(1),
+                StartPriority::Scheduled,
+                allocation,
+                policy,
+                &mut report,
+            ));
+        }
+        assert_eq!(pool.active_tail_count(), 2);
+        assert_eq!(report.fade_tail_overflow_count, 4);
+
+        let soft_pressure = RenderPolicy {
+            max_primary_voices: 12,
+            max_fade_tails: FADE_TAIL_COUNT as u8,
+            preserve_stolen_fade_tails: false,
+            release_excess_primaries: true,
+            trim_excess_primaries: false,
+            ..policy
+        };
+        pool.enforce_policy(soft_pressure, &mut report);
+        assert_eq!(pool.active_voice_count(), PRIMARY_VOICE_COUNT);
+        assert_eq!(pool.active_tail_count(), 2);
+        assert!(!pool.start_with_policy(
+            0,
+            sample(2),
+            StartPriority::Scheduled,
+            allocation,
+            soft_pressure,
+            &mut report,
+        ));
+        assert_eq!(pool.active_tail_count(), 2);
+        assert_eq!(report.load_shed_trigger_count, 1);
+        let catalog = test_catalog(KICK_WAV, HAT_WAV);
+        for _ in 0..DECLICK_FRAMES {
+            let _ = pool.render(&catalog, &[percent_to_q16(100); BEAT_PAD_COUNT]);
+        }
+        assert_eq!(pool.active_voice_count(), 12);
+        assert!(pool.start_with_policy(
+            0,
+            sample(2),
+            StartPriority::Scheduled,
+            allocation,
+            soft_pressure,
+            &mut report,
+        ));
+        assert_eq!(report.load_shed_fade_tail_count, 1);
+
+        let trimmed = RenderPolicy {
+            max_primary_voices: 12,
+            max_fade_tails: 0,
+            preserve_stolen_fade_tails: false,
+            trim_excess_primaries: true,
+            ..policy
+        };
+        pool.enforce_policy(trimmed, &mut report);
+        assert_eq!(pool.active_voice_count(), 12);
+        assert_eq!(pool.active_tail_count(), 0);
+        assert_eq!(report.load_shed_primary_count, 12);
+        assert_eq!(report.load_shed_fade_tail_count, 1);
+    }
+
+    #[test]
+    fn aku_kick_at_28_hz_contracts_cleanly_below_the_measured_wall() {
+        let mut sequencer = test_sequencer(KICK_WAV, HAT_WAV);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 28;
+        sequencer.apply_timing(&beats, 1_000, 0);
+
+        let mut output = [0_u32; AUDIO_BLOCK_FRAMES];
+        let mut frame = 0_u64;
+        let mut peak = 0_usize;
+        for _ in 0..300 {
+            let report = sequencer.render(frame, &mut output);
+            peak = peak.max(usize::from(report.peak_primary_voice_count));
+            frame = frame.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
+            if sequencer.active_voice_count() == 15 {
+                break;
+            }
+        }
+        assert_eq!(peak, 15);
+        assert_eq!(sequencer.active_voice_count(), 15);
+
+        sequencer.set_render_policy(RenderPolicy {
+            max_primary_voices: 14,
+            max_fade_tails: FADE_TAIL_COUNT as u8,
+            preserve_stolen_fade_tails: false,
+            release_excess_primaries: true,
+            trim_excess_primaries: false,
+            max_starts_per_pad: 1,
+            allow_preview: false,
+            dither_quality: DitherQuality::Coarse,
+        });
+        let report = sequencer.render(frame, &mut output);
+        assert_eq!(report.load_shed_primary_count, 1);
+        assert!(sequencer.active_voice_count() <= 14);
+        frame = frame.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
+
+        let mut saw_visual_tick = report.latest_visual_triggers[0].is_some();
+        for _ in 0..8 {
+            let report = sequencer.render(frame, &mut output);
+            saw_visual_tick |= report.latest_visual_triggers[0].is_some();
+            assert!(sequencer.active_voice_count() <= 14);
+            frame = frame.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
+        }
+        assert!(saw_visual_tick);
+    }
+
+    #[test]
+    fn full_pool_uses_zero_volume_then_global_victims_and_drops_silent_requests() {
+        fn full_pool(volumes: &[u8; BEAT_PAD_COUNT]) -> VoicePool {
+            let mut pool = VoicePool::new();
+            let mut ignored = RenderReport::default();
+            let allocation = VoiceAllocationState::settled(100, volumes);
+            for index in 0..PRIMARY_VOICE_COUNT {
+                assert!(pool.start(
+                    index % 8,
+                    sample(index % SAMPLE_COUNT),
+                    StartPriority::Scheduled,
+                    allocation,
+                    &mut ignored,
+                ));
+            }
+            pool
+        }
+
+        let mut zero_victim_volumes = [100; BEAT_PAD_COUNT];
+        zero_victim_volumes[2] = 0;
+        let mut pool = full_pool(&zero_victim_volumes);
+        let mut report = RenderReport::default();
+        let allocation = VoiceAllocationState::settled(100, &zero_victim_volumes);
+        assert!(pool.start(
+            8,
+            sample(23),
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.zero_volume_steal_count, 1);
+        assert_eq!(report.global_steal_count, 0);
+        assert_eq!(pool.primaries[2].owner_pad(), 8);
+        // Every stolen voice gets a bounded de-click tail, even when its pad's
+        // target is zero: the live 64-frame gain ramp may still be audible.
+        assert_eq!(pool.active_tail_count(), 1);
+
+        let full_volumes = [100; BEAT_PAD_COUNT];
+        let mut pool = full_pool(&full_volumes);
+        let mut report = RenderReport::default();
+        let allocation = VoiceAllocationState::settled(100, &full_volumes);
+        assert!(pool.start(
+            8,
+            sample(23),
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.global_steal_count, 1);
+        assert_eq!(pool.primaries[0].owner_pad(), 8);
+        assert_eq!(pool.active_tail_count(), 1);
+
+        let mut silent_request_volumes = full_volumes;
+        silent_request_volumes[8] = 0;
+        let mut pool = full_pool(&silent_request_volumes);
+        let mut report = RenderReport::default();
+        let allocation = VoiceAllocationState::settled(100, &silent_request_volumes);
+        assert!(!pool.start(
+            8,
+            sample(23),
+            StartPriority::Scheduled,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.silent_trigger_drop_count, 1);
+        assert_eq!(report.global_steal_count, 0);
+        assert_eq!(pool.active_tail_count(), 0);
+    }
+
+    #[test]
+    fn silent_requests_wait_for_gain_ramps_before_reusing_full_pool_voices() {
+        fn full_pool() -> VoicePool {
+            let volumes = [100; BEAT_PAD_COUNT];
+            let allocation = VoiceAllocationState::settled(100, &volumes);
+            let mut pool = VoicePool::new();
+            let mut report = RenderReport::default();
+            for index in 0..PRIMARY_VOICE_COUNT {
+                assert!(pool.start(
+                    index % 8,
+                    sample(0),
+                    StartPriority::Scheduled,
+                    allocation,
+                    &mut report,
+                ));
+            }
+            pool
+        }
+
+        let full_gain = [65_536; BEAT_PAD_COUNT];
+        let mut pad_targets = [100; BEAT_PAD_COUNT];
+        pad_targets[0] = 0;
+        let ramping_pad = VoiceAllocationState::new(100, &pad_targets, 65_536, &full_gain);
+        let mut pool = full_pool();
+        let mut report = RenderReport::default();
+        assert!(!pool.start(
+            0,
+            sample(1),
+            StartPriority::Scheduled,
+            ramping_pad,
+            &mut report,
+        ));
+        assert_eq!(report.silent_trigger_drop_count, 1);
+        assert_eq!(report.same_pad_steal_count, 0);
+        assert_eq!(pool.active_tail_count(), 0);
+
+        // A zero master makes every new request silent, but its in-progress
+        // ramp still protects voices that are currently audible.
+        let ramping_master =
+            VoiceAllocationState::new(0, &[100; BEAT_PAD_COUNT], 65_536, &full_gain);
+        let mut pool = full_pool();
+        let mut report = RenderReport::default();
+        assert!(!pool.start(
+            8,
+            sample(1),
+            StartPriority::Scheduled,
+            ramping_master,
+            &mut report,
+        ));
+        assert_eq!(report.silent_trigger_drop_count, 1);
+        assert_eq!(report.zero_volume_steal_count, 0);
+
+        // Once the master reaches zero, the same request may reuse a truly
+        // silent target-zero victim without sacrificing audible output.
+        let settled_master = VoiceAllocationState::new(0, &[100; BEAT_PAD_COUNT], 0, &full_gain);
+        assert!(pool.start(
+            8,
+            sample(1),
+            StartPriority::Scheduled,
+            settled_master,
+            &mut report,
+        ));
+        assert_eq!(report.zero_volume_steal_count, 1);
+        assert_eq!(pool.active_tail_count(), 1);
+    }
+
+    #[test]
+    fn audible_request_fades_a_target_zero_victim_still_ramping_down() {
+        let full_volumes = [100; BEAT_PAD_COUNT];
+        let fill = VoiceAllocationState::settled(100, &full_volumes);
+        let mut pool = VoicePool::new();
+        let mut report = RenderReport::default();
+        for index in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                index % 8,
+                sample(0),
+                StartPriority::Scheduled,
+                fill,
+                &mut report,
+            ));
+        }
+
+        let mut targets = full_volumes;
+        targets[2] = 0;
+        let ramping = VoiceAllocationState::new(100, &targets, 65_536, &[65_536; BEAT_PAD_COUNT]);
+        let mut report = RenderReport::default();
+        assert!(pool.start(8, sample(1), StartPriority::Scheduled, ramping, &mut report,));
+        assert_eq!(report.zero_volume_steal_count, 1);
+        assert_eq!(pool.active_tail_count(), 1);
+        assert_eq!(pool.tails[0].owner_pad, 2);
+    }
+
+    #[test]
+    fn previews_only_use_free_or_same_pad_primary_slots() {
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut pool = VoicePool::new();
+        let mut report = RenderReport::default();
+        for index in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                index % 8,
+                sample(0),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+
+        assert!(!pool.start(
+            8,
+            sample(1),
+            StartPriority::Preview,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.preview_drop_count, 1);
+        assert_eq!(report.global_steal_count, 0);
+        assert_eq!(report.zero_volume_steal_count, 0);
+
+        assert!(pool.start(
+            3,
+            sample(1),
+            StartPriority::Preview,
+            allocation,
+            &mut report,
+        ));
+        assert_eq!(report.same_pad_steal_count, 1);
+        assert_eq!(pool.primaries[3].sample, sample(1));
+    }
+
+    #[test]
+    fn forced_voice_and_steal_tail_fades_last_exactly_32_frames() {
+        let sample_bytes = wav(&[32_000; 64], false);
+        let catalog = test_catalog(&sample_bytes, &sample_bytes);
+
+        let mut voice = PlaybackVoice::idle();
+        voice.start(0, DEFAULT_KICK_SAMPLE, 7);
+        assert!(voice.force_release());
+        for remaining in (1_u8..=DECLICK_FRAMES).rev() {
+            assert_eq!(voice.render(&catalog, 65_536), i32::from(remaining) * 1_000);
+        }
+        assert!(!voice.is_active());
+
+        let mut stolen = PlaybackVoice::idle();
+        stolen.start(0, DEFAULT_KICK_SAMPLE, 8);
+        let mut tail = FadeTail::idle();
+        tail.start_from(stolen);
+        for remaining in (1_u8..=DECLICK_FRAMES).rev() {
+            assert_eq!(tail.render(&catalog, 65_536), i32::from(remaining) * 1_000);
+        }
+        assert!(!tail.active);
+    }
+
+    #[test]
+    fn fade_tail_overflow_replaces_nearest_completion_then_oldest() {
+        let mut pool = VoicePool::new();
+        pool.next_serial = 100;
+        for (slot, tail) in pool.tails.iter_mut().enumerate() {
+            let mut voice = PlaybackVoice::idle();
+            voice.start(slot % BEAT_PAD_COUNT, sample(0), 50 + slot as u64);
+            tail.start_from(voice);
+            tail.remaining = 20;
+        }
+        pool.tails[2].remaining = 5;
+        pool.tails[2].started_serial = 90;
+        pool.tails[6].remaining = 5;
+        pool.tails[6].started_serial = 80;
+
+        let mut incoming = PlaybackVoice::idle();
+        incoming.start(8, sample(1), 101);
+        let mut report = RenderReport::default();
+        pool.preserve_stolen_voice(incoming, FADE_TAIL_COUNT as u8, &mut report);
+        assert_eq!(report.fade_tail_overflow_count, 1);
+        assert_eq!(pool.tails[6].started_serial, 101);
+        assert_eq!(pool.tails[2].started_serial, 90);
+    }
+
+    #[test]
+    fn muting_one_pad_releases_all_24_of_its_primary_voices_in_place() {
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut pool = VoicePool::new();
+        let mut report = RenderReport::default();
+        for _ in 0..PRIMARY_VOICE_COUNT {
+            assert!(pool.start(
+                0,
+                sample(0),
+                StartPriority::Scheduled,
+                allocation,
+                &mut report,
+            ));
+        }
+        assert_eq!(pool.release_mask(1), PRIMARY_VOICE_COUNT as u16);
+        assert_eq!(pool.release_mask(1), 0);
+        assert_eq!(pool.active_voice_count(), PRIMARY_VOICE_COUNT);
+        assert_eq!(pool.active_tail_count(), 0);
+    }
+
+    #[test]
+    fn scheduled_and_latest_preview_start_independently_and_muted_preview_pulses() {
+        let sample_bytes = wav(&[100; 64], false);
+        let mut sequencer = test_sequencer(&sample_bytes, &sample_bytes);
+        let volumes = [100; BEAT_PAD_COUNT];
+        let allocation = VoiceAllocationState::settled(100, &volumes);
+        let mut ignored = RenderReport::default();
+        for index in 0..PRIMARY_VOICE_COUNT - 1 {
+            assert!(sequencer.voices.start(
+                1 + index % 7,
+                sample(0),
+                StartPriority::Scheduled,
+                allocation,
+                &mut ignored,
+            ));
+        }
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1_000;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        let first = PreviewRequest::new(8, sample(1)).unwrap();
+        let second = PreviewRequest::new(7, sample(2)).unwrap();
+        assert_eq!(sequencer.queue_preview(first), None);
+        assert_eq!(sequencer.queue_preview(second), Some(first));
+
+        let mut report = RenderReport::default();
+        assert_eq!(sequencer.render_pcm_frame(23, &mut report), 2_500);
+        assert_eq!(report.scheduled_voice_start_count, 1);
+        assert_eq!(report.preview_voice_start_count, 1);
+        assert_eq!(report.preview_drop_count, 0);
+        assert_eq!(report.same_pad_steal_count, 1);
+        assert_eq!(report.global_steal_count, 0);
+        assert_eq!(report.latest_visual_triggers[0], Some(23));
+        assert_eq!(report.latest_visual_triggers[7], Some(23));
+        assert_eq!(report.peak_primary_voice_count, PRIMARY_VOICE_COUNT as u8);
+
+        let mut muted = test_sequencer(&sample_bytes, &sample_bytes);
+        muted.set_mute_mask(1 << 2);
+        assert_eq!(
+            muted.queue_preview(PreviewRequest::new(2, sample(3)).unwrap()),
+            None
+        );
+        let mut report = RenderReport::default();
+        assert_eq!(muted.render_pcm_frame(99, &mut report), 0);
+        assert_eq!(report.latest_visual_triggers[2], Some(99));
+        assert_eq!(report.preview_drop_count, 1);
+        assert_eq!(report.preview_voice_start_count, 0);
+    }
+
+    #[test]
+    fn shared_sample_selection_is_checked_and_preview_queue_is_latest_wins() {
+        let mut state = SharedState::default();
+        assert_eq!(state.pad_samples(), &DEFAULT_PAD_SAMPLES);
+        assert!(state.set_pad_sample(4, sample(23)));
+        assert_eq!(state.pad_sample(4), Some(sample(23)));
+        assert!(!state.set_pad_sample(BEAT_PAD_COUNT, sample(0)));
+        assert_eq!(state.pad_sample(BEAT_PAD_COUNT), None);
+
+        let first = PreviewRequest::new(4, sample(22)).unwrap();
+        let second = PreviewRequest::new(4, sample(23)).unwrap();
+        assert_eq!(PreviewRequest::new(BEAT_PAD_COUNT, sample(0)), None);
+        assert_eq!(state.queue_preview(first), None);
+        assert_eq!(state.queue_preview(second), Some(first));
+        assert_eq!(state.take_preview(), Some(second));
+        assert_eq!(state.take_preview(), None);
+    }
+
+    #[test]
+    fn sampler_diagnostics_accumulate_counts_and_peak_usage() {
+        let first = RenderReport {
+            scheduled_voice_start_count: 2,
+            preview_voice_start_count: 1,
+            same_pad_steal_count: 3,
+            zero_volume_steal_count: 4,
+            global_steal_count: 5,
+            silent_trigger_drop_count: 6,
+            preview_drop_count: 7,
+            fade_tail_overflow_count: 8,
+            muted_voice_release_count: 9,
+            clipped_frame_count: 10,
+            peak_primary_voice_count: 20,
+            peak_fade_tail_count: 5,
+            peak_total_voice_count: 25,
+            ..RenderReport::default()
+        };
+        let second = RenderReport {
+            scheduled_voice_start_count: 11,
+            preview_voice_start_count: 12,
+            peak_primary_voice_count: 24,
+            peak_fade_tail_count: 3,
+            peak_total_voice_count: 27,
+            ..RenderReport::default()
+        };
+        let mut state = SharedState::default();
+        state.record_sampler_report(&first);
+        state.record_sampler_report(&second);
+        assert_eq!(state.sampler_diagnostics.scheduled_voice_start_count, 13);
+        assert_eq!(state.sampler_diagnostics.preview_voice_start_count, 13);
+        assert_eq!(state.sampler_diagnostics.same_pad_steal_count, 3);
+        assert_eq!(state.sampler_diagnostics.zero_volume_steal_count, 4);
+        assert_eq!(state.sampler_diagnostics.global_steal_count, 5);
+        assert_eq!(state.sampler_diagnostics.silent_trigger_drop_count, 6);
+        assert_eq!(state.sampler_diagnostics.preview_drop_count, 7);
+        assert_eq!(state.sampler_diagnostics.fade_tail_overflow_count, 8);
+        assert_eq!(state.sampler_diagnostics.muted_voice_release_count, 9);
+        assert_eq!(state.sampler_diagnostics.clipped_frame_count, 10);
+        assert_eq!(state.sampler_diagnostics.peak_primary_voice_count, 24);
+        assert_eq!(state.sampler_diagnostics.peak_fade_tail_count, 5);
+        assert_eq!(state.sampler_diagnostics.peak_total_voice_count, 27);
     }
 
     #[test]
     fn long_run_trigger_counts_do_not_drift() {
         let kick_bytes = wav(&[1], false);
         let hat_bytes = wav(&[1], false);
-        let mut sequencer = Sequencer::new(
-            WavPcm16::parse(&kick_bytes).unwrap(),
-            WavPcm16::parse(&hat_bytes).unwrap(),
-        );
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
         let mut beats = [0; BEAT_PAD_COUNT];
         beats[0] = 3;
         sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
@@ -1955,7 +4292,7 @@ mod tests {
         while frame < end {
             let count = ((end - frame) as usize).min(AUDIO_BLOCK_FRAMES);
             let report = sequencer.render(frame, &mut buffer[..count]);
-            total += u32::from(report.audible_trigger_counts[0]);
+            total += u32::from(report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()]);
             frame += count as u64;
         }
         // The boundary at exactly ten seconds belongs to the next frame.
@@ -2004,9 +4341,10 @@ mod tests {
         assert_eq!(BEAT_PAD_COUNT, 9);
         assert_eq!(MUTE_KEY_INDEX, 9);
         assert_eq!(VOLUME_KEY_INDEX, 10);
+        assert_eq!(SAMPLE_KEY_INDEX, 11);
         assert_eq!(BEAT_PAD_MASK, 0x01ff);
 
-        let controls = (1 << MUTE_KEY_INDEX) | (1 << VOLUME_KEY_INDEX) | (1 << 11);
+        let controls = (1 << MUTE_KEY_INDEX) | (1 << VOLUME_KEY_INDEX) | (1 << SAMPLE_KEY_INDEX);
         let mut debounce = KeyDebouncer::new(2);
         assert_eq!(debounce.update(controls), KeyChanges::default());
         let changes = debounce.update(controls);
@@ -2347,35 +4685,44 @@ mod tests {
         assert_eq!(adjust_base_interval(MIN_BASE_INTERVAL_MS, -1), 50);
         assert_eq!(adjust_base_interval(u32::MAX, 1), u32::MAX);
         assert_eq!(accelerated_encoder_delta(1, None), 1);
-        assert_eq!(accelerated_encoder_delta(1, Some(76)), 1);
-        assert_eq!(accelerated_encoder_delta(1, Some(75)), 10);
+        assert_eq!(accelerated_encoder_delta(1, Some(41)), 1);
+        assert_eq!(accelerated_encoder_delta(1, Some(40)), 10);
         assert_eq!(accelerated_encoder_delta(-1, Some(20)), -10);
         assert_eq!(adjust_volume_percent(100, -1), 99);
         assert_eq!(adjust_volume_percent(5, -10), 0);
         assert_eq!(adjust_volume_percent(95, 10), 100);
+        assert_eq!(sample(0).wrapping_offset(-1), sample(SAMPLE_COUNT - 1));
+        assert_eq!(sample(SAMPLE_COUNT - 1).wrapping_offset(1), sample(0));
+        assert_eq!(adjust_sample_selection(sample(0), -10), sample(23));
+        assert_eq!(adjust_sample_selection(sample(23), 10), sample(0));
+        assert_eq!(adjust_sample_selection(sample(7), 0), sample(7));
+        assert!(pattern_button_allowed(false, false, false, false));
+        assert!(!pattern_button_allowed(false, false, true, false));
+        assert!(!pattern_button_allowed(false, false, false, true));
+        assert!(!pattern_button_allowed(true, false, false, false));
 
         assert_eq!(
-            EncoderTarget::for_controls(None, false, false, None),
+            EncoderTarget::for_controls(None, false, false, None, false),
             EncoderTarget::BaseInterval
         );
         assert_eq!(
-            EncoderTarget::for_controls(None, true, false, None),
+            EncoderTarget::for_controls(None, true, false, None, false),
             EncoderTarget::LedBrightness
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true, false, None),
+            EncoderTarget::for_controls(Some(3), true, false, None, false),
             EncoderTarget::Pad(3)
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true, true, None),
+            EncoderTarget::for_controls(Some(3), true, true, None, false),
             EncoderTarget::PatternStep(3)
         );
         assert_eq!(
-            EncoderTarget::for_controls(None, true, true, Some(VolumeTarget::Global),),
+            EncoderTarget::for_controls(None, true, true, Some(VolumeTarget::Global), false),
             EncoderTarget::Volume(VolumeTarget::Global)
         );
         assert_eq!(
-            EncoderTarget::for_controls(Some(3), true, true, Some(VolumeTarget::Pad(3)),),
+            EncoderTarget::for_controls(Some(3), true, true, Some(VolumeTarget::Pad(3)), true,),
             EncoderTarget::Volume(VolumeTarget::Pad(3))
         );
         assert_eq!(
@@ -2384,13 +4731,45 @@ mod tests {
                 false,
                 false,
                 Some(VolumeTarget::Global),
+                true,
             ),
             EncoderTarget::Volume(VolumeTarget::Global)
         );
+        assert_eq!(
+            EncoderTarget::for_controls(None, true, true, None, true),
+            EncoderTarget::Sample(None)
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), true, true, None, true),
+            EncoderTarget::Sample(Some(3))
+        );
+        assert_eq!(
+            EncoderTarget::for_controls(Some(BEAT_PAD_COUNT), false, false, None, true),
+            EncoderTarget::Sample(None)
+        );
+
+        let mut editor = PatternEditorState::new();
+        editor.update_primary(Some(3), 8);
+        assert_eq!(
+            editor.button_pressed(Some(3), 8),
+            Some(PatternEditorAction::Entered)
+        );
+        editor.scroll(8, 3);
+        let before_sample = editor;
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), false, editor.active, None, true),
+            EncoderTarget::Sample(Some(3))
+        );
+        assert_eq!(editor, before_sample);
+        assert_eq!(
+            EncoderTarget::for_controls(Some(3), false, editor.active, None, false),
+            EncoderTarget::PatternStep(3)
+        );
+        assert_eq!(editor, before_sample);
 
         let mut acceleration = EncoderAcceleration::new();
         assert_eq!(acceleration.update(1_000, EncoderTarget::Pad(3), 1), 1);
-        assert_eq!(acceleration.update(1_050, EncoderTarget::Pad(3), 1), 10);
+        assert_eq!(acceleration.update(1_030, EncoderTarget::Pad(3), 1), 10);
         assert_eq!(
             acceleration.update(1_060, EncoderTarget::LedBrightness, 1),
             1
@@ -2445,6 +4824,9 @@ mod tests {
         assert_eq!(volume_led_color(50, 50), (64, 64, 0));
         assert_eq!(volume_led_color(0, 100), (0, 0, 0));
         assert_eq!(volume_led_color(100, 0), (0, 0, 0));
+        assert_eq!(sample_led_color(0), (0, 0, 0));
+        assert_eq!(sample_led_color(50), (0, 0, 128));
+        assert_eq!(sample_led_color(100), (0, 0, 255));
         assert_eq!(colorwheel(0), (255, 0, 0));
         assert_eq!(colorwheel(85), (0, 255, 0));
         assert_eq!(colorwheel(170), (0, 0, 255));

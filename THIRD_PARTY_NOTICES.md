@@ -1,5 +1,23 @@
 # Third-party notices
 
+## MacroPadSynthPlug drum samples
+
+The 24 WAV files below `samples/kit0_909`, `samples/kit1_tac`, and
+`samples/kit2_aku` were copied without modification from the MacroPadSynthPlug
+drum-machine example at commit
+[`5119f13fe9fa0ca0923efeb2105068b6e2cc3db1`](https://github.com/todbot/macropadsynthplug/tree/5119f13fe9fa0ca0923efeb2105068b6e2cc3db1/circuitpython/drum_machine/drumkits).
+
+MacroPadSynthPlug is distributed under
+[CC0 1.0 Universal](https://github.com/todbot/macropadsynthplug/blob/5119f13fe9fa0ca0923efeb2105068b6e2cc3db1/LICENSE).
+Its kit-specific provenance notes identify additional source context:
+
+- [`kit0_909/readme.txt`](https://github.com/todbot/macropadsynthplug/blob/5119f13fe9fa0ca0923efeb2105068b6e2cc3db1/circuitpython/drum_machine/drumkits/kit0_909/readme.txt)
+- [`kit1_tac/readme.txt`](https://github.com/todbot/macropadsynthplug/blob/5119f13fe9fa0ca0923efeb2105068b6e2cc3db1/circuitpython/drum_machine/drumkits/kit1_tac/readme.txt)
+- [`kit2_aku/readme.txt`](https://github.com/todbot/macropadsynthplug/blob/5119f13fe9fa0ca0923efeb2105068b6e2cc3db1/circuitpython/drum_machine/drumkits/kit2_aku/readme.txt)
+
+See [`samples/README.md`](samples/README.md) for the corresponding Freesound
+pack links, format requirements, ordering, and compatibility-copy details.
+
 ## Raspberry Pi pico-extras
 
 LoopTic's PWM audio encoder and PIO program are adapted from these files in

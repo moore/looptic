@@ -34,19 +34,21 @@ use embassy_rp::spi::{self, Spi};
 use embassy_rp::{interrupt, peripherals};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer, with_deadline};
+use embassy_time::{Delay, Duration, Instant, Timer, with_deadline};
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_6X10};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
+use looptic::load_control::{AudioLoadController, LoadLevel, RenderPolicy};
 use looptic::{
     AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, EncoderAcceleration, EncoderTarget, HeldPadSelection,
     KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState, MuteTarget, PatternEditorAction,
-    PatternEditorState, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, VOLUME_KEY_INDEX,
-    VolumeControlState, VolumeTarget, WavPcm16, apply_encoder_delta, colorwheel, led_pulse_active,
-    mute_led_color, pattern_window_start, scale_color, volume_led_color,
+    PatternEditorState, SAMPLE_COUNT, SAMPLE_KEY_INDEX, SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer,
+    SharedState, VOLUME_KEY_INDEX, VolumeControlState, VolumeTarget, adjust_sample_selection,
+    apply_encoder_delta, colorwheel, led_pulse_active, mute_led_color, pattern_button_allowed,
+    pattern_window_start, sample_assets, sample_led_color, scale_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -68,6 +70,7 @@ struct UiState {
     selected_pad: Option<usize>,
     encoder_pressed: bool,
     volume_pressed: bool,
+    sample_pressed: bool,
     volume_target: Option<VolumeTarget>,
     pattern_editor: PatternEditorState,
 }
@@ -81,6 +84,40 @@ struct OledResources {
     dc: Peri<'static, PIN_24>,
 }
 
+#[derive(Clone, Copy)]
+struct AudioServiceObservation {
+    service_us: u32,
+    render_us: u32,
+    dma_cadence_us: u32,
+    handoff_us: u32,
+    peak_primary_voices: u8,
+}
+
+#[derive(Clone, Copy)]
+struct AudioServiceMetrics {
+    observation: AudioServiceObservation,
+    observed_load_level: LoadLevel,
+    observed_policy: RenderPolicy,
+    next_load_level: LoadLevel,
+    next_policy: RenderPolicy,
+    load_ewma_us: u32,
+    window_max_us: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AudioDisplayMetrics {
+    level: LoadLevel,
+    active_voices: u8,
+    voice_limit: u8,
+    last_service_us: u32,
+    max_service_us: u32,
+    last_render_us: u32,
+    max_render_us: u32,
+    max_dma_cadence_us: u32,
+    deadline_misses: u32,
+    underruns: u32,
+}
+
 static SHARED: StaticCell<Shared> = StaticCell::new();
 static UI_SHARED: StaticCell<UiShared> = StaticCell::new();
 static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
@@ -89,12 +126,11 @@ static AUDIO_DMA_FRONT: StaticCell<[u32; AUDIO_BLOCK_FRAMES]> = StaticCell::new(
 static AUDIO_DMA_BACK: StaticCell<[u32; AUDIO_BLOCK_FRAMES]> = StaticCell::new();
 static FATAL_FAULT: AtomicBool = AtomicBool::new(false);
 
-const KICK_WAV: &[u8] = include_bytes!("../samples/00_kick02.wav");
-const OPEN_HAT_WAV: &[u8] = include_bytes!("../samples/02_ho02.wav");
 const AUDIO_CLOCK_DIVIDER_BITS: u32 = 667;
 const KEY_SCAN_INTERVAL: Duration = Duration::from_millis(1);
 const DISPLAY_INTERVAL: Duration = Duration::from_millis(34);
 const LED_INTERVAL: Duration = Duration::from_millis(5);
+const AUDIO_BLOCK_DEADLINE_US: u64 = looptic::load_control::AUDIO_BLOCK_BUDGET_US as u64;
 
 /// Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
 ///
@@ -170,6 +206,7 @@ async fn audio_task(
     let mut front_start = 0_u64;
     let (
         initial_beats,
+        initial_pad_samples,
         initial_base_interval,
         initial_mute_mask,
         initial_global_volume,
@@ -178,6 +215,7 @@ async fn audio_task(
         let state = state.borrow();
         (
             state.desired_beats,
+            *state.pad_samples(),
             state.base_interval_ms,
             state.effective_mute_mask(),
             state.global_volume_percent(),
@@ -185,11 +223,16 @@ async fn audio_task(
         )
     });
     sequencer.apply_timing(&initial_beats, initial_base_interval, front_start);
+    sequencer.set_pad_samples(&initial_pad_samples);
     sequencer.set_mute_mask(initial_mute_mask);
     sequencer.set_volumes(initial_global_volume, &initial_pad_volumes);
     sync_pattern_updates(shared, &mut sequencer);
+    let render_started = Instant::now();
     let report = sequencer.render(front_start, front);
-    publish_render(shared, &report);
+    let render_us = Instant::now()
+        .saturating_duration_since(render_started)
+        .as_micros();
+    publish_render(shared, &report, render_us);
 
     // Joined TX mode provides eight words of elasticity between DMA completions.
     for _ in 0..8 {
@@ -199,40 +242,147 @@ async fn audio_task(
     let _ = sm.tx().stalled();
     sm.set_enable(true);
 
+    let mut load_controller = AudioLoadController::new();
+    let mut policy = RenderPolicy::FULL;
+    let mut previous_observation: Option<AudioServiceObservation> = None;
+    let mut pending_metrics: Option<AudioServiceMetrics> = None;
+    let mut previous_dma_started: Option<Instant> = None;
+    let mut previous_handoff_started: Option<Instant> = None;
+    let mut underrun_count = 0_u32;
+
     loop {
+        let service_started = Instant::now();
+        if let Some(observation) = previous_observation.take() {
+            policy = load_controller.observe_with_cadence(
+                observation.service_us,
+                observation.dma_cadence_us,
+                observation.handoff_us,
+                observation.peak_primary_voices,
+                underrun_count,
+            );
+            if let Some(metrics) = pending_metrics.as_mut() {
+                metrics.next_load_level = load_controller.level();
+                metrics.next_policy = policy;
+                metrics.load_ewma_us = load_controller.ewma_us();
+                metrics.window_max_us = load_controller.window_max_us();
+            }
+        }
+        sequencer.set_render_policy(policy);
+
         let transfer = sm.tx().dma_push(&mut dma, front, false);
+        // `dma_push` writes CTRL_TRIG internally; the post-call timestamp is a
+        // conservative approximation of the instant DMA actually started.
+        let dma_started = Instant::now();
+        let dma_cadence_us = previous_dma_started.map_or(0, |previous| {
+            duration_us_u32(dma_started.saturating_duration_since(previous))
+        });
+        let handoff_us = previous_handoff_started.map_or(0, |previous| {
+            duration_us_u32(dma_started.saturating_duration_since(previous))
+        });
+        previous_dma_started = Some(dma_started);
 
         let back_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
-        let (beats, base_interval, mute_mask, global_volume, pad_volumes) = shared.lock(|state| {
-            let state = state.borrow();
-            (
-                state.desired_beats,
-                state.base_interval_ms,
-                state.effective_mute_mask(),
-                state.global_volume_percent(),
-                *state.pad_volume_percents(),
-            )
-        });
-        sequencer.apply_timing(&beats, base_interval, back_start);
-        sequencer.set_mute_mask(mute_mask);
-        sequencer.set_volumes(global_volume, &pad_volumes);
-        sync_pattern_updates(shared, &mut sequencer);
-        let report = sequencer.render(back_start, back);
-        publish_render(shared, &report);
-
-        transfer.await;
-
-        if sm.tx().stalled() {
+        let (beats, pad_samples, preview, base_interval, mute_mask, global_volume, pad_volumes) =
             shared.lock(|state| {
                 let mut state = state.borrow_mut();
+                if let Some(metrics) = pending_metrics.take() {
+                    record_audio_service_metrics(&mut state, metrics);
+                }
+                state.playback_frame = front_start;
+                (
+                    state.desired_beats,
+                    *state.pad_samples(),
+                    state.take_preview(),
+                    state.base_interval_ms,
+                    state.effective_mute_mask(),
+                    state.global_volume_percent(),
+                    *state.pad_volume_percents(),
+                )
+            });
+        sequencer.apply_timing(&beats, base_interval, back_start);
+        sequencer.set_pad_samples(&pad_samples);
+        sequencer.set_mute_mask(mute_mask);
+        sequencer.set_volumes(global_volume, &pad_volumes);
+        if let Some(preview) = preview {
+            let _ = sequencer.queue_preview(preview);
+        }
+        sync_pattern_updates(shared, &mut sequencer);
+        let render_started = Instant::now();
+        let report = sequencer.render(back_start, back);
+        let render_us = duration_us_u32(Instant::now().saturating_duration_since(render_started));
+        publish_render(shared, &report, u64::from(render_us));
+        let service_us = duration_us_u32(Instant::now().saturating_duration_since(service_started));
+        let observation = AudioServiceObservation {
+            service_us,
+            render_us,
+            dma_cadence_us,
+            handoff_us,
+            peak_primary_voices: report.peak_primary_voice_count,
+        };
+        previous_observation = Some(observation);
+        pending_metrics = Some(AudioServiceMetrics {
+            observation,
+            observed_load_level: load_controller.level(),
+            observed_policy: policy,
+            next_load_level: load_controller.level(),
+            next_policy: policy,
+            load_ewma_us: load_controller.ewma_us(),
+            window_max_us: load_controller.window_max_us(),
+        });
+
+        transfer.await;
+        previous_handoff_started = Some(Instant::now());
+
+        if sm.tx().stalled() {
+            underrun_count = shared.lock(|state| {
+                let mut state = state.borrow_mut();
                 state.underrun_count = state.underrun_count.saturating_add(1);
+                state.underrun_count
             });
         }
 
         front_start = back_start;
-        shared.lock(|state| state.borrow_mut().playback_frame = front_start);
         mem::swap(&mut front, &mut back);
     }
+}
+
+fn duration_us_u32(duration: Duration) -> u32 {
+    duration.as_micros().min(u64::from(u32::MAX)) as u32
+}
+
+fn record_audio_service_metrics(state: &mut SharedState, metrics: AudioServiceMetrics) {
+    state.last_render_time_us = metrics.observation.render_us;
+    state.last_audio_service_time_us = metrics.observation.service_us;
+    state.last_peak_primary_voices = metrics.observation.peak_primary_voices;
+    state.max_peak_primary_voices = state
+        .max_peak_primary_voices
+        .max(metrics.observation.peak_primary_voices);
+    if metrics.observation.service_us > state.max_audio_service_time_us {
+        state.worst_service_primary_voices = metrics.observation.peak_primary_voices;
+        state.worst_service_voice_limit = metrics.observed_policy.max_primary_voices;
+        state.worst_service_load_level = metrics.observed_load_level;
+    }
+    state.max_audio_service_time_us = state
+        .max_audio_service_time_us
+        .max(metrics.observation.service_us);
+    if u64::from(metrics.observation.service_us) > AUDIO_BLOCK_DEADLINE_US {
+        state.audio_service_deadline_miss_count =
+            state.audio_service_deadline_miss_count.saturating_add(1);
+    }
+    state.max_dma_cadence_us = state
+        .max_dma_cadence_us
+        .max(metrics.observation.dma_cadence_us);
+    state.max_dma_handoff_us = state.max_dma_handoff_us.max(metrics.observation.handoff_us);
+    if state.audio_load_level != metrics.next_load_level {
+        state.audio_load_transition_count = state.audio_load_transition_count.saturating_add(1);
+    }
+    state.audio_load_level = metrics.next_load_level;
+    state.effective_voice_limit = metrics.next_policy.max_primary_voices;
+    state.min_effective_voice_limit = state
+        .min_effective_voice_limit
+        .min(metrics.next_policy.max_primary_voices);
+    state.audio_load_ewma_us = metrics.load_ewma_us;
+    state.audio_load_window_max_us = metrics.window_max_us;
 }
 
 fn sync_pattern_updates(shared: &Shared, sequencer: &mut Sequencer<'_>) {
@@ -249,9 +399,16 @@ fn sync_pattern_updates(shared: &Shared, sequencer: &mut Sequencer<'_>) {
     });
 }
 
-fn publish_render(shared: &Shared, report: &looptic::RenderReport) {
+fn publish_render(shared: &Shared, report: &looptic::RenderReport, render_us: u64) {
     shared.lock(|state| {
         let mut state = state.borrow_mut();
+        state.record_sampler_report(report);
+        state.max_render_time_us = state
+            .max_render_time_us
+            .max(render_us.min(u64::from(u32::MAX)) as u32);
+        if render_us > AUDIO_BLOCK_DEADLINE_US {
+            state.render_deadline_miss_count = state.render_deadline_miss_count.saturating_add(1);
+        }
         for (pad, trigger) in report.latest_visual_triggers.iter().enumerate() {
             if let Some(frame) = trigger {
                 state.latest_trigger_frames[pad] = *frame;
@@ -284,13 +441,19 @@ async fn controls_task(
                 ui_state.encoder_pressed,
                 ui_state.pattern_editor.active,
                 ui_state.volume_target,
+                ui_state.sample_pressed,
             );
             let direction_delta = match direction {
                 Direction::Clockwise => 1,
                 Direction::CounterClockwise => -1,
             };
-            let delta =
+            let accelerated =
                 encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta);
+            let delta = if matches!(target, EncoderTarget::Sample(_)) {
+                direction_delta
+            } else {
+                accelerated
+            };
             match target {
                 EncoderTarget::PatternStep(pad) => {
                     let division = shared.lock(|state| state.borrow().desired_beats[pad]);
@@ -298,6 +461,18 @@ async fn controls_task(
                         state.borrow_mut().pattern_editor.scroll(division, delta);
                     });
                 }
+                EncoderTarget::Sample(Some(pad)) => shared.lock(|state| {
+                    let mut state = state.borrow_mut();
+                    if let Some(current) = state.pad_sample(pad) {
+                        let selected = adjust_sample_selection(current, delta);
+                        if state.set_pad_sample(pad, selected)
+                            && let Some(preview) = looptic::PreviewRequest::new(pad, selected)
+                        {
+                            let _ = state.queue_preview(preview);
+                        }
+                    }
+                }),
+                EncoderTarget::Sample(None) => {}
                 _ => shared.lock(|state| {
                     let mut state = state.borrow_mut();
                     apply_encoder_delta(&mut state, target, delta);
@@ -321,10 +496,12 @@ async fn controls_task(
             let encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
             let primary = selection.selected();
             let volume_pressed = debouncer.stable_mask() & (1 << VOLUME_KEY_INDEX) != 0;
+            let sample_pressed = debouncer.stable_mask() & (1 << SAMPLE_KEY_INDEX) != 0;
             volume_control.update(volume_pressed, changes, primary);
             let volume_target = volume_control.active_target();
             let mut next_ui = ui.lock(|state| *state.borrow());
             let volume_was_pressed = next_ui.volume_pressed;
+            let sample_was_pressed = next_ui.sample_pressed;
             let mute_bit = 1_u16 << MUTE_KEY_INDEX;
             let now_ms = now.as_millis();
             if changes.pressed & mute_bit != 0 {
@@ -348,14 +525,20 @@ async fn controls_task(
             next_ui.selected_pad = primary;
             next_ui.encoder_pressed = encoder_pressed;
             next_ui.volume_pressed = volume_pressed;
+            next_ui.sample_pressed = sample_pressed;
             next_ui.volume_target = volume_target;
             next_ui.pattern_editor.update_primary(primary, division);
-            let editor_action =
-                if !volume_pressed && !volume_was_pressed && button_changes.pressed & 1 != 0 {
-                    next_ui.pattern_editor.button_pressed(primary, division)
-                } else {
-                    None
-                };
+            let editor_action = if pattern_button_allowed(
+                volume_pressed,
+                volume_was_pressed,
+                sample_pressed,
+                sample_was_pressed,
+            ) && button_changes.pressed & 1 != 0
+            {
+                next_ui.pattern_editor.button_pressed(primary, division)
+            } else {
+                None
+            };
             if let Some(PatternEditorAction::Toggle { pad, step }) = editor_action {
                 shared.lock(|state| {
                     state.borrow_mut().toggle_pattern_step(pad, step);
@@ -379,7 +562,6 @@ async fn led_task(
     shared: &'static Shared,
     ui: &'static UiShared,
 ) {
-    let mut ticker = Ticker::every(LED_INTERVAL);
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
         let mute_target = MuteTarget::for_selected_pad(ui_state.selected_pad);
@@ -398,8 +580,10 @@ async fn led_task(
                     state.volume_percent(volume_target).unwrap_or(0),
                 )
             });
-        let brightness_preview =
-            ui_state.selected_pad.is_none() && ui_state.encoder_pressed && !ui_state.volume_pressed;
+        let brightness_preview = ui_state.selected_pad.is_none()
+            && ui_state.encoder_pressed
+            && !ui_state.volume_pressed
+            && !ui_state.sample_pressed;
 
         let mut colors = [RGB8::default(); KEY_COUNT];
         for pad in 0..BEAT_PAD_COUNT {
@@ -414,12 +598,17 @@ async fn led_task(
         colors[MUTE_KEY_INDEX] = RGB8 { r, g, b };
         let (r, g, b) = volume_led_color(volume, brightness);
         colors[VOLUME_KEY_INDEX] = RGB8 { r, g, b };
+        let (r, g, b) = sample_led_color(brightness);
+        colors[SAMPLE_KEY_INDEX] = RGB8 { r, g, b };
         pixels.write(&colors).await;
 
         if underruns != 0 || FATAL_FAULT.load(Ordering::Relaxed) {
             status_led.set_high();
         }
-        ticker.next().await;
+        // Schedule from now rather than replaying every missed refresh after
+        // an audio-pressure episode. Visual history is already represented by
+        // the latest trigger frame and does not benefit from catch-up writes.
+        Timer::after(LED_INTERVAL).await;
     }
 }
 
@@ -484,6 +673,56 @@ fn draw_pattern_editor<D>(
     }
 }
 
+fn draw_audio_diagnostics<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    metrics: AudioDisplayMetrics,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let level = match metrics.level {
+        LoadLevel::Normal => 'N',
+        LoadLevel::Pressure => 'P',
+        LoadLevel::Emergency => 'E',
+        LoadLevel::RecoveryDither | LoadLevel::RecoveryTails | LoadLevel::RecoveryStarts => 'R',
+    };
+    let mut line: String<24> = String::new();
+    let _ = write!(
+        &mut line,
+        "Load {} V{}/{}",
+        level, metrics.active_voices, metrics.voice_limit
+    );
+    let _ = Text::with_baseline(&line, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    line.clear();
+    let _ = write!(
+        &mut line,
+        "Svc {}/{} us",
+        metrics.last_service_us, metrics.max_service_us
+    );
+    let _ = Text::with_baseline(&line, Point::new(0, 12), style, Baseline::Top).draw(display);
+
+    line.clear();
+    let _ = write!(
+        &mut line,
+        "Ren {}/{} us",
+        metrics.last_render_us, metrics.max_render_us
+    );
+    let _ = Text::with_baseline(&line, Point::new(0, 24), style, Baseline::Top).draw(display);
+
+    line.clear();
+    let _ = write!(&mut line, "DMA {} us", metrics.max_dma_cadence_us);
+    let _ = Text::with_baseline(&line, Point::new(0, 36), style, Baseline::Top).draw(display);
+
+    line.clear();
+    let _ = write!(
+        &mut line,
+        "Late {} U {}",
+        metrics.deadline_misses, metrics.underruns
+    );
+    let _ = Text::with_baseline(&line, Point::new(0, 48), style, Baseline::Top).draw(display);
+}
+
 #[embassy_executor::task]
 async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'static UiShared) {
     let mut spi_config = spi::Config::default();
@@ -502,10 +741,8 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         }
     }
 
-    let mut last_value: Option<(EncoderTarget, u32, u32)> = None;
+    let mut last_value: Option<(EncoderTarget, u32, u32, Option<AudioDisplayMetrics>)> = None;
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let mut ticker = Ticker::every(DISPLAY_INTERVAL);
-
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
         let target = EncoderTarget::for_controls(
@@ -513,10 +750,15 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             ui_state.encoder_pressed,
             ui_state.pattern_editor.active,
             ui_state.volume_target,
+            ui_state.sample_pressed,
         );
-        let (displayed_value, pattern_revision) = shared.lock(|state| {
+        let diagnostics_active = ui_state.selected_pad.is_none()
+            && ui_state.sample_pressed
+            && ui_state.encoder_pressed
+            && !ui_state.volume_pressed;
+        let (displayed_value, pattern_revision, diagnostics) = shared.lock(|state| {
             let state = state.borrow();
-            match target {
+            let value = match target {
                 EncoderTarget::BaseInterval => (state.base_interval_ms, 0),
                 EncoderTarget::LedBrightness => (u32::from(state.led_brightness_percent), 0),
                 EncoderTarget::Pad(pad) => (u32::from(state.desired_beats[pad]), 0),
@@ -527,61 +769,127 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 EncoderTarget::Volume(target) => {
                     (u32::from(state.volume_percent(target).unwrap_or(0)), 0)
                 }
-            }
+                EncoderTarget::Sample(Some(pad)) => (
+                    state
+                        .pad_sample(pad)
+                        .map_or(0, |sample| sample.index() as u32),
+                    0,
+                ),
+                EncoderTarget::Sample(None) => (0, 0),
+            };
+            let diagnostics = diagnostics_active.then_some(AudioDisplayMetrics {
+                level: state.audio_load_level,
+                active_voices: state.last_peak_primary_voices,
+                voice_limit: state.effective_voice_limit,
+                last_service_us: state.last_audio_service_time_us,
+                max_service_us: state.max_audio_service_time_us,
+                last_render_us: state.last_render_time_us,
+                max_render_us: state.max_render_time_us,
+                max_dma_cadence_us: state.max_dma_cadence_us,
+                deadline_misses: state.audio_service_deadline_miss_count,
+                underruns: state.underrun_count,
+            });
+            (value.0, value.1, diagnostics)
         });
-        let value = (target, displayed_value, pattern_revision);
+        let value = (target, displayed_value, pattern_revision, diagnostics);
 
         if last_value != Some(value) {
             display.clear();
-            match target {
-                EncoderTarget::Pad(_) => {
-                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+            if let Some(metrics) = diagnostics {
+                draw_audio_diagnostics(&mut display, style, metrics);
+            } else {
+                match target {
+                    EncoderTarget::Pad(_) => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let mut line: String<24> = String::new();
+                        let _ = write!(&mut line, "Beat {}", displayed_value);
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::BaseInterval => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let mut line: String<24> = String::new();
+                        let _ = write!(&mut line, "Base {} ms", displayed_value);
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::LedBrightness => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let mut line: String<24> = String::new();
+                        let _ = write!(&mut line, "Light {}%", displayed_value);
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::PatternStep(pad) => {
+                        draw_pattern_editor(
+                            &mut display,
+                            style,
+                            shared,
+                            pad,
+                            ui_state.pattern_editor.cursor,
+                        );
+                    }
+                    EncoderTarget::Volume(VolumeTarget::Global) => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let mut line: String<24> = String::new();
+                        let _ = write!(&mut line, "Master {}%", displayed_value);
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::Volume(VolumeTarget::Pad(pad)) => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let mut line: String<24> = String::new();
+                        let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::Sample(Some(pad)) => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let sample = displayed_value as usize;
+                        let mut line: String<24> = String::new();
+                        let name = sample_assets::SAMPLE_NAMES
+                            .get(sample)
+                            .copied()
+                            .unwrap_or("?");
+                        let _ = write!(
+                            &mut line,
+                            "P{} Sample {:02}/{}",
+                            pad + 1,
+                            sample + 1,
+                            SAMPLE_COUNT
+                        );
+                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                        let _ = Text::with_baseline(name, Point::new(0, 30), style, Baseline::Top)
+                            .draw(&mut display);
+                    }
+                    EncoderTarget::Sample(None) => {
+                        let _ =
+                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                                .draw(&mut display);
+                        let _ =
+                            Text::with_baseline("Sample", Point::new(0, 16), style, Baseline::Top)
+                                .draw(&mut display);
+                        let _ = Text::with_baseline(
+                            "Hold beat",
+                            Point::new(0, 30),
+                            style,
+                            Baseline::Top,
+                        )
                         .draw(&mut display);
-                    let mut line: String<24> = String::new();
-                    let _ = write!(&mut line, "Beat {}", displayed_value);
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                        .draw(&mut display);
-                }
-                EncoderTarget::BaseInterval => {
-                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                        .draw(&mut display);
-                    let mut line: String<24> = String::new();
-                    let _ = write!(&mut line, "Base {} ms", displayed_value);
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                        .draw(&mut display);
-                }
-                EncoderTarget::LedBrightness => {
-                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                        .draw(&mut display);
-                    let mut line: String<24> = String::new();
-                    let _ = write!(&mut line, "Light {}%", displayed_value);
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                        .draw(&mut display);
-                }
-                EncoderTarget::PatternStep(pad) => {
-                    draw_pattern_editor(
-                        &mut display,
-                        style,
-                        shared,
-                        pad,
-                        ui_state.pattern_editor.cursor,
-                    );
-                }
-                EncoderTarget::Volume(VolumeTarget::Global) => {
-                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                        .draw(&mut display);
-                    let mut line: String<24> = String::new();
-                    let _ = write!(&mut line, "Master {}%", displayed_value);
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                        .draw(&mut display);
-                }
-                EncoderTarget::Volume(VolumeTarget::Pad(pad)) => {
-                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                        .draw(&mut display);
-                    let mut line: String<24> = String::new();
-                    let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                        .draw(&mut display);
+                    }
                 }
             }
 
@@ -591,7 +899,9 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             last_value = Some(value);
         }
 
-        ticker.next().await;
+        // A stale OLED refresh is disposable; never build a catch-up backlog
+        // that could keep controls latent after audio load has recovered.
+        Timer::after(DISPLAY_INTERVAL).await;
     }
 }
 
@@ -610,15 +920,15 @@ fn main() -> ! {
     let _speaker_enable = Output::new(p.PIN_14, Level::Low);
     let mut status_led = Output::new(p.PIN_13, Level::Low);
 
-    let (kick, open_hat) = match (WavPcm16::parse(KICK_WAV), WavPcm16::parse(OPEN_HAT_WAV)) {
-        (Ok(kick), Ok(open_hat)) => (kick, open_hat),
-        _ => {
+    let catalog = match sample_assets::parse_catalog() {
+        Ok(catalog) => catalog,
+        Err(_) => {
             // A steady low level is silent through the SynthPlug's AC-coupled output.
             let silent_audio = Output::new(p.PIN_20, Level::Low);
             fatal(&mut status_led, silent_audio)
         }
     };
-    let sequencer = Sequencer::new(kick, open_hat);
+    let sequencer = Sequencer::new(catalog);
 
     let audio_sm = configure_audio_pio(p.PIO0, p.PIN_20);
 

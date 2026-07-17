@@ -19,7 +19,9 @@ bench = false
 [profile.release]
 debug = 2
 lto = "fat"
-opt-level = "s"
+# Audio rendering is deadline-bound and the RP2040 has ample flash headroom.
+# Optimize the firmware for execution speed instead of minimum code size.
+opt-level = 3
 codegen-units = 1
 
 [target.'cfg(target_arch = "arm")'.dependencies]
