@@ -34,6 +34,7 @@ use embassy_rp::spi::{self, Spi};
 use embassy_rp::{interrupt, peripherals};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Timer, with_deadline};
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_6X10};
 use embedded_graphics::pixelcolor::BinaryColor;
@@ -43,13 +44,17 @@ use fixed::types::U24F8;
 use heapless::String;
 use looptic::load_control::{AudioLoadController, LoadLevel, RenderPolicy};
 use looptic::{
-    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, EncoderAcceleration, EncoderTarget, HeldPadSelection,
-    KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState, MuteTarget, PatternAllChoice,
-    PatternEditorAction, PatternEditorState, PatternFillState, SAMPLE_COUNT, SAMPLE_KEY_INDEX,
-    SAMPLE_RATE, SILENCE_PWM_WORD, Sequencer, SharedState, VOLUME_KEY_INDEX, VolumeControlState,
-    VolumeTarget, adjust_sample_selection, apply_encoder_delta, colorwheel, led_pulse_active,
-    mute_led_color, pattern_button_allowed, pattern_window_start, sample_assets, sample_led_color,
-    scale_color, volume_led_color,
+    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState,
+    MuteScanAction, MuteTarget, PatternAllChoice, PatternEditorAction, PatternFillState,
+    PatternVolumeTarget, RETURN_KEY_INDEX, ResetAllChoice, RootMode, SAMPLE_COUNT, SAMPLE_RATE,
+    SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN, SONG_FORMAT_VERSION, Sequencer, SharedState,
+    SongBrowserPurpose, SongConfirmChoice, SongLibraryStatus, SongMenuOperation, SongSlot,
+    SongSlotOccupancy, SongStorageOperation, SongUiStatus, SongsView, StoredSongV1, UiAction,
+    UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX,
+    VolumeTarget, adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness,
+    adjust_sample_selection, decode_song, encode_song_v1, led_pulse_active, mute_led_color,
+    pattern_window_start, resolve_mute_scan, return_led_color, sample_assets,
+    sample_selection_preview_request, voice_led_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -66,14 +71,13 @@ bind_interrupts!(struct Irqs {
 type Shared = Mutex<CriticalSectionRawMutex, RefCell<SharedState>>;
 type UiShared = Mutex<CriticalSectionRawMutex, RefCell<UiState>>;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UiState {
-    selected_pad: Option<usize>,
-    encoder_pressed: bool,
+    controller: UiController,
     volume_pressed: bool,
-    sample_pressed: bool,
-    volume_target: Option<VolumeTarget>,
-    pattern_editor: PatternEditorState,
+    song_library: SongLibraryStatus,
+    pending_song_operation: Option<SongStorageOperation>,
+    clean_song_revision: u32,
 }
 
 struct OledResources {
@@ -106,26 +110,10 @@ struct AudioServiceMetrics {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AudioDisplayMetrics {
-    level: LoadLevel,
-    active_voices: u8,
-    voice_limit: u8,
-    last_service_us: u32,
-    max_service_us: u32,
-    last_render_us: u32,
-    max_render_us: u32,
-    max_dma_cadence_us: u32,
-    deadline_misses: u32,
-    underruns: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DisplayStateKey {
-    target: EncoderTarget,
+    model: UiDisplayModel,
     displayed_value: u32,
     pattern_revision: u32,
-    pattern_all_choice: Option<PatternAllChoice>,
-    diagnostics: Option<AudioDisplayMetrics>,
 }
 
 static SHARED: StaticCell<Shared> = StaticCell::new();
@@ -134,13 +122,458 @@ static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 static EXECUTOR_LOW: StaticCell<Executor> = StaticCell::new();
 static AUDIO_DMA_FRONT: StaticCell<[u32; AUDIO_BLOCK_FRAMES]> = StaticCell::new();
 static AUDIO_DMA_BACK: StaticCell<[u32; AUDIO_BLOCK_FRAMES]> = StaticCell::new();
+static SONG_WORK_BUFFER: StaticCell<[u8; 4096]> = StaticCell::new();
+static SONG_RECORD_BUFFER: StaticCell<[u8; SONG_ENCODED_MAX_LEN]> = StaticCell::new();
 static FATAL_FAULT: AtomicBool = AtomicBool::new(false);
+static STORAGE_BOOT_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static AUDIO_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static AUDIO_PAUSED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static AUDIO_RESUME: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 const AUDIO_CLOCK_DIVIDER_BITS: u32 = 667;
 const KEY_SCAN_INTERVAL: Duration = Duration::from_millis(1);
 const DISPLAY_INTERVAL: Duration = Duration::from_millis(34);
 const LED_INTERVAL: Duration = Duration::from_millis(5);
+const STORAGE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const AUDIO_BLOCK_DEADLINE_US: u64 = looptic::load_control::AUDIO_BLOCK_BUDGET_US as u64;
+
+enum SongStorageBackend {
+    Blank(looptic::flash_storage::BlankSongStorage),
+    Ready(&'static mut looptic::flash_storage::SongMap),
+    Unsupported(looptic::flash_storage::UnsupportedSongStorage),
+    Corrupt,
+    Unavailable,
+}
+
+enum SongLoadResult {
+    Loaded {
+        revision: u32,
+        divisions: [u16; BEAT_PAD_COUNT],
+    },
+    Empty,
+    Unsupported {
+        found: u16,
+        supported: u16,
+    },
+    Corrupt,
+    Failed,
+}
+
+fn unsupported_storage_versions(info: looptic::flash_storage::SuperblockInfo) -> (u32, u32) {
+    if info.header_version != looptic::flash_storage::SUPERBLOCK_HEADER_VERSION {
+        (
+            u32::from(info.header_version),
+            u32::from(looptic::flash_storage::SUPERBLOCK_HEADER_VERSION),
+        )
+    } else if info.storage_layout_version != looptic::flash_storage::STORAGE_LAYOUT_VERSION {
+        (
+            info.storage_layout_version,
+            looptic::flash_storage::STORAGE_LAYOUT_VERSION,
+        )
+    } else {
+        (
+            u32::from(info.sequential_storage_version),
+            u32::from(looptic::flash_storage::SEQUENTIAL_STORAGE_FORMAT_VERSION),
+        )
+    }
+}
+
+fn unavailable_storage_status(backend: &SongStorageBackend) -> Option<SongUiStatus> {
+    match backend {
+        SongStorageBackend::Unsupported(storage) => {
+            let (found, supported) = unsupported_storage_versions(storage.info());
+            Some(SongUiStatus::UnsupportedStorage { found, supported })
+        }
+        SongStorageBackend::Corrupt => Some(SongUiStatus::Corrupt { slot: None }),
+        SongStorageBackend::Unavailable => Some(SongUiStatus::Unavailable),
+        SongStorageBackend::Blank(_) | SongStorageBackend::Ready(_) => None,
+    }
+}
+
+fn set_song_status(ui: &UiShared, status: SongUiStatus) {
+    ui.lock(|state| state.borrow_mut().controller.set_song_status(status));
+}
+
+async fn pause_audio_for_storage() {
+    AUDIO_PAUSE_REQUESTED.store(true, Ordering::Release);
+    AUDIO_PAUSED.wait().await;
+}
+
+fn resume_audio_after_storage() {
+    AUDIO_PAUSE_REQUESTED.store(false, Ordering::Release);
+    AUDIO_RESUME.signal(());
+}
+
+#[embassy_executor::task]
+async fn storage_task(
+    flash: Peri<'static, peripherals::FLASH>,
+    shared: &'static Shared,
+    ui: &'static UiShared,
+) {
+    let work_buffer = SONG_WORK_BUFFER.init([0_u8; 4096]);
+    let record_buffer = SONG_RECORD_BUFFER.init([0_u8; SONG_ENCODED_MAX_LEN]);
+
+    let mut boot_status = None;
+    let mut backend = match looptic::flash_storage::probe(flash) {
+        Ok(looptic::flash_storage::StorageProbe::Blank(blank)) => SongStorageBackend::Blank(blank),
+        Ok(looptic::flash_storage::StorageProbe::Incomplete(blank)) => {
+            SongStorageBackend::Blank(blank)
+        }
+        Ok(looptic::flash_storage::StorageProbe::Ready(map)) => SongStorageBackend::Ready(map),
+        Ok(looptic::flash_storage::StorageProbe::Unsupported(storage)) => {
+            let (found, supported) = unsupported_storage_versions(storage.info());
+            boot_status = Some(SongUiStatus::UnsupportedStorage { found, supported });
+            SongStorageBackend::Unsupported(storage)
+        }
+        Ok(looptic::flash_storage::StorageProbe::Corrupt(_)) => {
+            boot_status = Some(SongUiStatus::Corrupt { slot: None });
+            SongStorageBackend::Corrupt
+        }
+        Err(_) => {
+            boot_status = Some(SongUiStatus::Unavailable);
+            SongStorageBackend::Unavailable
+        }
+    };
+
+    let scanned = match &mut backend {
+        SongStorageBackend::Ready(map) => map.scan_occupancy(work_buffer).await.ok(),
+        _ => Some([0_u32; looptic::SONG_SLOT_COUNT / 32]),
+    };
+    let occupancy = match scanned {
+        Some(words) => SongSlotOccupancy::from_words(words),
+        None => {
+            backend = SongStorageBackend::Unavailable;
+            boot_status = Some(SongUiStatus::Unavailable);
+            SongSlotOccupancy::empty()
+        }
+    };
+    ui.lock(|state| {
+        let mut state = state.borrow_mut();
+        state.song_library.occupied = occupancy;
+        if let Some(status) = boot_status {
+            state.controller.set_song_status(status);
+        }
+    });
+    // Audio startup waits until the partition has been classified and the
+    // one-pass occupancy index is complete. A healthy scan is read-only, but
+    // the supported journal may repair an interrupted operation here.
+    STORAGE_BOOT_READY.signal(());
+
+    loop {
+        let operation = ui.lock(|state| state.borrow_mut().pending_song_operation.take());
+        let Some(operation) = operation else {
+            Timer::after(STORAGE_COMMAND_POLL_INTERVAL).await;
+            continue;
+        };
+
+        let library = ui.lock(|state| state.borrow().song_library);
+        let live_revision = shared.lock(|state| state.borrow().song_revision);
+
+        if operation == SongStorageOperation::SaveCurrent && library.current_slot.is_none() {
+            ui.lock(|state| {
+                state.borrow_mut().controller.open_save_as(None);
+            });
+            continue;
+        }
+        if operation != SongStorageOperation::Format
+            && let Some(status) = unavailable_storage_status(&backend)
+        {
+            set_song_status(ui, status);
+            continue;
+        }
+
+        match operation {
+            SongStorageOperation::Format => {
+                let unsupported = match mem::replace(&mut backend, SongStorageBackend::Unavailable)
+                {
+                    SongStorageBackend::Unsupported(storage) => storage,
+                    replacement => {
+                        backend = replacement;
+                        set_song_status(ui, SongUiStatus::Failed { operation });
+                        continue;
+                    }
+                };
+                pause_audio_for_storage().await;
+                backend = match unsupported
+                    .reformat(SONG_FORMAT_VERSION, |percent| {
+                        set_song_status(ui, SongUiStatus::Formatting { percent });
+                    })
+                    .await
+                {
+                    Ok(map) => SongStorageBackend::Ready(map),
+                    Err(_) => SongStorageBackend::Unavailable,
+                };
+                resume_audio_after_storage();
+                if matches!(backend, SongStorageBackend::Ready(_)) {
+                    ui.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.song_library = SongLibraryStatus::empty();
+                        state.clean_song_revision = 0;
+                        state
+                            .controller
+                            .set_song_status(SongUiStatus::Success { operation });
+                    });
+                } else {
+                    set_song_status(ui, SongUiStatus::Failed { operation });
+                }
+            }
+            SongStorageOperation::SaveCurrent | SongStorageOperation::SaveAs { .. } => {
+                let slot = match operation {
+                    SongStorageOperation::SaveCurrent => library
+                        .current_slot
+                        .expect("SaveCurrent without a slot was redirected"),
+                    SongStorageOperation::SaveAs { slot } => slot,
+                    _ => unreachable!(),
+                };
+                if operation == SongStorageOperation::SaveCurrent
+                    && live_revision == ui.lock(|state| state.borrow().clean_song_revision)
+                {
+                    set_song_status(ui, SongUiStatus::NoChanges { slot });
+                    continue;
+                }
+
+                pause_audio_for_storage().await;
+                let song = shared.lock(|state| StoredSongV1::snapshot(&state.borrow()));
+                let encoded_len = match encode_song_v1(&song, record_buffer) {
+                    Ok(encoded) => encoded.len(),
+                    Err(_) => {
+                        resume_audio_after_storage();
+                        set_song_status(ui, SongUiStatus::Failed { operation });
+                        continue;
+                    }
+                };
+
+                if matches!(backend, SongStorageBackend::Blank(_)) {
+                    let blank = match mem::replace(&mut backend, SongStorageBackend::Unavailable) {
+                        SongStorageBackend::Blank(blank) => blank,
+                        _ => unreachable!(),
+                    };
+                    backend = match blank.initialize(SONG_FORMAT_VERSION).await {
+                        Ok(map) => SongStorageBackend::Ready(map),
+                        Err(_) => SongStorageBackend::Unavailable,
+                    };
+                }
+                let saved = match &mut backend {
+                    SongStorageBackend::Ready(map) => map
+                        .save(
+                            slot.storage_key(),
+                            work_buffer,
+                            &record_buffer[..encoded_len],
+                        )
+                        .await
+                        .is_ok(),
+                    _ => false,
+                };
+                resume_audio_after_storage();
+
+                if saved {
+                    ui.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.song_library.occupied.set(slot, true);
+                        state.song_library.current_slot = Some(slot);
+                        state.song_library.dirty = false;
+                        state.clean_song_revision = live_revision;
+                        state
+                            .controller
+                            .set_song_status(SongUiStatus::Success { operation });
+                    });
+                } else {
+                    set_song_status(ui, SongUiStatus::Failed { operation });
+                }
+            }
+            SongStorageOperation::Load { slot } => {
+                if !library.occupied.contains(slot) {
+                    set_song_status(ui, SongUiStatus::Empty { slot });
+                    continue;
+                }
+
+                pause_audio_for_storage().await;
+                let loaded = match &mut backend {
+                    SongStorageBackend::Ready(map) => {
+                        match map.load(slot.storage_key(), work_buffer).await {
+                            Ok(Some(bytes)) => match decode_song(bytes) {
+                                Ok(song) => shared.lock(|state| {
+                                    let mut state = state.borrow_mut();
+                                    if song.apply_to(&mut state).is_ok() {
+                                        SongLoadResult::Loaded {
+                                            revision: state.song_revision,
+                                            divisions: state.desired_beats,
+                                        }
+                                    } else {
+                                        SongLoadResult::Corrupt
+                                    }
+                                }),
+                                Err(looptic::SongDecodeError::UnsupportedVersion {
+                                    found,
+                                    supported,
+                                }) => SongLoadResult::Unsupported { found, supported },
+                                Err(_) => SongLoadResult::Corrupt,
+                            },
+                            Ok(None) => SongLoadResult::Empty,
+                            Err(_) => SongLoadResult::Failed,
+                        }
+                    }
+                    _ => SongLoadResult::Failed,
+                };
+                resume_audio_after_storage();
+
+                match loaded {
+                    SongLoadResult::Loaded {
+                        revision,
+                        divisions,
+                    } => ui.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.controller.clamp_pattern_cursors(&divisions);
+                        state.song_library.current_slot = Some(slot);
+                        state.song_library.dirty = false;
+                        state.clean_song_revision = revision;
+                        state
+                            .controller
+                            .set_song_status(SongUiStatus::Success { operation });
+                    }),
+                    SongLoadResult::Unsupported { found, supported } => set_song_status(
+                        ui,
+                        SongUiStatus::UnsupportedVersion {
+                            slot: Some(slot),
+                            found,
+                            supported,
+                        },
+                    ),
+                    SongLoadResult::Empty => {
+                        ui.lock(|state| {
+                            let mut state = state.borrow_mut();
+                            state.song_library.occupied.set(slot, false);
+                            state
+                                .controller
+                                .set_song_status(SongUiStatus::Empty { slot });
+                        });
+                    }
+                    SongLoadResult::Corrupt => {
+                        set_song_status(ui, SongUiStatus::Corrupt { slot: Some(slot) });
+                    }
+                    SongLoadResult::Failed => {
+                        set_song_status(ui, SongUiStatus::Failed { operation });
+                    }
+                }
+            }
+            SongStorageOperation::Copy {
+                source,
+                destination,
+            } => {
+                if !library.occupied.contains(source) {
+                    set_song_status(ui, SongUiStatus::Empty { slot: source });
+                    continue;
+                }
+                if source == destination {
+                    set_song_status(ui, SongUiStatus::NoChanges { slot: source });
+                    continue;
+                }
+
+                pause_audio_for_storage().await;
+                let source_len = match &mut backend {
+                    SongStorageBackend::Ready(map) => {
+                        match map.load(source.storage_key(), work_buffer).await {
+                            Ok(Some(bytes)) if bytes.len() <= record_buffer.len() => {
+                                let len = bytes.len();
+                                record_buffer[..len].copy_from_slice(bytes);
+                                Some(len)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let copied = if let (Some(source_len), SongStorageBackend::Ready(map)) =
+                    (source_len, &mut backend)
+                {
+                    map.save(
+                        destination.storage_key(),
+                        work_buffer,
+                        &record_buffer[..source_len],
+                    )
+                    .await
+                    .is_ok()
+                } else {
+                    false
+                };
+                resume_audio_after_storage();
+
+                if copied {
+                    if library.current_slot == Some(destination) {
+                        // The live controls did not change, but their backing
+                        // slot now contains the copied source. Advance the edit
+                        // generation so root Save correctly offers to restore
+                        // the live song instead of reporting No changes.
+                        shared.lock(|state| state.borrow_mut().mark_song_changed());
+                    }
+                    ui.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.song_library.occupied.set(destination, true);
+                        if state.song_library.current_slot == Some(destination) {
+                            state.song_library.dirty = true;
+                        }
+                        state
+                            .controller
+                            .set_song_status(SongUiStatus::Success { operation });
+                    });
+                } else {
+                    set_song_status(ui, SongUiStatus::Failed { operation });
+                }
+            }
+            SongStorageOperation::Delete { slot } => {
+                if !library.occupied.contains(slot) {
+                    set_song_status(ui, SongUiStatus::Empty { slot });
+                    continue;
+                }
+
+                pause_audio_for_storage().await;
+                let deleted = match &mut backend {
+                    SongStorageBackend::Ready(map) => {
+                        map.delete(slot.storage_key(), work_buffer).await.is_ok()
+                    }
+                    _ => false,
+                };
+                resume_audio_after_storage();
+
+                if deleted {
+                    ui.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.song_library.occupied.set(slot, false);
+                        if state.song_library.current_slot == Some(slot) {
+                            state.song_library.current_slot = None;
+                        }
+                        state
+                            .controller
+                            .set_song_status(SongUiStatus::Success { operation });
+                    });
+                } else {
+                    set_song_status(ui, SongUiStatus::Failed { operation });
+                }
+            }
+        }
+    }
+}
+
+/// Apply a Pattern editor action shared by the encoder push and the Mute-key
+/// shortcut. Returns whether changing the Pattern submode should reset encoder
+/// acceleration.
+fn apply_pattern_editor_action(shared: &Shared, action: PatternEditorAction) -> bool {
+    match action {
+        PatternEditorAction::Toggle { pad, step } => {
+            shared.lock(|state| {
+                state.borrow_mut().toggle_pattern_step(pad, step);
+            });
+            false
+        }
+        PatternEditorAction::SetAll { pad, enabled } => {
+            shared.lock(|state| {
+                state.borrow_mut().set_pattern_all(pad, enabled);
+            });
+            true
+        }
+        PatternEditorAction::AllMenuOpened | PatternEditorAction::AllMenuCancelled => true,
+    }
+}
 
 /// Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
 ///
@@ -209,6 +642,10 @@ async fn audio_task(
     mut sequencer: Sequencer<'static>,
     shared: &'static Shared,
 ) {
+    // Boot-time flash inspection and the occupancy scan happen before PIO is
+    // enabled, so even journal recovery cannot contend with an audio deadline.
+    STORAGE_BOOT_READY.wait().await;
+
     let mut dma = dma::Channel::new(dma_peripheral, Irqs);
     let mut front = AUDIO_DMA_FRONT.init([SILENCE_PWM_WORD; AUDIO_BLOCK_FRAMES]);
     let mut back = AUDIO_DMA_BACK.init([SILENCE_PWM_WORD; AUDIO_BLOCK_FRAMES]);
@@ -292,27 +729,39 @@ async fn audio_task(
         previous_dma_started = Some(dma_started);
 
         let back_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
-        let (beats, pad_samples, preview, base_interval, mute_mask, global_volume, pad_volumes) =
-            shared.lock(|state| {
-                let mut state = state.borrow_mut();
-                if let Some(metrics) = pending_metrics.take() {
-                    record_audio_service_metrics(&mut state, metrics);
-                }
-                state.playback_frame = front_start;
-                (
-                    state.desired_beats,
-                    *state.pad_samples(),
-                    state.take_preview(),
-                    state.base_interval_ms,
-                    state.effective_mute_mask(),
-                    state.global_volume_percent(),
-                    *state.pad_volume_percents(),
-                )
-            });
+        let (
+            beats,
+            pad_samples,
+            preview,
+            base_interval,
+            mute_mask,
+            global_volume,
+            pad_volumes,
+            release_all,
+        ) = shared.lock(|state| {
+            let mut state = state.borrow_mut();
+            if let Some(metrics) = pending_metrics.take() {
+                record_audio_service_metrics(&mut state, metrics);
+            }
+            state.playback_frame = front_start;
+            (
+                state.desired_beats,
+                *state.pad_samples(),
+                state.take_preview(),
+                state.base_interval_ms,
+                state.effective_mute_mask(),
+                state.global_volume_percent(),
+                *state.pad_volume_percents(),
+                state.take_release_all_request(),
+            )
+        });
         sequencer.apply_timing(&beats, base_interval, back_start);
         sequencer.set_pad_samples(&pad_samples);
         sequencer.set_mute_mask(mute_mask);
         sequencer.set_volumes(global_volume, &pad_volumes);
+        if release_all {
+            sequencer.release_all_voices();
+        }
         if let Some(preview) = preview {
             let _ = sequencer.queue_preview(preview);
         }
@@ -344,16 +793,105 @@ async fn audio_task(
         previous_handoff_started = Some(Instant::now());
 
         if sm.tx().stalled() {
-            underrun_count = shared.lock(|state| {
-                let mut state = state.borrow_mut();
-                state.underrun_count = state.underrun_count.saturating_add(1);
-                state.underrun_count
-            });
+            underrun_count = record_audio_underrun(shared);
         }
 
         front_start = back_start;
         mem::swap(&mut front, &mut back);
+
+        if AUDIO_PAUSE_REQUESTED.load(Ordering::Acquire) {
+            // `front` is the already-rendered block immediately following the
+            // completed DMA. Let it play, render one final muted release block
+            // from the contiguous sequencer state, and only then stop PIO.
+            let normal_transfer = sm.tx().dma_push(&mut dma, front, false);
+            let fade_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
+            sequencer.set_mute_mask(looptic::BEAT_PAD_MASK);
+            sequencer.release_all_voices();
+            let fade_report = sequencer.render(fade_start, back);
+            publish_render(shared, &fade_report, 0);
+
+            normal_transfer.await;
+            if sm.tx().stalled() {
+                underrun_count = record_audio_underrun(shared);
+            }
+            let fade_transfer = sm.tx().dma_push(&mut dma, back, false);
+            fade_transfer.await;
+            if sm.tx().stalled() {
+                underrun_count = record_audio_underrun(shared);
+            }
+
+            // DMA completion can leave the joined FIFO eight frames ahead.
+            // Let centered/faded output drain before freezing the pin level.
+            Timer::after_micros(500).await;
+            sm.set_enable(false);
+            sm.clear_fifos();
+            front_start = fade_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
+            shared.lock(|state| state.borrow_mut().playback_frame = front_start);
+            AUDIO_PAUSED.signal(());
+            AUDIO_RESUME.wait().await;
+
+            let (
+                beats,
+                pad_samples,
+                preview,
+                base_interval,
+                mute_mask,
+                global_volume,
+                pad_volumes,
+                release_all,
+            ) = shared.lock(|state| {
+                let mut state = state.borrow_mut();
+                state.playback_frame = front_start;
+                (
+                    state.desired_beats,
+                    *state.pad_samples(),
+                    state.take_preview(),
+                    state.base_interval_ms,
+                    state.effective_mute_mask(),
+                    state.global_volume_percent(),
+                    *state.pad_volume_percents(),
+                    state.take_release_all_request(),
+                )
+            });
+            sequencer.apply_timing(&beats, base_interval, front_start);
+            sequencer.set_pad_samples(&pad_samples);
+            sequencer.set_mute_mask(mute_mask);
+            sequencer.set_volumes(global_volume, &pad_volumes);
+            if release_all {
+                sequencer.release_all_voices();
+            }
+            if let Some(preview) = preview {
+                let _ = sequencer.queue_preview(preview);
+            }
+            sync_pattern_updates(shared, &mut sequencer);
+            let report = sequencer.render(front_start, front);
+            publish_render(shared, &report, 0);
+
+            sm.restart();
+            sm.clear_fifos();
+            for _ in 0..8 {
+                sm.tx().push(SILENCE_PWM_WORD);
+            }
+            let _ = sm.tx().stalled();
+            sm.set_enable(true);
+
+            // The flash pause is not audio workload. Discard cadence samples
+            // spanning it so adaptive quality does not treat an explicit Save
+            // as CPU overload.
+            previous_observation = None;
+            pending_metrics = None;
+            previous_dma_started = None;
+            previous_handoff_started = None;
+        }
     }
+}
+
+fn record_audio_underrun(shared: &Shared) -> u32 {
+    shared.lock(|state| {
+        let mut state = state.borrow_mut();
+        state.underrun_count = state.underrun_count.saturating_add(1);
+        state.underrun_count
+    })
 }
 
 fn duration_us_u32(duration: Duration) -> u32 {
@@ -404,6 +942,9 @@ fn sync_pattern_updates(shared: &Shared, sequencer: &mut Sequencer<'_>) {
                 && let Some(pattern) = state.pattern(pad).copied()
             {
                 sequencer.set_pattern(pad, pattern);
+                if let Some(volumes) = state.trigger_volumes(pad) {
+                    sequencer.set_trigger_volumes(pad, volumes);
+                }
             }
         }
     });
@@ -437,55 +978,112 @@ async fn controls_task(
 ) {
     let mut debouncer = KeyDebouncer::new(5);
     let mut encoder_button_debouncer = KeyDebouncer::new(5);
-    let mut selection = HeldPadSelection::new();
     let mut mute_button = MuteButtonState::new();
-    let mut volume_control = VolumeControlState::new();
     let mut next_scan = Instant::now();
-    let mut encoder_acceleration = EncoderAcceleration::new();
+    let mut encoder_acceleration = UiEncoderAcceleration::new();
 
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
             let ui_state = ui.lock(|state| *state.borrow());
-            let target = EncoderTarget::for_controls(
-                ui_state.selected_pad,
-                ui_state.encoder_pressed,
-                ui_state.pattern_editor.active,
-                ui_state.volume_target,
-                ui_state.sample_pressed,
-            );
-            let direction_delta = match direction {
-                Direction::Clockwise => 1,
-                Direction::CounterClockwise => -1,
-            };
-            let choosing_pattern_all = ui_state.pattern_editor.all_menu.is_some();
-            let delta = if matches!(target, EncoderTarget::Sample(_)) || choosing_pattern_all {
-                direction_delta
-            } else {
-                encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta)
-            };
-            match target {
-                EncoderTarget::PatternStep(pad) => {
-                    let division = shared.lock(|state| state.borrow().desired_beats[pad]);
-                    ui.lock(|state| {
-                        state.borrow_mut().pattern_editor.scroll(division, delta);
-                    });
-                }
-                EncoderTarget::Sample(Some(pad)) => shared.lock(|state| {
-                    let mut state = state.borrow_mut();
-                    if let Some(current) = state.pad_sample(pad) {
-                        let selected = adjust_sample_selection(current, delta);
-                        if state.set_pad_sample(pad, selected)
-                            && let Some(preview) = looptic::PreviewRequest::new(pad, selected)
-                        {
-                            let _ = state.queue_preview(preview);
-                        }
+            let controller = ui_state.controller;
+            // Return acts on its physical edge immediately: detents received
+            // during its debounce window are discarded rather than editing or
+            // queuing a preview just before navigation resets.
+            if !keys[RETURN_KEY_INDEX].is_low()
+                && !controller.key_suppressed(RETURN_KEY_INDEX)
+                && !controller.encoder_suppressed()
+            {
+                let encoder_button_held = encoder_button.is_low();
+                let target = controller.encoder_target(ui_state.volume_pressed);
+                let direction_delta = match direction {
+                    Direction::Clockwise => 1,
+                    Direction::CounterClockwise => -1,
+                };
+                let unaccelerated = matches!(
+                    target,
+                    UiEncoderTarget::Root
+                        | UiEncoderTarget::PatternAll(_)
+                        | UiEncoderTarget::PatternNone
+                        | UiEncoderTarget::Sample(_)
+                        | UiEncoderTarget::SongStatus
+                        | UiEncoderTarget::ResetAll
+                ) || (target == UiEncoderTarget::Songs
+                    && !matches!(controller.songs_view(), SongsView::Browser { .. }));
+                let delta = if unaccelerated {
+                    encoder_acceleration = UiEncoderAcceleration::new();
+                    direction_delta
+                } else {
+                    encoder_acceleration.update(Instant::now().as_millis(), target, direction_delta)
+                };
+                match target {
+                    UiEncoderTarget::Root => ui.lock(|state| {
+                        state.borrow_mut().controller.rotate_root(delta);
+                    }),
+                    UiEncoderTarget::Pattern(pad) | UiEncoderTarget::PatternAll(pad) => {
+                        let division = shared.lock(|state| state.borrow().desired_beats[pad]);
+                        ui.lock(|state| {
+                            state
+                                .borrow_mut()
+                                .controller
+                                .rotate_pattern(pad, division, delta);
+                        });
                     }
-                }),
-                EncoderTarget::Sample(None) => {}
-                _ => shared.lock(|state| {
-                    let mut state = state.borrow_mut();
-                    apply_encoder_delta(&mut state, target, delta);
-                }),
+                    UiEncoderTarget::PatternNone => {}
+                    UiEncoderTarget::Sample(Some(pad)) => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        if let Some(current) = state.pad_sample(pad) {
+                            let selected = adjust_sample_selection(current, delta);
+                            if state.set_pad_sample(pad, selected)
+                                && let Some(preview) = sample_selection_preview_request(
+                                    pad,
+                                    current,
+                                    selected,
+                                    encoder_button_held,
+                                )
+                            {
+                                let _ = state.queue_preview(preview);
+                            }
+                        }
+                    }),
+                    UiEncoderTarget::Sample(None) => {}
+                    UiEncoderTarget::ResetAll => ui.lock(|state| {
+                        state.borrow_mut().controller.rotate_reset_choice(delta);
+                    }),
+                    UiEncoderTarget::Songs => ui.lock(|state| {
+                        state.borrow_mut().controller.rotate_songs(delta);
+                    }),
+                    UiEncoderTarget::SongStatus => {}
+                    UiEncoderTarget::Volume(target) => shared.lock(|state| {
+                        let _ = state.borrow_mut().adjust_volume(target, delta);
+                    }),
+                    UiEncoderTarget::PatternVolume(target) => shared.lock(|state| {
+                        let _ = state.borrow_mut().adjust_pattern_volume(target, delta);
+                    }),
+                    UiEncoderTarget::BeatsGlobal => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        let adjusted = adjust_base_interval(state.base_interval_ms, delta);
+                        let _ = state.set_base_interval_ms(adjusted);
+                    }),
+                    UiEncoderTarget::BeatsPad(pad) => {
+                        let division = shared.lock(|state| {
+                            let mut state = state.borrow_mut();
+                            let adjusted = adjust_beat_multiplier(state.desired_beats[pad], delta);
+                            let _ = state.set_desired_beats(pad, adjusted);
+                            state.desired_beats[pad]
+                        });
+                        ui.lock(|state| {
+                            state
+                                .borrow_mut()
+                                .controller
+                                .clamp_pattern_cursor(pad, division);
+                        });
+                    }
+                    UiEncoderTarget::Light => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        state.led_brightness_percent =
+                            adjust_led_brightness(state.led_brightness_percent, delta);
+                    }),
+                }
             }
         }
 
@@ -498,73 +1096,163 @@ async fn controls_task(
                 }
             }
 
+            let physical_encoder_pressed = encoder_button.is_low();
             let changes = debouncer.update(raw_mask);
-            selection.apply(changes);
             let button_changes =
-                encoder_button_debouncer.update(u16::from(encoder_button.is_low()));
-            let encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
-            let primary = selection.selected();
-            let volume_pressed = debouncer.stable_mask() & (1 << VOLUME_KEY_INDEX) != 0;
-            let sample_pressed = debouncer.stable_mask() & (1 << SAMPLE_KEY_INDEX) != 0;
-            volume_control.update(volume_pressed, changes, primary);
-            let volume_target = volume_control.active_target();
+                encoder_button_debouncer.update(u16::from(physical_encoder_pressed));
+            let stable_mask = debouncer.stable_mask();
+            let debounced_encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
             let mut next_ui = ui.lock(|state| *state.borrow());
-            let volume_was_pressed = next_ui.volume_pressed;
-            let sample_was_pressed = next_ui.sample_pressed;
+            next_ui
+                .controller
+                .update_suppression(raw_mask, physical_encoder_pressed);
+
             let mute_bit = 1_u16 << MUTE_KEY_INDEX;
+            let return_bit = 1_u16 << RETURN_KEY_INDEX;
             let now_ms = now.as_millis();
-            if changes.pressed & mute_bit != 0 {
-                let target = MuteTarget::for_selected_pad(primary);
-                if mute_button.press(target, now_ms) {
+
+            let return_pressed = changes.pressed & return_bit != 0
+                && !next_ui.controller.key_suppressed(RETURN_KEY_INDEX);
+            let mute_action = resolve_mute_scan(
+                &mut mute_button,
+                return_pressed,
+                changes.released & mute_bit != 0,
+                now_ms,
+            );
+            if return_pressed {
+                if matches!(mute_action, Some(MuteScanAction::Cancel(_))) {
                     shared.lock(|state| {
-                        state.borrow_mut().begin_mute_gesture(target);
+                        state.borrow_mut().cancel_mute_gesture();
                     });
                 }
-            }
-            if changes.released & mute_bit != 0
-                && let Some(release) = mute_button.release(now_ms)
-            {
-                shared.lock(|state| {
-                    state.borrow_mut().end_mute_gesture(release);
-                });
-            }
-            let division = primary.map_or(0, |pad| {
-                shared.lock(|state| state.borrow().desired_beats[pad])
-            });
-            next_ui.selected_pad = primary;
-            next_ui.encoder_pressed = encoder_pressed;
-            next_ui.volume_pressed = volume_pressed;
-            next_ui.sample_pressed = sample_pressed;
-            next_ui.volume_target = volume_target;
-            next_ui.pattern_editor.update_primary(primary, division);
-            let editor_action = if pattern_button_allowed(
-                volume_pressed,
-                volume_was_pressed,
-                sample_pressed,
-                sample_was_pressed,
-            ) && button_changes.pressed & 1 != 0
-            {
-                next_ui.pattern_editor.button_pressed(primary, division)
+                next_ui
+                    .controller
+                    .return_to_root(raw_mask, physical_encoder_pressed);
+                next_ui.volume_pressed = false;
+                encoder_acceleration = UiEncoderAcceleration::new();
             } else {
-                None
-            };
-            match editor_action {
-                Some(PatternEditorAction::Toggle { pad, step }) => shared.lock(|state| {
-                    state.borrow_mut().toggle_pattern_step(pad, step);
-                }),
-                Some(PatternEditorAction::SetAll { pad, enabled }) => {
+                let storage_busy = matches!(
+                    next_ui.controller.song_status(),
+                    Some(SongUiStatus::Busy { .. })
+                );
+                if storage_busy {
+                    if matches!(mute_action, Some(MuteScanAction::Release(_))) {
+                        shared.lock(|state| {
+                            state.borrow_mut().cancel_mute_gesture();
+                        });
+                    }
+                    next_ui.volume_pressed = false;
+                    let revision = shared.lock(|state| state.borrow().song_revision);
+                    next_ui.song_library.dirty = revision != next_ui.clean_song_revision;
+                    ui.lock(|state| *state.borrow_mut() = next_ui);
+                    next_scan += KEY_SCAN_INTERVAL;
+                    if next_scan <= now {
+                        next_scan = now + KEY_SCAN_INTERVAL;
+                    }
+                    continue;
+                }
+                if let Some(MuteScanAction::Release(release)) = mute_action {
                     shared.lock(|state| {
-                        state.borrow_mut().set_pattern_all(pad, enabled);
+                        state.borrow_mut().end_mute_gesture(release);
                     });
-                    encoder_acceleration = EncoderAcceleration::new();
                 }
-                Some(
-                    PatternEditorAction::AllMenuOpened | PatternEditorAction::AllMenuCancelled,
-                ) => {
-                    encoder_acceleration = EncoderAcceleration::new();
+                let allowed_pressed = changes.pressed & !next_ui.controller.suppressed_keys();
+                let pressed_beats = allowed_pressed & looptic::BEAT_PAD_MASK;
+                if pressed_beats != 0 {
+                    // Deterministic simultaneous-press policy: the lowest
+                    // logical beat key wins this scan.
+                    let pad = pressed_beats.trailing_zeros() as usize;
+                    next_ui.controller.press_voice(pad);
+                    if let Some(selected) = next_ui.controller.selected_pad() {
+                        let division = shared.lock(|state| state.borrow().desired_beats[selected]);
+                        next_ui.controller.clamp_pattern_cursor(selected, division);
+                    }
                 }
-                Some(PatternEditorAction::Entered) | None => {}
+
+                let pattern_mute_pressed = allowed_pressed & mute_bit != 0
+                    && next_ui.controller.page() == UiPage::Pattern
+                    && next_ui.controller.selected_pad().is_some();
+                if pattern_mute_pressed {
+                    let selected_division = next_ui
+                        .controller
+                        .selected_pad()
+                        .map(|pad| shared.lock(|state| state.borrow().desired_beats[pad]));
+                    if let Some(UiAction::Pattern(action)) =
+                        next_ui.controller.press_pattern_control(selected_division)
+                        && apply_pattern_editor_action(shared, action)
+                    {
+                        encoder_acceleration = UiEncoderAcceleration::new();
+                    }
+                } else if allowed_pressed & mute_bit != 0 {
+                    let target = MuteTarget::for_selected_pad(next_ui.controller.selected_pad());
+                    if mute_button.press(target, now_ms) {
+                        shared.lock(|state| {
+                            state.borrow_mut().begin_mute_gesture(target);
+                        });
+                    }
+                }
+
+                let volume_pressed = stable_mask & (1_u16 << VOLUME_KEY_INDEX) != 0
+                    && !next_ui.controller.key_suppressed(VOLUME_KEY_INDEX);
+                let encoder_pressed =
+                    debounced_encoder_pressed && !next_ui.controller.encoder_suppressed();
+                next_ui.volume_pressed = volume_pressed;
+
+                if button_changes.pressed & 1 != 0
+                    && encoder_pressed
+                    && !volume_pressed
+                    && !pattern_mute_pressed
+                {
+                    let selected_division = next_ui
+                        .controller
+                        .selected_pad()
+                        .map(|pad| shared.lock(|state| state.borrow().desired_beats[pad]));
+                    let songs_page = next_ui.controller.page() == UiPage::Songs;
+                    let action = next_ui.controller.press_encoder(selected_division);
+                    if songs_page {
+                        encoder_acceleration = UiEncoderAcceleration::new();
+                    }
+                    match action {
+                        Some(UiAction::Pattern(action)) => {
+                            if apply_pattern_editor_action(shared, action) {
+                                encoder_acceleration = UiEncoderAcceleration::new();
+                            }
+                        }
+                        Some(UiAction::ResetConfirmed) => {
+                            mute_button.cancel();
+                            let revision = shared.lock(|state| {
+                                let mut state = state.borrow_mut();
+                                state.reset_musical_state();
+                                state.song_revision
+                            });
+                            next_ui.song_library.current_slot = None;
+                            next_ui.song_library.dirty = false;
+                            next_ui.clean_song_revision = revision;
+                            encoder_acceleration = UiEncoderAcceleration::new();
+                        }
+                        Some(UiAction::Song(operation)) => {
+                            if operation == SongStorageOperation::SaveCurrent
+                                && next_ui.song_library.current_slot.is_none()
+                            {
+                                next_ui.controller.open_save_as(None);
+                            } else {
+                                mute_button.cancel();
+                                shared.lock(|state| {
+                                    state.borrow_mut().cancel_mute_gesture();
+                                });
+                                next_ui.volume_pressed = false;
+                                // The storage task consumes this latest command.
+                                // Busy routing prevents a second command.
+                                next_ui.pending_song_operation = Some(operation);
+                            }
+                            encoder_acceleration = UiEncoderAcceleration::new();
+                        }
+                        None => {}
+                    }
+                }
             }
+            let revision = shared.lock(|state| state.borrow().song_revision);
+            next_ui.song_library.dirty = revision != next_ui.clean_song_revision;
             ui.lock(|state| *state.borrow_mut() = next_ui);
 
             next_scan += KEY_SCAN_INTERVAL;
@@ -585,10 +1273,9 @@ async fn led_task(
 ) {
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
-        let mute_target = MuteTarget::for_selected_pad(ui_state.selected_pad);
-        let volume_target = ui_state
-            .volume_target
-            .unwrap_or(VolumeTarget::for_selected_pad(ui_state.selected_pad));
+        let selected_pad = ui_state.controller.selected_pad();
+        let mute_target = MuteTarget::for_selected_pad(selected_pad);
+        let volume_target = ui_state.controller.encoder_target(true);
         let (playback_frame, triggers, underruns, brightness, mute_active, volume) =
             shared.lock(|state| {
                 let state = state.borrow();
@@ -598,29 +1285,38 @@ async fn led_task(
                     state.underrun_count,
                     state.led_brightness_percent,
                     state.mute_indicator_active(mute_target).unwrap_or(false),
-                    state.volume_percent(volume_target).unwrap_or(0),
+                    match volume_target {
+                        UiEncoderTarget::PatternVolume(target) => {
+                            state.pattern_volume_percent(target).unwrap_or(0)
+                        }
+                        UiEncoderTarget::Volume(target) => {
+                            state.volume_percent(target).unwrap_or(0)
+                        }
+                        _ => 0,
+                    },
                 )
             });
-        let brightness_preview = ui_state.selected_pad.is_none()
-            && ui_state.encoder_pressed
-            && !ui_state.volume_pressed
-            && !ui_state.sample_pressed;
+        let light_preview = ui_state.controller.page() == UiPage::Light;
 
         let mut colors = [RGB8::default(); KEY_COUNT];
         for pad in 0..BEAT_PAD_COUNT {
-            if brightness_preview
-                || led_pulse_active(playback_frame, triggers[pad], SAMPLE_RATE / 10)
-            {
-                let (r, g, b) = scale_color(colorwheel((21 * pad) as u8), brightness);
-                colors[pad] = RGB8 { r, g, b };
-            }
+            let trigger_active = led_pulse_active(playback_frame, triggers[pad], SAMPLE_RATE / 10);
+            let (r, g, b) = voice_led_color(
+                pad,
+                brightness,
+                selected_pad.is_some(),
+                selected_pad == Some(pad),
+                trigger_active,
+                light_preview,
+            );
+            colors[pad] = RGB8 { r, g, b };
         }
         let (r, g, b) = mute_led_color(mute_active, brightness);
         colors[MUTE_KEY_INDEX] = RGB8 { r, g, b };
         let (r, g, b) = volume_led_color(volume, brightness);
         colors[VOLUME_KEY_INDEX] = RGB8 { r, g, b };
-        let (r, g, b) = sample_led_color(brightness);
-        colors[SAMPLE_KEY_INDEX] = RGB8 { r, g, b };
+        let (r, g, b) = return_led_color(brightness);
+        colors[RETURN_KEY_INDEX] = RGB8 { r, g, b };
         pixels.write(&colors).await;
 
         if underruns != 0 || FATAL_FAULT.load(Ordering::Relaxed) {
@@ -643,26 +1339,42 @@ fn draw_pattern_editor<D>(
     D: DrawTarget<Color = BinaryColor>,
 {
     const VISIBLE_ROWS: u16 = 5;
-    let (division, cursor, window_start, fill_state, enabled_rows) = shared.lock(|state| {
-        let state = state.borrow();
-        let division = state.desired_beats[pad];
-        let cursor = cursor.min(division);
-        let window_start = pattern_window_start(cursor, division, VISIBLE_ROWS);
-        let mut enabled_rows = [false; VISIBLE_ROWS as usize];
-        let mut fill_state = PatternFillState::Empty;
-        if let Some(pattern) = state.pattern(pad) {
-            fill_state = pattern.fill_state();
-            for row in 0..VISIBLE_ROWS {
-                let entry = window_start + row;
-                if entry != 0 && entry <= division {
-                    let step = entry - 1;
-                    enabled_rows[usize::from(row)] =
-                        pattern.step_enabled(step, division).unwrap_or(false);
+    let (division, cursor, window_start, fill_state, all_volume, enabled_rows, volume_rows) =
+        shared.lock(|state| {
+            let state = state.borrow();
+            let division = state.desired_beats[pad];
+            let cursor = cursor.min(division);
+            let window_start = pattern_window_start(cursor, division, VISIBLE_ROWS);
+            let mut enabled_rows = [false; VISIBLE_ROWS as usize];
+            let mut volume_rows = [0_u8; VISIBLE_ROWS as usize];
+            let mut fill_state = PatternFillState::Empty;
+            let mut all_volume = 0;
+            if let Some(pattern) = state.pattern(pad) {
+                fill_state = pattern.fill_state();
+                for row in 0..VISIBLE_ROWS {
+                    let entry = window_start + row;
+                    if entry != 0 && entry <= division {
+                        let step = entry - 1;
+                        enabled_rows[usize::from(row)] =
+                            pattern.step_enabled(step, division).unwrap_or(false);
+                        volume_rows[usize::from(row)] =
+                            state.trigger_volume(pad, usize::from(step)).unwrap_or(0);
+                    }
                 }
             }
-        }
-        (division, cursor, window_start, fill_state, enabled_rows)
-    });
+            if let Some(volumes) = state.trigger_volumes(pad) {
+                all_volume = volumes.average_percent();
+            }
+            (
+                division,
+                cursor,
+                window_start,
+                fill_state,
+                all_volume,
+                enabled_rows,
+                volume_rows,
+            )
+        });
 
     let mut header: String<24> = String::new();
     let _ = write!(&mut header, "LoopTic P{} {}", pad + 1, division);
@@ -674,21 +1386,28 @@ fn draw_pattern_editor<D>(
             break;
         }
         let marker = if entry == cursor { '>' } else { ' ' };
-        let mut line: String<16> = String::new();
+        let mut line: String<20> = String::new();
         if entry == 0 {
             let state = match fill_state {
                 PatternFillState::Empty => "off",
                 PatternFillState::Full => "ON",
                 PatternFillState::Mixed => "mix",
             };
-            let _ = write!(&mut line, "{} All {}", marker, state);
+            let _ = write!(&mut line, "{} All {} avg{}%", marker, state, all_volume);
         } else {
             let state = if enabled_rows[usize::from(row)] {
                 "ON"
             } else {
                 "off"
             };
-            let _ = write!(&mut line, "{} {:04} {}", marker, entry, state);
+            let _ = write!(
+                &mut line,
+                "{} {:04} {} {}%",
+                marker,
+                entry,
+                state,
+                volume_rows[usize::from(row)]
+            );
         }
         let _ = Text::with_baseline(
             &line,
@@ -738,54 +1457,351 @@ fn draw_pattern_all_menu<D>(
     }
 }
 
-fn draw_audio_diagnostics<D>(
+fn draw_root_menu<D>(
     display: &mut D,
     style: MonoTextStyle<'_, BinaryColor>,
-    metrics: AudioDisplayMetrics,
+    highlighted: RootMode,
+    selected_pad: Option<usize>,
+    current_song: Option<SongSlot>,
+    song_dirty: bool,
 ) where
     D: DrawTarget<Color = BinaryColor>,
 {
-    let level = match metrics.level {
-        LoadLevel::Normal => 'N',
-        LoadLevel::Pressure => 'P',
-        LoadLevel::Emergency => 'E',
-        LoadLevel::RecoveryDither | LoadLevel::RecoveryTails | LoadLevel::RecoveryStarts => 'R',
+    let mut header: String<24> = String::new();
+    if let Some(slot) = current_song {
+        let _ = write!(
+            &mut header,
+            "LoopTic {:03}{}",
+            slot.number(),
+            if song_dirty { "*" } else { "" }
+        );
+    } else {
+        let _ = write!(
+            &mut header,
+            "LoopTic Unsaved{}",
+            if song_dirty { "*" } else { "" }
+        );
+    }
+    if let Some(pad) = selected_pad {
+        let _ = write!(&mut header, " P{}", pad + 1);
+    }
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    const VISIBLE_ROWS: usize = 5;
+    let start = highlighted
+        .index()
+        .saturating_sub(VISIBLE_ROWS - 1)
+        .min(RootMode::COUNT.saturating_sub(VISIBLE_ROWS));
+    for (row, mode) in RootMode::ALL[start..start + VISIBLE_ROWS]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let marker = if mode == highlighted { '>' } else { ' ' };
+        let label = match mode {
+            RootMode::Pattern => "Pattern",
+            RootMode::Beats => "Beats",
+            RootMode::Sample => "Sample",
+            RootMode::Light => "Light",
+            RootMode::Save => "Save",
+            RootMode::Songs => "Songs",
+            RootMode::ResetAll => "Reset all",
+        };
+        let mut line: String<24> = String::new();
+        let _ = write!(&mut line, "{} {}", marker, label);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 14 + row as i32 * 10),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+}
+
+fn draw_songs_menu<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    selected: SongMenuOperation,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ =
+        Text::with_baseline("LoopTic Songs", Point::new(0, 0), style, Baseline::Top).draw(display);
+    for (row, operation) in SongMenuOperation::ALL.iter().copied().enumerate() {
+        let marker = if operation == selected { '>' } else { ' ' };
+        let label = match operation {
+            SongMenuOperation::Load => "Load",
+            SongMenuOperation::SaveAs => "Save as",
+            SongMenuOperation::Copy => "Copy",
+            SongMenuOperation::Delete => "Delete",
+        };
+        let mut line: String<20> = String::new();
+        let _ = write!(&mut line, "{} {}", marker, label);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 16 + row as i32 * 12),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+}
+
+fn draw_song_browser<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    purpose: SongBrowserPurpose,
+    selected: SongSlot,
+    occupied: SongSlotOccupancy,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let title = match purpose {
+        SongBrowserPurpose::Load => "Load song",
+        SongBrowserPurpose::SaveAs => "Save as",
+        SongBrowserPurpose::CopySource => "Copy from",
+        SongBrowserPurpose::CopyDestination { .. } => "Copy to",
+        SongBrowserPurpose::Delete => "Delete song",
     };
+    let _ = Text::with_baseline(title, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    const VISIBLE_ROWS: usize = 4;
+    let start = selected
+        .index()
+        .saturating_sub(1)
+        .min(looptic::SONG_SLOT_COUNT - VISIBLE_ROWS);
+    for row in 0..VISIBLE_ROWS {
+        let slot = SongSlot::from_index(start + row).unwrap_or_default();
+        let marker = if slot == selected { '>' } else { ' ' };
+        let stored = if occupied.contains(slot) { '*' } else { '-' };
+        let mut line: String<24> = String::new();
+        let _ = write!(
+            &mut line,
+            "{}{:03}{} {}",
+            marker,
+            slot.number(),
+            stored,
+            slot.animal_name()
+        );
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 16 + row as i32 * 12),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+}
+
+fn song_operation_label(operation: SongStorageOperation) -> &'static str {
+    match operation {
+        SongStorageOperation::Format => "Format",
+        SongStorageOperation::SaveCurrent | SongStorageOperation::SaveAs { .. } => "Save",
+        SongStorageOperation::Load { .. } => "Load",
+        SongStorageOperation::Copy { .. } => "Copy",
+        SongStorageOperation::Delete { .. } => "Delete",
+    }
+}
+
+fn draw_song_confirmation<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    operation: SongStorageOperation,
+    selected: SongConfirmChoice,
+    destination_occupied: bool,
+    live_song_dirty: bool,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let mut header: String<24> = String::new();
+    let _ = write!(&mut header, "{} song?", song_operation_label(operation));
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
     let mut line: String<24> = String::new();
-    let _ = write!(
-        &mut line,
-        "Load {} V{}/{}",
-        level, metrics.active_voices, metrics.voice_limit
-    );
-    let _ = Text::with_baseline(&line, Point::new(0, 0), style, Baseline::Top).draw(display);
+    match operation {
+        SongStorageOperation::Format => {
+            let _ = line.push_str("Erase all songs");
+        }
+        SongStorageOperation::Copy {
+            source,
+            destination,
+        } => {
+            let _ = write!(
+                &mut line,
+                "{:03} -> {:03}",
+                source.number(),
+                destination.number()
+            );
+        }
+        _ => {
+            if let Some(slot) = operation.destination_slot() {
+                let _ = write!(&mut line, "{:03} {}", slot.number(), slot.animal_name());
+            }
+        }
+    }
+    let _ = Text::with_baseline(&line, Point::new(0, 13), style, Baseline::Top).draw(display);
+    let warning = if destination_occupied {
+        Some("Overwrite stored")
+    } else if matches!(operation, SongStorageOperation::Load { .. }) && live_song_dirty {
+        Some("Unsaved changes!")
+    } else {
+        None
+    };
+    if let Some(warning) = warning {
+        let _ = Text::with_baseline(warning, Point::new(0, 25), style, Baseline::Top).draw(display);
+    }
+    for (row, (choice, label)) in [
+        (SongConfirmChoice::Cancel, "Cancel"),
+        (SongConfirmChoice::Confirm, "Confirm"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let marker = if *choice == selected { '>' } else { ' ' };
+        let mut line: String<16> = String::new();
+        let _ = write!(&mut line, "{} {}", marker, label);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 37 + row as i32 * 13),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
+}
 
-    line.clear();
-    let _ = write!(
-        &mut line,
-        "Svc {}/{} us",
-        metrics.last_service_us, metrics.max_service_us
-    );
-    let _ = Text::with_baseline(&line, Point::new(0, 12), style, Baseline::Top).draw(display);
+fn draw_song_status<D>(display: &mut D, style: MonoTextStyle<'_, BinaryColor>, status: SongUiStatus)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ =
+        Text::with_baseline("LoopTic Songs", Point::new(0, 0), style, Baseline::Top).draw(display);
+    let mut first: String<24> = String::new();
+    let mut second: String<24> = String::new();
+    match status {
+        SongUiStatus::Busy { operation } => {
+            let _ = write!(
+                &mut first,
+                "{} in progress",
+                song_operation_label(operation)
+            );
+            let _ = second.push_str("Please wait");
+        }
+        SongUiStatus::Formatting { percent } => {
+            let _ = first.push_str("Formatting storage");
+            let _ = write!(&mut second, "{}% complete", percent);
+        }
+        SongUiStatus::Success { operation } => {
+            let _ = write!(&mut first, "{} complete", song_operation_label(operation));
+            if let Some(slot) = operation.destination_slot() {
+                let _ = write!(&mut second, "{:03} {}", slot.number(), slot.animal_name());
+            }
+        }
+        SongUiStatus::NoChanges { slot } => {
+            let _ = first.push_str("No changes");
+            let _ = write!(&mut second, "{:03} {}", slot.number(), slot.animal_name());
+        }
+        SongUiStatus::Empty { slot } => {
+            let _ = first.push_str("Slot is empty");
+            let _ = write!(&mut second, "{:03} {}", slot.number(), slot.animal_name());
+        }
+        SongUiStatus::UnsupportedVersion {
+            slot,
+            found,
+            supported,
+        } => {
+            let _ = first.push_str("Unsupported format");
+            if let Some(slot) = slot {
+                let _ = write!(
+                    &mut second,
+                    "{:03} v{} (need v{})",
+                    slot.number(),
+                    found,
+                    supported
+                );
+            } else {
+                let _ = write!(&mut second, "v{} (need v{})", found, supported);
+            }
+        }
+        SongUiStatus::UnsupportedStorage { found, supported } => {
+            let _ = first.push_str("Storage unsupported");
+            if found == supported {
+                let _ = second.push_str("layout mismatch");
+            } else {
+                let _ = write!(&mut second, "format {} (need {})", found, supported);
+            }
+        }
+        SongUiStatus::Corrupt { slot } => {
+            let _ = first.push_str(if slot.is_some() {
+                "Song data corrupt"
+            } else {
+                "Storage corrupt"
+            });
+            if let Some(slot) = slot {
+                let _ = write!(&mut second, "Slot {:03}", slot.number());
+            }
+        }
+        SongUiStatus::Failed { operation } => {
+            let _ = write!(&mut first, "{} failed", song_operation_label(operation));
+            let _ = second.push_str("Result uncertain");
+        }
+        SongUiStatus::Unavailable => {
+            let _ = first.push_str("Storage unavailable");
+            let _ = second.push_str("Reboot and retry");
+        }
+    }
+    let _ = Text::with_baseline(&first, Point::new(0, 18), style, Baseline::Top).draw(display);
+    let _ = Text::with_baseline(&second, Point::new(0, 34), style, Baseline::Top).draw(display);
+    if !matches!(
+        status,
+        SongUiStatus::Busy { .. } | SongUiStatus::Formatting { .. }
+    ) {
+        let hint = if matches!(status, SongUiStatus::Failed { .. }) {
+            "Reboot and verify"
+        } else {
+            "Push to close"
+        };
+        let _ = Text::with_baseline(hint, Point::new(0, 50), style, Baseline::Top).draw(display);
+    }
+}
 
-    line.clear();
-    let _ = write!(
-        &mut line,
-        "Ren {}/{} us",
-        metrics.last_render_us, metrics.max_render_us
-    );
-    let _ = Text::with_baseline(&line, Point::new(0, 24), style, Baseline::Top).draw(display);
+fn draw_select_voice<D>(display: &mut D, style: MonoTextStyle<'_, BinaryColor>, mode: &str)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top).draw(display);
+    let _ = Text::with_baseline(mode, Point::new(0, 16), style, Baseline::Top).draw(display);
+    let _ =
+        Text::with_baseline("Select voice", Point::new(0, 30), style, Baseline::Top).draw(display);
+}
 
-    line.clear();
-    let _ = write!(&mut line, "DMA {} us", metrics.max_dma_cadence_us);
-    let _ = Text::with_baseline(&line, Point::new(0, 36), style, Baseline::Top).draw(display);
-
-    line.clear();
-    let _ = write!(
-        &mut line,
-        "Late {} U {}",
-        metrics.deadline_misses, metrics.underruns
-    );
-    let _ = Text::with_baseline(&line, Point::new(0, 48), style, Baseline::Top).draw(display);
+fn draw_reset_menu<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    selected: ResetAllChoice,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ = Text::with_baseline("LoopTic Reset all", Point::new(0, 0), style, Baseline::Top)
+        .draw(display);
+    for (row, (choice, label)) in [
+        (ResetAllChoice::Cancel, "Cancel"),
+        (ResetAllChoice::Reset, "Reset"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let marker = if *choice == selected { '>' } else { ' ' };
+        let mut line: String<16> = String::new();
+        let _ = write!(&mut line, "{} {}", marker, label);
+        let _ = Text::with_baseline(
+            &line,
+            Point::new(0, 18 + row as i32 * 16),
+            style,
+            Baseline::Top,
+        )
+        .draw(display);
+    }
 }
 
 #[embassy_executor::task]
@@ -810,165 +1826,188 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
     let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
-        let target = EncoderTarget::for_controls(
-            ui_state.selected_pad,
-            ui_state.encoder_pressed,
-            ui_state.pattern_editor.active,
-            ui_state.volume_target,
-            ui_state.sample_pressed,
-        );
-        let diagnostics_active = ui_state.selected_pad.is_none()
-            && ui_state.sample_pressed
-            && ui_state.encoder_pressed
-            && !ui_state.volume_pressed;
-        let (displayed_value, pattern_revision, diagnostics) = shared.lock(|state| {
+        let model = ui_state
+            .controller
+            .display_model_with_library(ui_state.volume_pressed, ui_state.song_library);
+        let (displayed_value, pattern_revision) = shared.lock(|state| {
             let state = state.borrow();
-            let value = match target {
-                EncoderTarget::BaseInterval => (state.base_interval_ms, 0),
-                EncoderTarget::LedBrightness => (u32::from(state.led_brightness_percent), 0),
-                EncoderTarget::Pad(pad) => (u32::from(state.desired_beats[pad]), 0),
-                EncoderTarget::PatternStep(_) => (
-                    u32::from(ui_state.pattern_editor.cursor),
-                    state.pattern_revision,
-                ),
-                EncoderTarget::Volume(target) => {
+            match model {
+                UiDisplayModel::Volume { target } => {
                     (u32::from(state.volume_percent(target).unwrap_or(0)), 0)
                 }
-                EncoderTarget::Sample(Some(pad)) => (
+                UiDisplayModel::PatternVolume { target } => (
+                    u32::from(state.pattern_volume_percent(target).unwrap_or(0)),
+                    state.pattern_revision,
+                ),
+                UiDisplayModel::BeatsGlobal => (state.base_interval_ms, 0),
+                UiDisplayModel::BeatsPad { pad } => (u32::from(state.desired_beats[pad]), 0),
+                UiDisplayModel::PatternEditor { pad, .. }
+                | UiDisplayModel::PatternAll { pad, .. } => {
+                    (u32::from(state.desired_beats[pad]), state.pattern_revision)
+                }
+                UiDisplayModel::SamplePad { pad } => (
                     state
                         .pad_sample(pad)
                         .map_or(0, |sample| sample.index() as u32),
                     0,
                 ),
-                EncoderTarget::Sample(None) => (0, 0),
-            };
-            let diagnostics = diagnostics_active.then_some(AudioDisplayMetrics {
-                level: state.audio_load_level,
-                active_voices: state.last_peak_primary_voices,
-                voice_limit: state.effective_voice_limit,
-                last_service_us: state.last_audio_service_time_us,
-                max_service_us: state.max_audio_service_time_us,
-                last_render_us: state.last_render_time_us,
-                max_render_us: state.max_render_time_us,
-                max_dma_cadence_us: state.max_dma_cadence_us,
-                deadline_misses: state.audio_service_deadline_miss_count,
-                underruns: state.underrun_count,
-            });
-            (value.0, value.1, diagnostics)
+                UiDisplayModel::Light => (u32::from(state.led_brightness_percent), 0),
+                UiDisplayModel::Root { .. }
+                | UiDisplayModel::PatternSelectVoice
+                | UiDisplayModel::SampleSelectVoice
+                | UiDisplayModel::SongsMenu { .. }
+                | UiDisplayModel::SongBrowser { .. }
+                | UiDisplayModel::SongConfirmation { .. }
+                | UiDisplayModel::SongStatus { .. }
+                | UiDisplayModel::ResetAll { .. } => (0, 0),
+            }
         });
-        let pattern_all_choice = ui_state.pattern_editor.all_menu.map(|menu| menu.choice);
         let value = DisplayStateKey {
-            target,
+            model,
             displayed_value,
             pattern_revision,
-            pattern_all_choice,
-            diagnostics,
         };
 
         if last_value != Some(value) {
             display.clear();
-            if let Some(metrics) = diagnostics {
-                draw_audio_diagnostics(&mut display, style, metrics);
-            } else {
-                match target {
-                    EncoderTarget::Pad(_) => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let mut line: String<24> = String::new();
-                        let _ = write!(&mut line, "Beat {}", displayed_value);
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
+            match model {
+                UiDisplayModel::Root {
+                    highlighted,
+                    selected_pad,
+                    current_song,
+                    song_dirty,
+                } => draw_root_menu(
+                    &mut display,
+                    style,
+                    highlighted,
+                    selected_pad,
+                    current_song,
+                    song_dirty,
+                ),
+                UiDisplayModel::Volume { target } => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    match target {
+                        VolumeTarget::Global => {
+                            let _ = write!(&mut line, "Master {}%", displayed_value);
+                        }
+                        VolumeTarget::Pad(pad) => {
+                            let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
+                        }
                     }
-                    EncoderTarget::BaseInterval => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let mut line: String<24> = String::new();
-                        let _ = write!(&mut line, "Base {} ms", displayed_value);
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
-                    }
-                    EncoderTarget::LedBrightness => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let mut line: String<24> = String::new();
-                        let _ = write!(&mut line, "Light {}%", displayed_value);
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
-                    }
-                    EncoderTarget::PatternStep(pad) => {
-                        if let Some(menu) = ui_state.pattern_editor.all_menu {
-                            draw_pattern_all_menu(&mut display, style, pad, menu.choice);
-                        } else {
-                            draw_pattern_editor(
-                                &mut display,
-                                style,
-                                shared,
-                                pad,
-                                ui_state.pattern_editor.cursor,
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                UiDisplayModel::PatternVolume { target } => {
+                    let _ = Text::with_baseline(
+                        "LoopTic Pattern",
+                        Point::new(0, 0),
+                        style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    match target {
+                        PatternVolumeTarget::All { pad } => {
+                            let _ = write!(&mut line, "P{} All avg {}%", pad + 1, displayed_value);
+                        }
+                        PatternVolumeTarget::Step { pad, step } => {
+                            let _ = write!(
+                                &mut line,
+                                "P{} T{:03} {}%",
+                                pad + 1,
+                                step + 1,
+                                displayed_value
                             );
                         }
                     }
-                    EncoderTarget::Volume(VolumeTarget::Global) => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let mut line: String<24> = String::new();
-                        let _ = write!(&mut line, "Master {}%", displayed_value);
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
-                    }
-                    EncoderTarget::Volume(VolumeTarget::Pad(pad)) => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let mut line: String<24> = String::new();
-                        let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
-                    }
-                    EncoderTarget::Sample(Some(pad)) => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let sample = displayed_value as usize;
-                        let mut line: String<24> = String::new();
-                        let name = sample_assets::SAMPLE_NAMES
-                            .get(sample)
-                            .copied()
-                            .unwrap_or("?");
-                        let _ = write!(
-                            &mut line,
-                            "P{} Sample {:02}/{}",
-                            pad + 1,
-                            sample + 1,
-                            SAMPLE_COUNT
-                        );
-                        let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
-                            .draw(&mut display);
-                        let _ = Text::with_baseline(name, Point::new(0, 30), style, Baseline::Top)
-                            .draw(&mut display);
-                    }
-                    EncoderTarget::Sample(None) => {
-                        let _ =
-                            Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
-                                .draw(&mut display);
-                        let _ =
-                            Text::with_baseline("Sample", Point::new(0, 16), style, Baseline::Top)
-                                .draw(&mut display);
-                        let _ = Text::with_baseline(
-                            "Hold beat",
-                            Point::new(0, 30),
-                            style,
-                            Baseline::Top,
-                        )
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
                         .draw(&mut display);
+                }
+                UiDisplayModel::PatternSelectVoice => {
+                    draw_select_voice(&mut display, style, "Pattern");
+                }
+                UiDisplayModel::PatternEditor { pad, cursor } => {
+                    draw_pattern_editor(&mut display, style, shared, pad, cursor);
+                }
+                UiDisplayModel::PatternAll { pad, choice } => {
+                    draw_pattern_all_menu(&mut display, style, pad, choice);
+                }
+                UiDisplayModel::BeatsGlobal | UiDisplayModel::BeatsPad { .. } => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    if let UiDisplayModel::BeatsPad { pad } = model {
+                        let _ = write!(&mut line, "P{} Beat {}", pad + 1, displayed_value);
+                    } else {
+                        let _ = write!(&mut line, "Base {} ms", displayed_value);
                     }
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                UiDisplayModel::SampleSelectVoice => {
+                    draw_select_voice(&mut display, style, "Sample");
+                }
+                UiDisplayModel::SamplePad { pad } => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let sample = displayed_value as usize;
+                    let mut line: String<24> = String::new();
+                    let name = sample_assets::SAMPLE_NAMES
+                        .get(sample)
+                        .copied()
+                        .unwrap_or("?");
+                    let _ = write!(
+                        &mut line,
+                        "P{} Sample {:02}/{}",
+                        pad + 1,
+                        sample + 1,
+                        SAMPLE_COUNT
+                    );
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                    let _ = Text::with_baseline(name, Point::new(0, 30), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                UiDisplayModel::Light => {
+                    let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    let _ = write!(&mut line, "Light {}%", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                UiDisplayModel::SongsMenu { selected } => {
+                    draw_songs_menu(&mut display, style, selected);
+                }
+                UiDisplayModel::SongBrowser {
+                    purpose,
+                    slot,
+                    occupied,
+                } => {
+                    draw_song_browser(&mut display, style, purpose, slot, occupied);
+                }
+                UiDisplayModel::SongConfirmation {
+                    operation,
+                    choice,
+                    destination_occupied,
+                    live_song_dirty,
+                } => draw_song_confirmation(
+                    &mut display,
+                    style,
+                    operation,
+                    choice,
+                    destination_occupied,
+                    live_song_dirty,
+                ),
+                UiDisplayModel::SongStatus { status } => {
+                    draw_song_status(&mut display, style, status);
+                }
+                UiDisplayModel::ResetAll { choice } => {
+                    draw_reset_menu(&mut display, style, choice);
                 }
             }
-
             if display.flush().is_err() {
                 FATAL_FAULT.store(true, Ordering::Relaxed);
             }
@@ -1041,6 +2080,7 @@ fn main() -> ! {
 
     let low_executor = EXECUTOR_LOW.init(Executor::new());
     low_executor.run(|spawner| {
+        spawner.spawn(storage_task(p.FLASH, shared, ui).unwrap());
         spawner.spawn(controls_task(keys, encoder, encoder_button, shared, ui).unwrap());
         spawner.spawn(led_task(pixels, status_led, shared, ui).unwrap());
         let oled = OledResources {
