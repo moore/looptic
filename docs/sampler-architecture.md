@@ -121,9 +121,8 @@ Mode behavior is:
   enable state and stored trigger level; `All` shows the rounded whole-map
   average. Slow turns move one row and eligible accelerated turns move ten
   rows, clamping at `All` and the final visible trigger rather than crossing an
-  endpoint. The encoder push and bottom-left Mute key are equivalent Pattern
-  action inputs: either toggles a trigger row or opens/confirms the safe `All`
-  choice.
+  endpoint. The encoder push toggles a trigger row or opens/confirms the safe
+  `All` choice.
 - **Beats:** with no selection, edit the base interval; with a selection, edit
   that pad's division from 0 through the 256-slot maximum.
 - **Sample:** with no selection, show `Select voice`. For a selected pad, each
@@ -144,14 +143,10 @@ Mode behavior is:
   detent moves one choice without acceleration and clamps at the ends. Pressing
   the encoder on either choice exits the confirmation.
 
-Mute normally captures the persistent selected pad at its press edge, or Global
-if the selection is empty, and retains that target for the complete tap/hold
-gesture. On a selected pad's Pattern page, however, its press is routed through
-the same Pattern-control path as the encoder button and never starts a mute
-gesture. Holding does not repeat the action, and release is inert. Simultaneous
-Mute and encoder-button press edges are coalesced into one Pattern action;
-Return retains priority over both. Pattern with no selection continues to use
-global Mute. Volume instead resolves its target dynamically while held.
+Mute captures the persistent selected pad at its press edge, or Global if the
+selection is empty, and retains that target for the complete tap/hold gesture
+on every page. Return retains priority and cancels an active gesture. Volume
+instead resolves its target dynamically while held.
 Ordinarily it edits the currently selected pad or the master when selection is
 empty. On a selected pad's Pattern page, it edits the highlighted trigger
 level; highlighting `All` targets all stored trigger levels. It then returns
@@ -574,11 +569,10 @@ Exercise these cases separately and confirm their diagnostic counters:
     and persistence across shrink/expand until a committed `All` or `None`
     deliberately resets them. Verify row clamping at `All` and the final
     trigger, choice clamping at `Cancel` and `None`, and operation at division
-    zero. Use both the encoder button and Mute key to toggle rows and to
-    open/confirm the whole-map choice. A long Mute hold must perform only one
-    Pattern action without muting or fading voices, and simultaneous Mute and
-    encoder-button edges must also produce exactly one action. Clear selection
-    while remaining in Pattern and verify normal global Mute behavior returns.
+    zero. Use the encoder button to toggle rows and to open/confirm the
+    whole-map choice. On the Pattern page, verify that Mute still performs its
+    normal selected-pad tap/hold gesture. Clear selection while remaining in
+    Pattern and verify that Mute targets Global.
 11. Starting with Beats highlighted, navigate the seven root entries in
     `Beats`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`, `Reset all` order;
     verify five-row scrolling and clamping at both ends. Enter each persistent
@@ -635,7 +629,7 @@ suppression while the encoder is held, clamped list navigation and persistent
 pages, per-pad Pattern cursors and confirmations, context-sensitive master,
 pad, trigger, and whole-map Volume targets, Return cleanup with preserve-in-
 mode/clear-at-root selection behavior, held-control suppression, Mute capture/
-cancellation, the selected-Pattern Mute shortcut, bounded LED helpers, reset
+cancellation on every page, bounded LED helpers, reset
 confirmation, selection-aware beat dimming, musical-state reset, and exact
 primary release. Whole-map state tests verify that both `All` and `None` reset
 all trigger levels to 100% while `Cancel` leaves enablement and levels intact.

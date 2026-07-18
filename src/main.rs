@@ -554,9 +554,8 @@ async fn storage_task(
     }
 }
 
-/// Apply a Pattern editor action shared by the encoder push and the Mute-key
-/// shortcut. Returns whether changing the Pattern submode should reset encoder
-/// acceleration.
+/// Apply an encoder-driven Pattern editor action. Returns whether changing the
+/// Pattern submode should reset encoder acceleration.
 fn apply_pattern_editor_action(shared: &Shared, action: PatternEditorAction) -> bool {
     match action {
         PatternEditorAction::Toggle { pad, step } => {
@@ -1133,7 +1132,7 @@ async fn controls_task(
             } else {
                 let storage_busy = matches!(
                     next_ui.controller.song_status(),
-                    Some(SongUiStatus::Busy { .. })
+                    Some(SongUiStatus::Busy { .. } | SongUiStatus::Formatting { .. })
                 );
                 if storage_busy {
                     if matches!(mute_action, Some(MuteScanAction::Release(_))) {
@@ -1169,21 +1168,7 @@ async fn controls_task(
                     }
                 }
 
-                let pattern_mute_pressed = allowed_pressed & mute_bit != 0
-                    && next_ui.controller.page() == UiPage::Pattern
-                    && next_ui.controller.selected_pad().is_some();
-                if pattern_mute_pressed {
-                    let selected_division = next_ui
-                        .controller
-                        .selected_pad()
-                        .map(|pad| shared.lock(|state| state.borrow().desired_beats[pad]));
-                    if let Some(UiAction::Pattern(action)) =
-                        next_ui.controller.press_pattern_control(selected_division)
-                        && apply_pattern_editor_action(shared, action)
-                    {
-                        encoder_acceleration = UiEncoderAcceleration::new();
-                    }
-                } else if allowed_pressed & mute_bit != 0 {
+                if allowed_pressed & mute_bit != 0 {
                     let target = MuteTarget::for_selected_pad(next_ui.controller.selected_pad());
                     if mute_button.press(target, now_ms) {
                         shared.lock(|state| {
@@ -1198,11 +1183,7 @@ async fn controls_task(
                     debounced_encoder_pressed && !next_ui.controller.encoder_suppressed();
                 next_ui.volume_pressed = volume_pressed;
 
-                if button_changes.pressed & 1 != 0
-                    && encoder_pressed
-                    && !volume_pressed
-                    && !pattern_mute_pressed
-                {
+                if button_changes.pressed & 1 != 0 && encoder_pressed && !volume_pressed {
                     let selected_division = next_ui
                         .controller
                         .selected_pad()

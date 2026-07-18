@@ -118,13 +118,9 @@ beat, or the entire sequencer when no beat is selected. The target is captured
 when Mute is pressed and does not change if the selection changes during that
 gesture.
 
-There is one navigation exception: on the Pattern page with a beat selected,
-Mute is a second Pattern action key rather than a mute gesture. Its press toggles
-the highlighted trigger, opens the safe `All` choice from the `All` row, or
-confirms the highlighted `Cancel`/`All`/`None` choice. Holding it does not
-repeat the action, and releasing it does not change a mute latch. If Mute and
-the encoder button reach debounce together, the pair performs only one Pattern
-action. Pattern with no selected beat retains normal global Mute behavior.
+Mute has the same behavior on every page, including Pattern. The encoder button
+is the only control that toggles highlighted Pattern triggers or opens and
+confirms the `All` choice.
 
 Muting suppresses triggers rather than merely silencing their sample output.
 Active voices fade out over 32 audio frames (about 1.45 ms), avoiding the click
@@ -536,9 +532,8 @@ full, mixed, and empty maps: it must default to `Cancel` and clamp at `Cancel`
 and `None`; `All` must fill the complete 256-bit map, and `None` must clear it,
 including hidden slots. Committing either `All` or `None` must reset all 256
 stored trigger levels to 100%; `Cancel` and Return must preserve both the
-complete map and every stored level. Verify that both the encoder button and
-Mute can toggle an individual row, open the `All` choice, and confirm it, and
-that simultaneous Mute/encoder presses produce exactly one Pattern action.
+complete map and every stored level. Verify that only the encoder button
+toggles an individual row or opens and confirms the `All` choice.
 
 In Beats, verify that an empty selection edits the 50 ms-or-greater base
 interval and a selected beat edits its 0–256 division, including the documented
@@ -552,10 +547,9 @@ the Mute LED is bright red when its displayed target is unmuted, is dimmed to
 20% when muted, and shows only the selected beat's local setting while a beat
 is selected. Muted voices should fade cleanly in about 1.45 ms while their visual
 pulses and phase continue, then resume at the next scheduled trigger after
-unmuting. Repeat on a selected beat's Pattern page and verify that short and
-long Mute presses perform one Pattern action without momentarily muting,
-changing the mute latch, or fading active voices; clear selection there and
-confirm that Mute again targets the global latch.
+unmuting. Repeat on a selected beat's Pattern page and verify that short taps
+toggle that pad's mute while long holds mute it only until release. Clear the
+selection there and confirm that Mute targets the global latch.
 
 Hold Volume and dynamically select, replace, and clear beat targets; verify
 fallback to master, 1%/10% adjustment,

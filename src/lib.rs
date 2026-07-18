@@ -3988,10 +3988,8 @@ impl UiController {
         }
     }
 
-    /// Activate the highlighted Pattern row without applying any behavior on
-    /// other pages. Both the encoder push and the Pattern-mode Mute shortcut
-    /// use this path so their toggle and All-confirmation behavior stays
-    /// identical.
+    /// Activate the highlighted Pattern row from the encoder push without
+    /// applying any behavior on other pages.
     pub fn press_pattern_control(&mut self, selected_division: Option<u16>) -> Option<UiAction> {
         if self.page != UiPage::Pattern {
             return None;
@@ -7487,7 +7485,7 @@ mod tests {
     }
 
     #[test]
-    fn alternate_pattern_control_matches_encoder_for_rows_and_whole_map_choices() {
+    fn pattern_control_handles_rows_and_whole_map_choices() {
         let mut ui = UiController::new();
         assert_eq!(ui.press_pattern_control(None), None);
 
