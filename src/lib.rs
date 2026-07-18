@@ -4350,6 +4350,42 @@ pub fn pattern_window_start(cursor: u16, division: u16, visible_rows: u16) -> u1
         .min(entry_count - visible_rows)
 }
 
+/// A selectable slice plus continuation flags for a scrolling OLED menu.
+/// Firmware renders the flags beside the first and last item, so they consume
+/// horizontal marker space rather than reducing the number of visible items.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScrollMenuWindow {
+    pub start: usize,
+    pub item_rows: usize,
+    pub more_above: bool,
+    pub more_below: bool,
+}
+
+pub fn scroll_menu_window(
+    selected: usize,
+    item_count: usize,
+    visible_rows: usize,
+) -> ScrollMenuWindow {
+    if item_count == 0 || visible_rows == 0 {
+        return ScrollMenuWindow::default();
+    }
+    let selected = selected.min(item_count - 1);
+    let item_rows = item_count.min(visible_rows);
+    // When more items remain below, keep the selection one row above the
+    // bottom so the final row can carry the continuation triangle in the
+    // ordinary selection-marker column. Each further selection still shifts
+    // the window by exactly one entry.
+    let start = selected
+        .saturating_sub(item_rows.saturating_sub(2))
+        .min(item_count - item_rows);
+    ScrollMenuWindow {
+        start,
+        item_rows,
+        more_above: start != 0,
+        more_below: start + item_rows < item_count,
+    }
+}
+
 /// Accelerate a direction delta when consecutive detents arrive quickly.
 pub fn accelerated_encoder_delta(direction: i32, elapsed_ms: Option<u64>) -> i32 {
     let multiplier = if elapsed_ms.is_some_and(|elapsed| elapsed <= FAST_ENCODER_THRESHOLD_MS) {
@@ -6759,6 +6795,36 @@ mod tests {
         assert_eq!(pattern_window_start(3, 4, 5), 0);
         assert_eq!(pattern_window_start(0, 0, 5), 0);
         assert_eq!(pattern_window_start(3, 12, 0), 0);
+
+        assert_eq!(
+            scroll_menu_window(0, 7, 5),
+            ScrollMenuWindow {
+                start: 0,
+                item_rows: 5,
+                more_above: false,
+                more_below: true,
+            }
+        );
+        assert_eq!(
+            scroll_menu_window(4, 20, 5),
+            ScrollMenuWindow {
+                start: 1,
+                item_rows: 5,
+                more_above: true,
+                more_below: true,
+            }
+        );
+        assert_eq!(scroll_menu_window(5, 20, 5).start, 2);
+        assert_eq!(scroll_menu_window(6, 20, 5).start, 3);
+        assert_eq!(
+            scroll_menu_window(19, 20, 5),
+            ScrollMenuWindow {
+                start: 15,
+                item_rows: 5,
+                more_above: true,
+                more_below: false,
+            }
+        );
     }
 
     #[test]

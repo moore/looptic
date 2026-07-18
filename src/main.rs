@@ -39,6 +39,7 @@ use embassy_time::{Delay, Duration, Instant, Timer, with_deadline};
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_6X10};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{PrimitiveStyle, Triangle};
 use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
@@ -53,8 +54,8 @@ use looptic::{
     UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX,
     VolumeTarget, adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness,
     adjust_sample_selection, decode_song, encode_song_v1, led_pulse_active, mute_led_color,
-    pattern_window_start, resolve_mute_scan, return_led_color, sample_assets,
-    sample_selection_preview_request, voice_led_color, volume_led_color,
+    resolve_mute_scan, return_led_color, sample_assets, sample_selection_preview_request,
+    scroll_menu_window, voice_led_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -1320,26 +1321,29 @@ fn draw_pattern_editor<D>(
     D: DrawTarget<Color = BinaryColor>,
 {
     const VISIBLE_ROWS: u16 = 5;
-    let (division, cursor, window_start, fill_state, all_volume, enabled_rows, volume_rows) =
-        shared.lock(|state| {
+    let (division, cursor, window, fill_state, all_volume, enabled_rows, volume_rows) = shared
+        .lock(|state| {
             let state = state.borrow();
             let division = state.desired_beats[pad];
             let cursor = cursor.min(division);
-            let window_start = pattern_window_start(cursor, division, VISIBLE_ROWS);
+            let window = scroll_menu_window(
+                usize::from(cursor),
+                usize::from(division) + 1,
+                usize::from(VISIBLE_ROWS),
+            );
             let mut enabled_rows = [false; VISIBLE_ROWS as usize];
             let mut volume_rows = [0_u8; VISIBLE_ROWS as usize];
             let mut fill_state = PatternFillState::Empty;
             let mut all_volume = 0;
             if let Some(pattern) = state.pattern(pad) {
                 fill_state = pattern.fill_state();
-                for row in 0..VISIBLE_ROWS {
-                    let entry = window_start + row;
-                    if entry != 0 && entry <= division {
+                for row in 0..window.item_rows {
+                    let entry = window.start + row;
+                    if entry != 0 && entry <= usize::from(division) {
                         let step = entry - 1;
-                        enabled_rows[usize::from(row)] =
-                            pattern.step_enabled(step, division).unwrap_or(false);
-                        volume_rows[usize::from(row)] =
-                            state.trigger_volume(pad, usize::from(step)).unwrap_or(0);
+                        enabled_rows[row] =
+                            pattern.step_enabled(step as u16, division).unwrap_or(false);
+                        volume_rows[row] = state.trigger_volume(pad, step).unwrap_or(0);
                     }
                 }
             }
@@ -1349,7 +1353,7 @@ fn draw_pattern_editor<D>(
             (
                 division,
                 cursor,
-                window_start,
+                window,
                 fill_state,
                 all_volume,
                 enabled_rows,
@@ -1361,12 +1365,16 @@ fn draw_pattern_editor<D>(
     let _ = write!(&mut header, "LoopTic P{} {}", pad + 1, division);
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
-    for row in 0..VISIBLE_ROWS {
-        let entry = window_start + row;
-        if entry > division {
-            break;
-        }
-        let marker = if entry == cursor { '>' } else { ' ' };
+    if window.more_above {
+        draw_scroll_triangle(display, 14, true);
+    }
+    for row in 0..window.item_rows {
+        let entry = window.start + row;
+        let marker = if entry == usize::from(cursor) {
+            '>'
+        } else {
+            ' '
+        };
         let mut line: String<20> = String::new();
         if entry == 0 {
             let state = match fill_state {
@@ -1376,27 +1384,23 @@ fn draw_pattern_editor<D>(
             };
             let _ = write!(&mut line, "{} All {} avg{}%", marker, state, all_volume);
         } else {
-            let state = if enabled_rows[usize::from(row)] {
-                "ON"
-            } else {
-                "off"
-            };
+            let state = if enabled_rows[row] { "ON" } else { "off" };
             let _ = write!(
                 &mut line,
                 "{} {:04} {} {}%",
-                marker,
-                entry,
-                state,
-                volume_rows[usize::from(row)]
+                marker, entry, state, volume_rows[row]
             );
         }
         let _ = Text::with_baseline(
             &line,
-            Point::new(0, 14 + i32::from(row) * 10),
+            Point::new(0, 14 + row as i32 * 10),
             style,
             Baseline::Top,
         )
         .draw(display);
+    }
+    if window.more_below {
+        draw_scroll_triangle(display, 14 + (window.item_rows - 1) as i32 * 10, false);
     }
 
     if division == 0 {
@@ -1469,11 +1473,11 @@ fn draw_root_menu<D>(
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
     const VISIBLE_ROWS: usize = 5;
-    let start = highlighted
-        .index()
-        .saturating_sub(VISIBLE_ROWS - 1)
-        .min(RootMode::COUNT.saturating_sub(VISIBLE_ROWS));
-    for (row, mode) in RootMode::ALL[start..start + VISIBLE_ROWS]
+    let window = scroll_menu_window(highlighted.index(), RootMode::COUNT, VISIBLE_ROWS);
+    if window.more_above {
+        draw_scroll_triangle(display, 14, true);
+    }
+    for (row, mode) in RootMode::ALL[window.start..window.start + window.item_rows]
         .iter()
         .copied()
         .enumerate()
@@ -1497,6 +1501,9 @@ fn draw_root_menu<D>(
             Baseline::Top,
         )
         .draw(display);
+    }
+    if window.more_below {
+        draw_scroll_triangle(display, 14 + (window.item_rows - 1) as i32 * 10, false);
     }
 }
 
@@ -1548,12 +1555,12 @@ fn draw_song_browser<D>(
     let _ = Text::with_baseline(title, Point::new(0, 0), style, Baseline::Top).draw(display);
 
     const VISIBLE_ROWS: usize = 4;
-    let start = selected
-        .index()
-        .saturating_sub(1)
-        .min(looptic::SONG_SLOT_COUNT - VISIBLE_ROWS);
-    for row in 0..VISIBLE_ROWS {
-        let slot = SongSlot::from_index(start + row).unwrap_or_default();
+    let window = scroll_menu_window(selected.index(), looptic::SONG_SLOT_COUNT, VISIBLE_ROWS);
+    if window.more_above {
+        draw_scroll_triangle(display, 16, true);
+    }
+    for row in 0..window.item_rows {
+        let slot = SongSlot::from_index(window.start + row).unwrap_or_default();
         let marker = if slot == selected { '>' } else { ' ' };
         let stored = if occupied.contains(slot) { '*' } else { '-' };
         let mut line: String<24> = String::new();
@@ -1573,6 +1580,27 @@ fn draw_song_browser<D>(
         )
         .draw(display);
     }
+    if window.more_below {
+        draw_scroll_triangle(display, 16 + (window.item_rows - 1) as i32 * 12, false);
+    }
+}
+
+fn draw_scroll_triangle<D>(display: &mut D, row_y: i32, points_up: bool)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let (tip_y, base_y) = if points_up {
+        (row_y + 1, row_y + 7)
+    } else {
+        (row_y + 7, row_y + 1)
+    };
+    let _ = Triangle::new(
+        Point::new(3, tip_y),
+        Point::new(0, base_y),
+        Point::new(6, base_y),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .draw(display);
 }
 
 fn song_operation_label(operation: SongStorageOperation) -> &'static str {
