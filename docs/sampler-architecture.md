@@ -81,12 +81,12 @@ voice constant-time, independently addressable XIP reads.
 
 ### Control state and modes
 
-The OLED root menu is ordered `Beats`, `Pattern`, `Sample`, `Light`, `Save`,
-`Songs`, and `Reset all`, with Beats highlighted at boot. Encoder navigation
-moves one item per detent without acceleration and clamps at both ends; the
-five-row window scrolls and its cursor survives mode entry and Return. Encoder
-push enters the highlighted mode or invokes root Save; modes do not close
-merely because a beat key is released.
+The OLED root menu is ordered `Beats`, `Cycle length`, `Pattern`, `Sample`,
+`Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot.
+Encoder navigation moves one item per detent without acceleration and clamps at
+both ends; the five-row window scrolls and its cursor survives mode entry and
+Return. Encoder push enters the highlighted mode or invokes root Save; modes do
+not close merely because a beat key is released.
 
 Beat-key press edges update persistent selection. The current policy is
 exclusive: an unselected pad replaces the selected pad, pressing the selected
@@ -103,8 +103,10 @@ its press, Return takes priority over other key-press edges and an
 encoder-button press. A simultaneous Mute release is cancelled without a latch
 toggle. The physical Return level blocks encoder detents throughout the
 five-sample debounce window, so they cannot edit a value or queue a preview just
-before Return is recognized. Return then closes the current mode or
-confirmation, discards any still-uncommitted choice or control gesture,
+before Return is recognized. In the Pattern Cycles editor, Return closes only
+that editor and remains in Pattern. Otherwise, Return closes the current mode
+or confirmation, discards any still-uncommitted
+choice or control gesture,
 preserves beat selection, and restores the root at its remembered cursor. A
 Return press while already at the root instead clears selection. Controls
 already physically held at that point are blocked until release, preventing an
@@ -117,14 +119,22 @@ starts again with the slow step.
 Mode behavior is:
 
 - **Pattern:** with no selection, show `Select voice`. A selected pad exposes
-  its direct-slot pattern list and its own persistent cursor. Every row shows
+  a persistent `Cycles` multiplier, its direct-slot pattern list, and its own
+  cursor. Beats controls tick cadence while `beats × repeat` controls Pattern
+  wrap length. Every trigger row shows
   enable state and stored trigger level; `All` shows the rounded whole-map
   average. Slow turns move one row and eligible accelerated turns move ten
-  rows, clamping at `All` and the final visible trigger rather than crossing an
+  rows, clamping at `Cycles` and the final visible trigger rather than crossing an
   endpoint. The encoder push toggles a trigger row or opens/confirms the safe
   `All` choice.
-- **Beats:** with no selection, edit the base interval; with a selection, edit
-  that pad's division from 0 through the 256-slot maximum.
+- **Beats:** with no selection, show `Select voice` and ignore encoder turns. A
+  selected pad directly edits its 0–256 Beats value with 1/10-step acceleration.
+  Encoder push has no action, and Return closes the mode.
+- **Cycle length:** with no selection, directly edit the global length with
+  10/100 ms acceleration. A selected pad directly edits its persistent Cycle
+  length with the same acceleration. Zero means follow the current global
+  value; 50 ms is the minimum independent length, and values 1 through 49 are
+  skipped. Encoder push has no action, and Return closes the mode.
 - **Sample:** with no selection, show `Select voice`. For a selected pad, each
   encoder detent moves one entry through the 24-sample catalog without
   acceleration and clamps at the first or last sample. Each actual assignment
@@ -154,9 +164,9 @@ encoder control to the open mode on release.
 
 Beat LEDs are composed in two stages. The base color is off when idle, steady
 white for the selected beat, a pad's normal palette color for a 100 ms trigger
-or preview indication, or the normal palette while Light mode is open. Priority
-is trigger/preview, then selected-white, then Light, then idle; a selected key's
-beat therefore replaces white with its normal color before returning to white.
+or preview indication, or the normal palette while Light mode is open. On a
+selected key, a trigger contributes 20% of its palette color to 80% white before
+global brightness is applied, so continuous fast triggers still read as selected.
 
 If a selection exists, an additional 20% multiplier is then applied to every
 non-selected beat LED. Consequently idle keys remain off; trigger, preview, and
@@ -175,19 +185,23 @@ proportional range mapping or interpolation. Reducing a division exposes a
 shorter prefix without modifying the hidden suffix, and increasing it reveals
 the previous enable states and levels.
 
-Pattern mode presents a scrollable `All` row before the visible trigger rows.
+Pattern mode presents a scrollable `Cycles` row, then `All`, before the visible
+trigger rows. Pushing `Cycles` opens a one-step editor bounded by
+`floor(256 / beats)`; push or Return closes it. Increasing Beats clamps Cycles
+when necessary without erasing hidden slots.
 Each trigger row reports `ON`/`off` and its stored percentage. The row cursor
-clamps at `All` and the final visible trigger. `All` reports the whole enable
+clamps at `Cycles` and the final visible trigger. `All` reports the whole enable
 map as `ON`, `off`, or `mix` and its rounded average trigger level, not merely
 the currently visible prefix. Pressing it opens a three-choice confirmation
 containing `Cancel`, `All`, and `None`; `Cancel` is selected initially. The
-choice also clamps at `Cancel` and `None`; the encoder button or Mute key
-confirms it and returns to the pattern list. `All` fills all 256 enable bits and
+choice also clamps at `Cancel` and `None`; the encoder button confirms it and
+returns to the pattern list. `All` fills all 256 enable bits and
 `None` clears all 256 enable bits. Committing either choice also resets every
 one of the 256 stored trigger levels to 100%, including hidden and disabled
 slots. `Cancel` leaves both maps unchanged. Return also cancels the choice,
 preserves selection, and returns to the root. At division zero no trigger rows
-are visible, but `All` remains available and still operates on the complete
+are visible, but `Cycles` and `All` remain available; Cycles is fixed at 1x and
+`All` still operates on the complete
 map. Normal division changes and individual trigger edits never alter hidden
 slots.
 
@@ -200,11 +214,12 @@ the displayed average, so accents remain distinct until individual slots clamp
 at 0% or 100%. Whole-map edits update the cached sum used for the rounded
 average and publish one pattern revision.
 
-Confirming Reset all is an atomic UI-to-audio state reset: set the base interval
-to 1000 ms, all divisions to zero, every pattern bit on, every trigger level to
-100%, pads 0–5 to AKU Kick, pads 6–8 to AKU Open Hat, global and per-pad mute
-off, and master/per-pad volume to 100%; clear pending preview and visual-pulse
-state. At the next audio-block
+Confirming Reset all is an atomic UI-to-audio state reset: set the global Cycle
+length to 1000 ms, clear all per-pad Cycle-length overrides, set all Beats values
+to zero and Pattern Cycles to 1x, turn every pattern bit on, set every trigger
+level to 100%, assign pads 0–5 to AKU Kick and pads 6–8 to AKU Open Hat, turn
+global and per-pad mute off, and set master/per-pad volume to 100%; clear pending
+preview and visual-pulse state. At the next audio-block
 boundary, active primary voices enter the normal 32-frame release. Existing
 forced-fade tails are neither restarted nor cleared and finish their bounded
 fades. Live gain ramps are frozen for those 32 frames, preventing a voice that
@@ -221,6 +236,24 @@ Persistent storage is deliberately outside the real-time renderer. The final
 2 MiB flash partition, versioned superblock, Postcard song schema,
 sequential-storage journal, explicit operation semantics, and audio-quiesce
 protocol are specified in [song storage architecture](song-storage.md).
+
+### Cycle timing
+
+The global Cycle length is the default timing interval for every pad. Each pad
+may instead persist an independent Cycle-length override. The editor represents
+the absence of an override as zero, which makes the pad follow the current
+global value; any setting at or above 50 ms is stored as an independent value
+and is unaffected by later global edits. For either source, a pad's Beats value
+distributes that many scheduled ticks across its effective Cycle length. The Pattern
+`Cycles` multiplier is orthogonal: it extends only the number of pattern slots
+visited before wrap and never changes tick cadence.
+
+The audio task snapshots all nine effective Cycle lengths with Beats and Pattern
+Cycles at each block boundary. A Beats or effective-length change realigns that
+pad to the first tick after the current boundary on the frame-zero global grid;
+unchanged pads retain their pending deadlines. This permits pads with independent
+Cycle lengths while keeping each rational clock deterministic and globally
+phase-referenced.
 
 ### Exact-frame coalescing
 
@@ -573,21 +606,33 @@ Exercise these cases separately and confirm their diagnostic counters:
     whole-map choice. On the Pattern page, verify that Mute still performs its
     normal selected-pad tap/hold gesture. Clear selection while remaining in
     Pattern and verify that Mute targets Global.
-11. Starting with Beats highlighted, navigate the seven root entries in
-    `Beats`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`, `Reset all` order;
-    verify five-row scrolling and clamping at both ends. Enter each persistent
+11. Starting with Beats highlighted, navigate the eight root entries in
+    `Beats`, `Cycle length`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`,
+    `Reset all` order; verify five-row scrolling and clamping at both ends.
+    Enter each persistent
     mode, change and clear selection without holding
-    beat keys, and verify per-pad Pattern cursors. Selection changes must not
-    preview. Return must take priority over simultaneous key-press and
-    encoder-button press edges, cancel uncommitted choices, preserve selection
+    beat keys, and verify per-pad Pattern cursors. In Beats, no
+    selection must show `Select voice`; each selected pad must directly use
+    1/10-step editing, encoder push must do nothing, and Return must reach the
+    root. In Cycle length, verify direct 10/100 ms global and selected-pad
+    editing. A selected pad at zero must follow later global edits; clockwise
+    from zero must select 50 ms, counter-clockwise below 50 ms must return to
+    zero, and values 1 through 49 must remain unreachable. Nonzero pad values
+    must ignore later global edits and persist independently. Encoder push must
+    do nothing, and Return must go directly to the root.
+    Selection changes must not preview. Return must take priority over
+    simultaneous key-press and encoder-button press edges, cancel uncommitted
+    choices, preserve selection
     when leaving modes and confirmations, clear selection when already at the
     root, and block already-held controls until release.
 12. Exercise all 256 named song slots, unchanged Save suppression, Load,
     Save-as overwrite, stored-slot Copy, Delete, empty-slot feedback, dirty
     indication, Return cancellation, audio fade/pause/resume, USB firmware
-    replacement with data retained, and the version/corruption screens. Run the
-    power-cut matrix in `song-storage.md`; every slot must recover as the old or
-    new complete value, never a mixture.
+    replacement with data retained, and the version/corruption screens. Load a
+    v2 record and verify an in-memory migration with every pad following Global,
+    no automatic flash rewrite, and a v3 record after an edit followed by Save
+    or after Save-as. Run the power-cut matrix in `song-storage.md`; every slot
+    must recover as the old or new complete value, never a mixture.
 13. Alter every Reset all category and verify its default Cancel choice,
     one-detent nonaccelerated movement, end clamping, and inert Cancel path.
     Create active primaries and forced-fade tails, then confirm Reset. Verify the

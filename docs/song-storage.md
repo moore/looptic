@@ -63,6 +63,15 @@ protects backend compatibility, while the song-record decoder distinguishes a
 supported song, an unsupported older/newer schema, and corrupt payload data.
 That second version gate permits future firmware to migrate records one song at
 a time without changing the physical partition.
+Current saves use song format v3, which adds an optional Cycle-length override
+for every pad. The decoder also accepts v2 and migrates it in memory by assigning
+every pad to the global Cycle length, exactly preserving v2 timing. Loading does
+not rewrite the stored bytes; the next Save after an edit or Save-as writes v3.
+Raw Copy retains the source record's original version. V1 and unknown newer
+records are reported as unsupported and are not rewritten automatically. This
+record-schema change
+does not alter the superblock or journal geometry, so the physical storage-layout
+version remains 1.
 
 ## Map and operation rules
 
@@ -72,7 +81,7 @@ self-versioned song records. The backend exposes a one-pass 256-bit occupancy
 scan plus load, save, and delete operations. Animal names are firmware-owned
 labels derived from the slot and are not stored in flash.
 
-Two MiB is deliberate. A complete V1 song is about 2.7 KiB and therefore each
+Two MiB is deliberate. A complete V3 song is about 2.7 KiB and therefore each
 live value occupies most of one 4 KiB erase sector. A 1 MiB partition contains
 exactly 256 sectors, but the journal requires a next-page migration buffer. It
 therefore cannot operationally hold 256 one-sector live records and still
@@ -80,9 +89,10 @@ update or collect them. The 511-sector map holds all 256 live slots plus the
 required buffer while retaining substantial append/compaction workspace and
 distributing erases cyclically.
 
-The frozen Postcard/Serde V1 DTO stores the base interval, nine divisions,
-nine sample identifiers, nine 32-byte enable maps, nine sets of 256 trigger
-levels, global/per-pad latched mute, and master/per-pad volume. It is not
+The frozen Postcard/Serde V3 DTO stores the global Cycle length, nine Beats
+values, nine Pattern Cycles multipliers, nine optional per-pad Cycle-length
+overrides, nine sample identifiers, nine 32-byte enable maps, nine sets of 256
+trigger levels, global/per-pad latched mute, and master/per-pad volume. It is not
 `SharedState`: playback position, voices, scheduler and UI cursors, previews,
 momentary mute, brightness, dirty flags, adaptive-load state, and diagnostics
 are intentionally excluded. Nested 32-byte chunks keep serialization bounded
@@ -131,8 +141,8 @@ would. Recovery exposes either a complete previous value or a complete new
 value, never a mixture. Another test fills the actual 511-sector geometry with
 all 256 near-maximum records, overwrites and deletes entries, and reopens it.
 Synthetic metadata tests cover partial initialization and unknown layouts;
-codec tests cover old/new record versions, truncation, trailing data, and
-semantic corruption. End-to-end initialization cuts and abrupt cuts on
+codec tests cover v2 migration, current/unknown record versions, truncation,
+trailing data, and semantic corruption. End-to-end initialization cuts and abrupt cuts on
 physical hardware remain acceptance tests because host fault injection cannot
 model the W25Q64's analog behavior.
 

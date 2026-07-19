@@ -182,15 +182,20 @@ pub fn inspect_superblock(
     }
 
     let page = &sector[..FLASH_PROGRAM_BYTES];
+    let matches_uncommitted_descriptor = |expected: &[u8; FLASH_PROGRAM_BYTES]| {
+        page[SUPERBLOCK_COMMIT_OFFSET] == 0xff
+            && sector[SUPERBLOCK_COMMIT_OFFSET + 1..]
+                .iter()
+                .all(|byte| *byte == 0xff)
+            && page[..SUPERBLOCK_COMMIT_OFFSET]
+                .iter()
+                .zip(&expected[..SUPERBLOCK_COMMIT_OFFSET])
+                .all(|(&observed, &target)| observed & target == target)
+    };
     let expected = encode_superblock(expected_initial_song_format_version);
-    let is_exact_partial_descriptor = page[SUPERBLOCK_COMMIT_OFFSET] == 0xff
-        && sector[SUPERBLOCK_COMMIT_OFFSET + 1..]
-            .iter()
-            .all(|byte| *byte == 0xff)
-        && page[..SUPERBLOCK_COMMIT_OFFSET]
-            .iter()
-            .zip(&expected[..SUPERBLOCK_COMMIT_OFFSET])
-            .all(|(&observed, &target)| observed & target == target);
+    let is_exact_partial_descriptor = matches_uncommitted_descriptor(&expected)
+        || (expected_initial_song_format_version == crate::SONG_FORMAT_VERSION
+            && matches_uncommitted_descriptor(&encode_superblock(crate::SONG_FORMAT_V2)));
     if is_exact_partial_descriptor {
         return SuperblockStatus::Incomplete;
     }
@@ -743,6 +748,25 @@ mod tests {
             inspect_page(encode_superblock(2), 1),
             SuperblockStatus::Corrupt(SuperblockCorruption::UntrustedIncompleteDescriptor)
         );
+    }
+
+    #[test]
+    fn interrupted_v2_initialization_is_retryable_after_the_v3_upgrade() {
+        let descriptor = encode_superblock(crate::SONG_FORMAT_V2);
+        assert_eq!(
+            inspect_page(descriptor, crate::SONG_FORMAT_VERSION),
+            SuperblockStatus::Incomplete
+        );
+
+        for prefix_len in 1..=SUPERBLOCK_COMMIT_OFFSET {
+            let mut partial = [0xff; FLASH_PROGRAM_BYTES];
+            partial[..prefix_len].copy_from_slice(&descriptor[..prefix_len]);
+            assert_eq!(
+                inspect_page(partial, crate::SONG_FORMAT_VERSION),
+                SuperblockStatus::Incomplete,
+                "v2 partial prefix length {prefix_len}"
+            );
+        }
     }
 
     #[test]

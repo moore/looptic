@@ -34,8 +34,10 @@ pub const DEFAULT_TRIGGER_VOLUME_PERCENT: u8 = 100;
 pub const MUTE_TAP_THRESHOLD_MS: u64 = 300;
 pub const MUTE_LED_DIM_PERCENT: u8 = 20;
 pub const NONSELECTED_LED_SCALE_PERCENT: u8 = 20;
+pub const SELECTED_TRIGGER_COLOR_PERCENT: u8 = 20;
 pub const SAMPLE_COUNT: usize = 24;
 pub const SONG_SLOT_COUNT: usize = 256;
+pub const DEFAULT_PATTERN_REPEATS: u16 = 1;
 pub const PRIMARY_VOICE_COUNT: usize = 24;
 pub const FADE_TAIL_COUNT: usize = 9;
 pub const DECLICK_FRAMES: u8 = 32;
@@ -78,7 +80,8 @@ const fn coarse_dither_masks() -> [u16; PWM_DITHER_CYCLES as usize + 1] {
 /// Centered PWM command used while no PCM data is available.
 pub const SILENCE_PWM_WORD: u32 = 64 | (63 << 7);
 
-/// A persistent 256-slot map whose first `division` bits form the active pattern.
+/// A persistent 256-slot map whose active prefix is selected independently of
+/// the pad's tick cadence by its beat count and repeat multiplier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pattern {
     bits: [u8; PATTERN_BYTES],
@@ -231,6 +234,30 @@ pub fn pattern_step_index(step: u16, division: u16) -> Option<usize> {
         return None;
     }
     Some(usize::from(step))
+}
+
+pub const fn max_pattern_repeats(beats: u16) -> u16 {
+    if beats == 0 {
+        DEFAULT_PATTERN_REPEATS
+    } else {
+        MAX_BEAT_MULTIPLIER / beats
+    }
+}
+
+pub const fn effective_pattern_steps(beats: u16, repeats: u16) -> u16 {
+    if beats == 0 {
+        0
+    } else {
+        let maximum = max_pattern_repeats(beats);
+        let repeats = if repeats < 1 {
+            1
+        } else if repeats > maximum {
+            maximum
+        } else {
+            repeats
+        };
+        beats.saturating_mul(repeats)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,6 +518,8 @@ pub const fn sample_selection_preview_request(
 #[derive(Clone, Copy, Debug)]
 pub struct PadState {
     pub beats_per_interval: u16,
+    pattern_steps: u16,
+    cycle_length_ms: u32,
     pub tick_ordinal: u128,
     pub next_frame: Option<u64>,
     pub sample: SampleId,
@@ -509,6 +538,8 @@ impl PadState {
     const fn new(pad: usize) -> Self {
         Self {
             beats_per_interval: 0,
+            pattern_steps: 0,
+            cycle_length_ms: DEFAULT_BASE_INTERVAL_MS,
             tick_ordinal: 0,
             next_frame: None,
             sample: DEFAULT_PAD_SAMPLES[pad],
@@ -530,6 +561,7 @@ impl PadState {
         self.period_remainder = 0;
         self.deadline_error = 0;
         self.next_step = 0;
+        self.pattern_steps = 0;
     }
 
     /// Align this pad to the first global-grid tick strictly after `from_frame`.
@@ -537,7 +569,13 @@ impl PadState {
     /// Wide arithmetic is intentionally confined to timing changes. Once
     /// aligned, normal rendering advances deadlines with additions and
     /// comparisons only.
-    fn align_clock(&mut self, beats_per_interval: u16, base_interval_ms: u32, from_frame: u64) {
+    fn align_clock(
+        &mut self,
+        beats_per_interval: u16,
+        pattern_steps: u16,
+        base_interval_ms: u32,
+        from_frame: u64,
+    ) {
         debug_assert!(beats_per_interval != 0);
 
         let period_numerator = u64::from(SAMPLE_RATE) * u64::from(base_interval_ms);
@@ -555,7 +593,9 @@ impl PadState {
         self.whole_frames = period_numerator / u64::from(period_denominator);
         self.period_remainder = (period_numerator % u64::from(period_denominator)) as u32;
         self.deadline_error = deadline_error as u32;
-        self.next_step = ((ordinal - 1) % u128::from(beats_per_interval)) as u16;
+        self.pattern_steps = pattern_steps;
+        self.cycle_length_ms = base_interval_ms;
+        self.next_step = ((ordinal - 1) % u128::from(pattern_steps)) as u16;
     }
 
     /// Consume every tick due at `frame`, coalescing enabled triggers at the
@@ -645,7 +685,7 @@ impl PadState {
         self.next_frame = Some(deadline.wrapping_add(frame_delta));
         self.tick_ordinal = self.tick_ordinal.wrapping_add(1);
         self.next_step += 1;
-        if self.next_step == self.beats_per_interval {
+        if self.next_step == self.pattern_steps {
             self.next_step = 0;
         }
     }
@@ -679,7 +719,7 @@ impl PadState {
         trigger_volumes: &TriggerVolumes,
         due: u128,
     ) -> Option<u8> {
-        let division = self.beats_per_interval;
+        let division = self.pattern_steps;
         let unique_steps = if due >= u128::from(division) {
             division
         } else {
@@ -720,10 +760,10 @@ impl PadState {
         self.deadline_error = new_error as u32;
         self.tick_ordinal = self.tick_ordinal.wrapping_add(due);
 
-        let division = u128::from(self.beats_per_interval);
+        let division = u128::from(self.pattern_steps);
         let step_advance = (due % division) as u16;
         let next_step = u32::from(self.next_step) + u32::from(step_advance);
-        self.next_step = (next_step % u32::from(self.beats_per_interval)) as u16;
+        self.next_step = (next_step % u32::from(self.pattern_steps)) as u16;
     }
 }
 
@@ -1739,6 +1779,10 @@ impl<'a> Sequencer<'a> {
         &self.pads
     }
 
+    pub fn pad_cycle_length_ms(&self, pad: usize) -> Option<u32> {
+        self.pads.get(pad).map(|state| state.cycle_length_ms)
+    }
+
     pub const fn base_interval_ms(&self) -> u32 {
         self.base_interval_ms
     }
@@ -1883,21 +1927,73 @@ impl<'a> Sequencer<'a> {
         base_interval_ms: u32,
         from_frame: u64,
     ) {
-        let base_interval_ms = base_interval_ms.max(MIN_BASE_INTERVAL_MS);
-        let base_changed = self.base_interval_ms != base_interval_ms;
-        self.base_interval_ms = base_interval_ms;
+        self.apply_timing_with_repeats(
+            beats,
+            &[DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT],
+            base_interval_ms,
+            from_frame,
+        );
+    }
 
-        for (pad, requested) in self.pads.iter_mut().zip(beats.iter().copied()) {
+    pub fn apply_timing_with_repeats(
+        &mut self,
+        beats: &[u16; BEAT_PAD_COUNT],
+        repeats: &[u16; BEAT_PAD_COUNT],
+        base_interval_ms: u32,
+        from_frame: u64,
+    ) {
+        self.apply_timing_with_cycles(
+            beats,
+            repeats,
+            &[base_interval_ms; BEAT_PAD_COUNT],
+            base_interval_ms,
+            from_frame,
+        );
+    }
+
+    pub fn apply_timing_with_cycles(
+        &mut self,
+        beats: &[u16; BEAT_PAD_COUNT],
+        repeats: &[u16; BEAT_PAD_COUNT],
+        cycle_lengths_ms: &[u32; BEAT_PAD_COUNT],
+        global_cycle_length_ms: u32,
+        from_frame: u64,
+    ) {
+        self.base_interval_ms = global_cycle_length_ms.max(MIN_BASE_INTERVAL_MS);
+
+        for (((pad, requested), repeats), cycle_length_ms) in self
+            .pads
+            .iter_mut()
+            .zip(beats.iter().copied())
+            .zip(repeats.iter().copied())
+            .zip(cycle_lengths_ms.iter().copied())
+        {
             let beats_per_interval = requested.min(MAX_BEAT_MULTIPLIER);
-            if !base_changed && pad.beats_per_interval == beats_per_interval {
+            let pattern_steps = effective_pattern_steps(beats_per_interval, repeats);
+            let cycle_length_ms = cycle_length_ms.max(MIN_BASE_INTERVAL_MS);
+            let timing_changed = pad.beats_per_interval != beats_per_interval
+                || pad.cycle_length_ms != cycle_length_ms;
+            if !timing_changed && pad.pattern_steps == pattern_steps {
                 continue;
             }
 
-            pad.beats_per_interval = beats_per_interval;
             if beats_per_interval == 0 {
+                pad.beats_per_interval = 0;
+                pad.cycle_length_ms = cycle_length_ms;
                 pad.disable_clock();
+            } else if timing_changed {
+                pad.beats_per_interval = beats_per_interval;
+                pad.align_clock(
+                    beats_per_interval,
+                    pattern_steps,
+                    cycle_length_ms,
+                    from_frame,
+                );
             } else {
-                pad.align_clock(beats_per_interval, base_interval_ms, from_frame);
+                // Repeat-only edits change Pattern phase against the same
+                // global tick ordinal without moving the pending deadline.
+                pad.pattern_steps = pattern_steps;
+                pad.next_step = ((pad.tick_ordinal - 1) % u128::from(pattern_steps)) as u16;
             }
         }
     }
@@ -2255,6 +2351,8 @@ pub fn resolve_mute_scan(
 #[derive(Clone, Copy, Debug)]
 pub struct SharedState {
     pub desired_beats: [u16; BEAT_PAD_COUNT],
+    pattern_repeats: [u16; BEAT_PAD_COUNT],
+    pad_cycle_length_overrides_ms: [Option<u32>; BEAT_PAD_COUNT],
     pad_samples: [SampleId; BEAT_PAD_COUNT],
     pending_preview: Option<PreviewRequest>,
     pub base_interval_ms: u32,
@@ -2301,6 +2399,8 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             desired_beats: [0; BEAT_PAD_COUNT],
+            pattern_repeats: [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT],
+            pad_cycle_length_overrides_ms: [None; BEAT_PAD_COUNT],
             pad_samples: DEFAULT_PAD_SAMPLES,
             pending_preview: None,
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
@@ -2363,6 +2463,100 @@ impl SharedState {
         }
         if self.desired_beats[pad] != beats {
             self.desired_beats[pad] = beats;
+            self.pattern_repeats[pad] = self.pattern_repeats[pad].min(max_pattern_repeats(beats));
+            self.mark_song_changed();
+        }
+        true
+    }
+
+    pub const fn pattern_repeats(&self) -> &[u16; BEAT_PAD_COUNT] {
+        &self.pattern_repeats
+    }
+
+    pub fn pattern_repeat(&self, pad: usize) -> Option<u16> {
+        self.pattern_repeats.get(pad).copied()
+    }
+
+    pub fn effective_pattern_steps(&self, pad: usize) -> Option<u16> {
+        Some(effective_pattern_steps(
+            *self.desired_beats.get(pad)?,
+            *self.pattern_repeats.get(pad)?,
+        ))
+    }
+
+    pub fn set_pattern_repeat(&mut self, pad: usize, repeats: u16) -> bool {
+        let Some(current) = self.pattern_repeats.get_mut(pad) else {
+            return false;
+        };
+        let beats = self.desired_beats[pad];
+        let repeats = repeats.clamp(1, max_pattern_repeats(beats));
+        if *current != repeats {
+            *current = repeats;
+            self.mark_song_changed();
+        }
+        true
+    }
+
+    pub fn pad_uses_cycle_length_override(&self, pad: usize) -> Option<bool> {
+        self.pad_cycle_length_overrides_ms
+            .get(pad)
+            .map(Option::is_some)
+    }
+
+    pub fn pad_cycle_length_override_ms(&self, pad: usize) -> Option<u32> {
+        self.pad_cycle_length_overrides_ms
+            .get(pad)
+            .copied()
+            .flatten()
+    }
+
+    pub fn effective_cycle_length_ms(&self, pad: usize) -> Option<u32> {
+        Some(
+            self.pad_cycle_length_overrides_ms
+                .get(pad)?
+                .unwrap_or(self.base_interval_ms),
+        )
+    }
+
+    pub fn effective_cycle_lengths_ms(&self) -> [u32; BEAT_PAD_COUNT] {
+        core::array::from_fn(|pad| {
+            self.pad_cycle_length_overrides_ms[pad].unwrap_or(self.base_interval_ms)
+        })
+    }
+
+    pub fn set_pad_cycle_length_override_enabled(&mut self, pad: usize, enabled: bool) -> bool {
+        let Some(current) = self.pad_cycle_length_overrides_ms.get_mut(pad) else {
+            return false;
+        };
+        let next = if enabled {
+            Some(current.unwrap_or(self.base_interval_ms))
+        } else {
+            None
+        };
+        if *current != next {
+            *current = next;
+            self.mark_song_changed();
+        }
+        true
+    }
+
+    pub fn toggle_pad_cycle_length_override(&mut self, pad: usize) -> Option<bool> {
+        let enabled = !self.pad_uses_cycle_length_override(pad)?;
+        self.set_pad_cycle_length_override_enabled(pad, enabled)
+            .then_some(enabled)
+    }
+
+    /// Set a pad's Cycle length, using zero to follow the global Cycle length.
+    pub fn set_pad_cycle_length_ms(&mut self, pad: usize, cycle_length_ms: u32) -> bool {
+        if cycle_length_ms != 0 && cycle_length_ms < MIN_BASE_INTERVAL_MS {
+            return false;
+        }
+        let Some(current) = self.pad_cycle_length_overrides_ms.get_mut(pad) else {
+            return false;
+        };
+        let next = (cycle_length_ms != 0).then_some(cycle_length_ms);
+        if *current != next {
+            *current = next;
             self.mark_song_changed();
         }
         true
@@ -2400,6 +2594,8 @@ impl SharedState {
     /// brightness, the playback epoch, adaptive-load state, or diagnostics.
     pub fn reset_musical_state(&mut self) {
         self.desired_beats = [0; BEAT_PAD_COUNT];
+        self.pattern_repeats = [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT];
+        self.pad_cycle_length_overrides_ms = [None; BEAT_PAD_COUNT];
         self.pad_samples = DEFAULT_PAD_SAMPLES;
         self.pending_preview = None;
         self.base_interval_ms = DEFAULT_BASE_INTERVAL_MS;
@@ -2472,7 +2668,7 @@ impl SharedState {
                 (pad, changed, result)
             }
             PatternVolumeTarget::Step { pad, step } => {
-                pattern_step_index(step, self.desired_beats[pad])?;
+                pattern_step_index(step, self.effective_pattern_steps(pad)?)?;
                 let previous = self.trigger_volumes[pad].percent(usize::from(step))?;
                 let result = self.trigger_volumes[pad].adjust_step(usize::from(step), delta)?;
                 (pad, result != previous, result)
@@ -2487,7 +2683,7 @@ impl SharedState {
     }
 
     pub fn toggle_pattern_step(&mut self, pad: usize, step: u16) -> Option<bool> {
-        let division = *self.desired_beats.get(pad)?;
+        let division = self.effective_pattern_steps(pad)?;
         let enabled = self.patterns.get_mut(pad)?.toggle_step(step, division)?;
         self.pattern_dirty_mask |= 1 << pad;
         self.pattern_revision = self.pattern_revision.wrapping_add(1);
@@ -2920,62 +3116,106 @@ pub const SONG_SLOT_ANIMAL_NAMES: [&str; SONG_SLOT_COUNT] = [
 
 /// Versioned song-record envelope written inside the flash map value.
 pub const SONG_FORMAT_MAGIC: [u8; 4] = *b"LTSG";
-pub const SONG_FORMAT_VERSION: u16 = 1;
+/// Previous record version still decoded and migrated in memory.
+pub const SONG_FORMAT_V2: u16 = 2;
+pub const SONG_FORMAT_VERSION: u16 = 3;
 pub const SONG_FORMAT_HEADER_LEN: usize = 8;
-/// Number of pads encoded by the frozen V1 song schema.
-pub const SONG_V1_PAD_COUNT: usize = 9;
-/// Bytes in one V1 pattern-enable map.
-pub const SONG_V1_PATTERN_BYTES: usize = 32;
-/// Number of 32-byte trigger-level chunks encoded for one V1 pad.
-pub const SONG_V1_TRIGGER_LEVEL_CHUNKS: usize = 8;
-/// Exact encoded length of [`StoredSongV1::default`] with the pinned codec.
+/// Number of pads encoded by the frozen V2 song schema.
+pub const SONG_V2_PAD_COUNT: usize = 9;
+/// Bytes in one V2 pattern-enable map.
+pub const SONG_V2_PATTERN_BYTES: usize = 32;
+/// Number of 32-byte trigger-level chunks encoded for one V2 pad.
+pub const SONG_V2_TRIGGER_LEVEL_CHUNKS: usize = 8;
+/// Exact encoded length of [`StoredSongV2::default`] with the pinned codec.
 ///
 /// This is a schema regression sentinel, not the maximum possible record size.
-pub const SONG_V1_DEFAULT_ENCODED_LEN: usize = 2_640;
+pub const SONG_V2_DEFAULT_ENCODED_LEN: usize = 2_649;
+/// Number of pads encoded by the frozen V3 song schema.
+pub const SONG_V3_PAD_COUNT: usize = 9;
+/// Bytes in one V3 pattern-enable map.
+pub const SONG_V3_PATTERN_BYTES: usize = 32;
+/// Number of 32-byte trigger-level chunks encoded for one V3 pad.
+pub const SONG_V3_TRIGGER_LEVEL_CHUNKS: usize = 8;
+/// Exact encoded length of [`StoredSongV3::default`] with the pinned codec.
+///
+/// This is a schema regression sentinel, not the maximum possible record size.
+pub const SONG_V3_DEFAULT_ENCODED_LEN: usize = 2_658;
 /// Includes the eight-byte envelope. The current maximum encoded size is
 /// tested to fit. The spare buffer space is not permission to change the
-/// frozen V1 schema; incompatible fields require a new format version.
+/// frozen V3 schema; incompatible fields require a new format version.
 pub const SONG_ENCODED_MAX_LEN: usize = 3_072;
 
-/// Backward-compatible name for the frozen V1 trigger-level chunk count.
-pub const STORED_TRIGGER_LEVEL_CHUNKS: usize = SONG_V1_TRIGGER_LEVEL_CHUNKS;
+/// Backward-compatible name for the current frozen trigger-level chunk count.
+pub const STORED_TRIGGER_LEVEL_CHUNKS: usize = SONG_V3_TRIGGER_LEVEL_CHUNKS;
 
-// V1's serialized dimensions must never follow later runtime geometry changes.
+// V2's serialized dimensions must never follow later runtime geometry changes.
 // A runtime change must either preserve these conversion invariants or introduce
 // a new stored-song version with an explicit migration path.
 const _: () = {
-    assert!(BEAT_PAD_COUNT == SONG_V1_PAD_COUNT);
-    assert!(PATTERN_BYTES == SONG_V1_PATTERN_BYTES);
-    assert!(PATTERN_BITS == SONG_V1_PATTERN_BYTES * 8);
-    assert!(PATTERN_BITS == SONG_V1_PATTERN_BYTES * SONG_V1_TRIGGER_LEVEL_CHUNKS);
+    assert!(BEAT_PAD_COUNT == SONG_V2_PAD_COUNT);
+    assert!(PATTERN_BYTES == SONG_V2_PATTERN_BYTES);
+    assert!(PATTERN_BITS == SONG_V2_PATTERN_BYTES * 8);
+    assert!(PATTERN_BITS == SONG_V2_PATTERN_BYTES * SONG_V2_TRIGGER_LEVEL_CHUNKS);
+};
+
+// V3 retains V2's fixed pattern geometry and adds only per-pad Cycle timing.
+const _: () = {
+    assert!(BEAT_PAD_COUNT == SONG_V3_PAD_COUNT);
+    assert!(PATTERN_BYTES == SONG_V3_PATTERN_BYTES);
+    assert!(PATTERN_BITS == SONG_V3_PATTERN_BYTES * 8);
+    assert!(PATTERN_BITS == SONG_V3_PATTERN_BYTES * SONG_V3_TRIGGER_LEVEL_CHUNKS);
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct StoredPadV1 {
+pub struct StoredPadV2 {
     pub division: u16,
+    pub pattern_repeats: u16,
     pub sample_id: u8,
-    pub pattern: [u8; SONG_V1_PATTERN_BYTES],
-    pub trigger_levels: [[u8; SONG_V1_PATTERN_BYTES]; SONG_V1_TRIGGER_LEVEL_CHUNKS],
+    pub pattern: [u8; SONG_V2_PATTERN_BYTES],
+    pub trigger_levels: [[u8; SONG_V2_PATTERN_BYTES]; SONG_V2_TRIGGER_LEVEL_CHUNKS],
     pub mute: bool,
     pub volume_percent: u8,
 }
 
-/// Frozen schema for the first persistent LoopTic song format.
+/// Frozen schema for LoopTic song format version 2.
 ///
 /// Runtime state such as playback position, active voices, previews, UI
 /// cursors, brightness, and diagnostics is intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct StoredSongV1 {
+pub struct StoredSongV2 {
     pub base_interval_ms: u32,
     pub global_mute: bool,
     pub master_volume_percent: u8,
-    pub pads: [StoredPadV1; SONG_V1_PAD_COUNT],
+    pub pads: [StoredPadV2; SONG_V2_PAD_COUNT],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct StoredPadV3 {
+    pub division: u16,
+    pub pattern_repeats: u16,
+    pub cycle_length_override_ms: Option<u32>,
+    pub sample_id: u8,
+    pub pattern: [u8; SONG_V3_PATTERN_BYTES],
+    pub trigger_levels: [[u8; SONG_V3_PATTERN_BYTES]; SONG_V3_TRIGGER_LEVEL_CHUNKS],
+    pub mute: bool,
+    pub volume_percent: u8,
+}
+
+/// Frozen schema for LoopTic song format version 3.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct StoredSongV3 {
+    pub base_interval_ms: u32,
+    pub global_mute: bool,
+    pub master_volume_percent: u8,
+    pub pads: [StoredPadV3; SONG_V3_PAD_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SongValidationError {
     BaseIntervalTooShort { value: u32 },
     DivisionOutOfRange { pad: u8, value: u16 },
+    PatternRepeatsOutOfRange { pad: u8, value: u16, maximum: u16 },
+    CycleLengthOverrideTooShort { pad: u8, value: u32 },
     SampleOutOfRange { pad: u8, value: u8 },
     MasterVolumeOutOfRange { value: u8 },
     PadVolumeOutOfRange { pad: u8, value: u8 },
@@ -2999,18 +3239,20 @@ pub enum SongDecodeError {
     InvalidSong(SongValidationError),
 }
 
-impl StoredSongV1 {
+impl StoredSongV3 {
     pub fn snapshot(state: &SharedState) -> Self {
         let pads = core::array::from_fn(|pad| {
-            let mut trigger_levels = [[0_u8; SONG_V1_PATTERN_BYTES]; SONG_V1_TRIGGER_LEVEL_CHUNKS];
+            let mut trigger_levels = [[0_u8; SONG_V3_PATTERN_BYTES]; SONG_V3_TRIGGER_LEVEL_CHUNKS];
             for (chunk_index, chunk) in trigger_levels.iter_mut().enumerate() {
-                let start = chunk_index * SONG_V1_PATTERN_BYTES;
+                let start = chunk_index * SONG_V3_PATTERN_BYTES;
                 chunk.copy_from_slice(
-                    &state.trigger_volumes[pad].percents[start..start + SONG_V1_PATTERN_BYTES],
+                    &state.trigger_volumes[pad].percents[start..start + SONG_V3_PATTERN_BYTES],
                 );
             }
-            StoredPadV1 {
+            StoredPadV3 {
                 division: state.desired_beats[pad],
+                pattern_repeats: state.pattern_repeats[pad],
+                cycle_length_override_ms: state.pad_cycle_length_overrides_ms[pad],
                 sample_id: state.pad_samples[pad].index() as u8,
                 pattern: state.patterns[pad].bits,
                 trigger_levels,
@@ -3045,6 +3287,19 @@ impl StoredSongV1 {
                     value: stored.division,
                 });
             }
+            let maximum = max_pattern_repeats(stored.division);
+            if stored.pattern_repeats == 0 || stored.pattern_repeats > maximum {
+                return Err(SongValidationError::PatternRepeatsOutOfRange {
+                    pad,
+                    value: stored.pattern_repeats,
+                    maximum,
+                });
+            }
+            if let Some(value) = stored.cycle_length_override_ms
+                && value < MIN_BASE_INTERVAL_MS
+            {
+                return Err(SongValidationError::CycleLengthOverrideTooShort { pad, value });
+            }
             if usize::from(stored.sample_id) >= SAMPLE_COUNT {
                 return Err(SongValidationError::SampleOutOfRange {
                     pad,
@@ -3062,7 +3317,7 @@ impl StoredSongV1 {
                     if value > 100 {
                         return Err(SongValidationError::TriggerVolumeOutOfRange {
                             pad,
-                            step: (chunk_index * SONG_V1_PATTERN_BYTES + offset) as u16,
+                            step: (chunk_index * SONG_V3_PATTERN_BYTES + offset) as u16,
                             value,
                         });
                     }
@@ -3090,8 +3345,8 @@ impl StoredSongV1 {
             };
             let mut percents = [0_u8; PATTERN_BITS];
             for (chunk_index, chunk) in stored.trigger_levels.iter().enumerate() {
-                let start = chunk_index * SONG_V1_PATTERN_BYTES;
-                percents[start..start + SONG_V1_PATTERN_BYTES].copy_from_slice(chunk);
+                let start = chunk_index * SONG_V3_PATTERN_BYTES;
+                percents[start..start + SONG_V3_PATTERN_BYTES].copy_from_slice(chunk);
             }
             let sum = percents.iter().map(|&value| u32::from(value)).sum();
             trigger_volumes[pad] = TriggerVolumes { percents, sum };
@@ -3100,6 +3355,9 @@ impl StoredSongV1 {
         }
 
         state.desired_beats = core::array::from_fn(|pad| self.pads[pad].division);
+        state.pattern_repeats = core::array::from_fn(|pad| self.pads[pad].pattern_repeats);
+        state.pad_cycle_length_overrides_ms =
+            core::array::from_fn(|pad| self.pads[pad].cycle_length_override_ms);
         state.pad_samples = samples;
         state.pending_preview = None;
         state.base_interval_ms = self.base_interval_ms;
@@ -3119,18 +3377,94 @@ impl StoredSongV1 {
     }
 }
 
-impl Default for StoredSongV1 {
+impl Default for StoredSongV3 {
     fn default() -> Self {
         Self::snapshot(&SharedState::default())
     }
 }
 
-/// Encode one validated V1 song into a self-describing, allocation-free value.
-pub fn encode_song_v1<'a>(
-    song: &StoredSongV1,
+impl StoredSongV2 {
+    pub fn snapshot(state: &SharedState) -> Self {
+        StoredSongV3::snapshot(state).into()
+    }
+
+    pub fn validate(&self) -> Result<(), SongValidationError> {
+        StoredSongV3::from(self.clone()).validate()
+    }
+
+    pub fn into_v3(self) -> StoredSongV3 {
+        self.into()
+    }
+}
+
+impl Default for StoredSongV2 {
+    fn default() -> Self {
+        Self::snapshot(&SharedState::default())
+    }
+}
+
+impl From<StoredSongV2> for StoredSongV3 {
+    fn from(song: StoredSongV2) -> Self {
+        Self {
+            base_interval_ms: song.base_interval_ms,
+            global_mute: song.global_mute,
+            master_volume_percent: song.master_volume_percent,
+            pads: song.pads.map(|pad| StoredPadV3 {
+                division: pad.division,
+                pattern_repeats: pad.pattern_repeats,
+                cycle_length_override_ms: None,
+                sample_id: pad.sample_id,
+                pattern: pad.pattern,
+                trigger_levels: pad.trigger_levels,
+                mute: pad.mute,
+                volume_percent: pad.volume_percent,
+            }),
+        }
+    }
+}
+
+impl From<StoredSongV3> for StoredSongV2 {
+    fn from(song: StoredSongV3) -> Self {
+        Self {
+            base_interval_ms: song.base_interval_ms,
+            global_mute: song.global_mute,
+            master_volume_percent: song.master_volume_percent,
+            pads: song.pads.map(|pad| StoredPadV2 {
+                division: pad.division,
+                pattern_repeats: pad.pattern_repeats,
+                sample_id: pad.sample_id,
+                pattern: pad.pattern,
+                trigger_levels: pad.trigger_levels,
+                mute: pad.mute,
+                volume_percent: pad.volume_percent,
+            }),
+        }
+    }
+}
+
+/// Encode one validated V2 song into a self-describing, allocation-free value.
+pub fn encode_song_v2<'a>(
+    song: &StoredSongV2,
     output: &'a mut [u8],
 ) -> Result<&'a [u8], SongEncodeError> {
     song.validate().map_err(SongEncodeError::InvalidSong)?;
+    encode_song_envelope(song, SONG_FORMAT_V2, output)
+}
+
+/// Encode one validated V3 song into a self-describing, allocation-free value.
+pub fn encode_song_v3<'a>(
+    song: &StoredSongV3,
+    output: &'a mut [u8],
+) -> Result<&'a [u8], SongEncodeError> {
+    song.validate().map_err(SongEncodeError::InvalidSong)?;
+    encode_song_envelope(song, SONG_FORMAT_VERSION, output)
+}
+
+fn encode_song_envelope<'a>(
+    song: &impl serde::Serialize,
+    version: u16,
+    output: &'a mut [u8],
+) -> Result<&'a [u8], SongEncodeError> {
     if output.len() < SONG_FORMAT_HEADER_LEN {
         return Err(SongEncodeError::BufferTooSmall);
     }
@@ -3139,14 +3473,14 @@ pub fn encode_song_v1<'a>(
         .len();
     let payload_len = u16::try_from(payload_len).map_err(|_| SongEncodeError::PayloadTooLarge)?;
     output[..4].copy_from_slice(&SONG_FORMAT_MAGIC);
-    output[4..6].copy_from_slice(&SONG_FORMAT_VERSION.to_le_bytes());
+    output[4..6].copy_from_slice(&version.to_le_bytes());
     output[6..8].copy_from_slice(&payload_len.to_le_bytes());
     Ok(&output[..SONG_FORMAT_HEADER_LEN + usize::from(payload_len)])
 }
 
 /// Decode a song envelope and report unsupported schema versions separately
 /// from corruption, truncation, and semantically invalid values.
-pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV1, SongDecodeError> {
+pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV3, SongDecodeError> {
     if bytes.len() < SONG_FORMAT_HEADER_LEN {
         return Err(SongDecodeError::Truncated);
     }
@@ -3155,7 +3489,7 @@ pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV1, SongDecodeError> {
         return Err(SongDecodeError::BadMagic { found: found_magic });
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != SONG_FORMAT_VERSION {
+    if version != SONG_FORMAT_V2 && version != SONG_FORMAT_VERSION {
         return Err(SongDecodeError::UnsupportedVersion {
             found: version,
             supported: SONG_FORMAT_VERSION,
@@ -3169,12 +3503,22 @@ pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV1, SongDecodeError> {
     if actual != usize::from(declared) {
         return Err(SongDecodeError::LengthMismatch { declared, actual });
     }
-    let (song, remainder): (StoredSongV1, &[u8]) =
-        postcard::take_from_bytes(&bytes[SONG_FORMAT_HEADER_LEN..])
-            .map_err(|_| SongDecodeError::InvalidPayload)?;
-    if !remainder.is_empty() {
-        return Err(SongDecodeError::InvalidPayload);
-    }
+    let payload = &bytes[SONG_FORMAT_HEADER_LEN..];
+    let song = if version == SONG_FORMAT_V2 {
+        let (song, remainder): (StoredSongV2, &[u8]) =
+            postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
+        if !remainder.is_empty() {
+            return Err(SongDecodeError::InvalidPayload);
+        }
+        song.into_v3()
+    } else {
+        let (song, remainder): (StoredSongV3, &[u8]) =
+            postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
+        if !remainder.is_empty() {
+            return Err(SongDecodeError::InvalidPayload);
+        }
+        song
+    };
     song.validate().map_err(SongDecodeError::InvalidSong)?;
     Ok(song)
 }
@@ -3276,6 +3620,7 @@ impl VoiceSelection {
 pub enum RootMode {
     #[default]
     Beats,
+    CycleLength,
     Pattern,
     Sample,
     Light,
@@ -3285,8 +3630,9 @@ pub enum RootMode {
 }
 
 impl RootMode {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Beats,
+        Self::CycleLength,
         Self::Pattern,
         Self::Sample,
         Self::Light,
@@ -3322,6 +3668,7 @@ pub enum UiPage {
     Root,
     Pattern,
     Beats,
+    CycleLength,
     Sample,
     Light,
     Songs,
@@ -3574,10 +3921,13 @@ pub enum UiEncoderTarget {
     PatternVolume(PatternVolumeTarget),
     Root,
     Pattern(usize),
+    PatternRepeat(usize),
     PatternAll(usize),
     PatternNone,
-    BeatsGlobal,
+    BeatsNone,
     BeatsPad(usize),
+    CycleGlobal,
+    CyclePadLength(usize),
     Sample(Option<usize>),
     Light,
     Songs,
@@ -3611,6 +3961,9 @@ pub enum UiDisplayModel {
         target: PatternVolumeTarget,
     },
     PatternSelectVoice,
+    PatternRepeat {
+        pad: usize,
+    },
     PatternEditor {
         pad: usize,
         cursor: u16,
@@ -3619,8 +3972,12 @@ pub enum UiDisplayModel {
         pad: usize,
         choice: PatternAllChoice,
     },
-    BeatsGlobal,
+    BeatsSelectVoice,
     BeatsPad {
+        pad: usize,
+    },
+    CycleGlobal,
+    CyclePadLength {
         pad: usize,
     },
     SampleSelectVoice,
@@ -3661,6 +4018,7 @@ pub struct UiController {
     root_mode: RootMode,
     selection: VoiceSelection,
     pattern_cursors: [u16; BEAT_PAD_COUNT],
+    pattern_repeat_editor: Option<usize>,
     pattern_all_menu: Option<PatternAllMenu>,
     reset_choice: ResetAllChoice,
     songs_view: SongsView,
@@ -3676,6 +4034,7 @@ impl UiController {
             root_mode: RootMode::Beats,
             selection: VoiceSelection::new(),
             pattern_cursors: [0; BEAT_PAD_COUNT],
+            pattern_repeat_editor: None,
             pattern_all_menu: None,
             reset_choice: ResetAllChoice::Cancel,
             songs_view: SongsView::Operations {
@@ -3710,6 +4069,7 @@ impl UiController {
         }
         if self.selection != before {
             self.pattern_all_menu = None;
+            self.pattern_repeat_editor = None;
         }
         true
     }
@@ -3729,6 +4089,7 @@ impl UiController {
         self.page = match self.root_mode {
             RootMode::Pattern => UiPage::Pattern,
             RootMode::Beats => UiPage::Beats,
+            RootMode::CycleLength => UiPage::CycleLength,
             RootMode::Sample => UiPage::Sample,
             RootMode::Light => UiPage::Light,
             RootMode::Save => UiPage::Root,
@@ -3784,7 +4145,7 @@ impl UiController {
         let Some(cursor) = self.pattern_cursors.get_mut(pad) else {
             return false;
         };
-        *cursor = (*cursor).min(division.min(MAX_BEAT_MULTIPLIER));
+        *cursor = (*cursor).min(division);
         true
     }
 
@@ -3802,6 +4163,9 @@ impl UiController {
 
     pub fn rotate_pattern(&mut self, pad: usize, division: u16, delta: i32) {
         if self.page != UiPage::Pattern || Some(pad) != self.selected_pad() {
+            return;
+        }
+        if self.pattern_repeat_editor == Some(pad) {
             return;
         }
         if let Some(menu) = &mut self.pattern_all_menu {
@@ -3887,7 +4251,7 @@ impl UiController {
                     None
                 }
             }
-            UiPage::Beats | UiPage::Sample | UiPage::Light => None,
+            UiPage::Beats | UiPage::CycleLength | UiPage::Sample | UiPage::Light => None,
         }
     }
 
@@ -3995,7 +4359,11 @@ impl UiController {
             return None;
         }
         let pad = self.selected_pad()?;
-        let division = selected_division?.min(MAX_BEAT_MULTIPLIER);
+        let division = selected_division?;
+        if self.pattern_repeat_editor == Some(pad) {
+            self.pattern_repeat_editor = None;
+            return Some(UiAction::Pattern(PatternEditorAction::RepeatEditorClosed));
+        }
         self.clamp_pattern_cursor(pad, division);
         if let Some(menu) = self.pattern_all_menu.take() {
             let action = if menu.pad != pad || menu.choice == PatternAllChoice::Cancel {
@@ -4010,6 +4378,9 @@ impl UiController {
         }
         let cursor = self.pattern_cursors[pad];
         if cursor == 0 {
+            self.pattern_repeat_editor = Some(pad);
+            Some(UiAction::Pattern(PatternEditorAction::RepeatEditorOpened))
+        } else if cursor == 1 {
             self.pattern_all_menu = Some(PatternAllMenu {
                 pad,
                 choice: PatternAllChoice::Cancel,
@@ -4018,7 +4389,7 @@ impl UiController {
         } else {
             Some(UiAction::Pattern(PatternEditorAction::Toggle {
                 pad,
-                step: cursor - 1,
+                step: cursor - 2,
             }))
         }
     }
@@ -4038,14 +4409,20 @@ impl UiController {
         match self.page {
             UiPage::Root => UiEncoderTarget::Root,
             UiPage::Pattern => match self.selected_pad() {
+                Some(pad) if self.pattern_repeat_editor == Some(pad) => {
+                    UiEncoderTarget::PatternRepeat(pad)
+                }
                 Some(pad) if self.pattern_all_menu.is_some() => UiEncoderTarget::PatternAll(pad),
                 Some(pad) => UiEncoderTarget::Pattern(pad),
                 None => UiEncoderTarget::PatternNone,
             },
-            UiPage::Beats => match self.selected_pad() {
-                Some(pad) => UiEncoderTarget::BeatsPad(pad),
-                None => UiEncoderTarget::BeatsGlobal,
-            },
+            UiPage::Beats => self
+                .selected_pad()
+                .map_or(UiEncoderTarget::BeatsNone, UiEncoderTarget::BeatsPad),
+            UiPage::CycleLength => self.selected_pad().map_or(
+                UiEncoderTarget::CycleGlobal,
+                UiEncoderTarget::CyclePadLength,
+            ),
             UiPage::Sample => UiEncoderTarget::Sample(self.selected_pad()),
             UiPage::Light => UiEncoderTarget::Light,
             UiPage::Songs => UiEncoderTarget::Songs,
@@ -4083,6 +4460,9 @@ impl UiController {
                 song_dirty: library.dirty,
             },
             UiPage::Pattern => match self.selected_pad() {
+                Some(pad) if self.pattern_repeat_editor == Some(pad) => {
+                    UiDisplayModel::PatternRepeat { pad }
+                }
                 Some(pad) => match self.pattern_all_menu {
                     Some(menu) => UiDisplayModel::PatternAll {
                         pad,
@@ -4097,7 +4477,11 @@ impl UiController {
             },
             UiPage::Beats => match self.selected_pad() {
                 Some(pad) => UiDisplayModel::BeatsPad { pad },
-                None => UiDisplayModel::BeatsGlobal,
+                None => UiDisplayModel::BeatsSelectVoice,
+            },
+            UiPage::CycleLength => match self.selected_pad() {
+                Some(pad) => UiDisplayModel::CyclePadLength { pad },
+                None => UiDisplayModel::CycleGlobal,
             },
             UiPage::Sample => match self.selected_pad() {
                 Some(pad) => UiDisplayModel::SamplePad { pad },
@@ -4141,13 +4525,15 @@ impl UiController {
             return None;
         };
         let cursor = self.pattern_cursors[pad];
-        if cursor == 0 {
+        if cursor == 1 {
             Some(PatternVolumeTarget::All { pad })
-        } else {
+        } else if cursor >= 2 {
             Some(PatternVolumeTarget::Step {
                 pad,
-                step: cursor - 1,
+                step: cursor - 2,
             })
+        } else {
+            None
         }
     }
 
@@ -4156,6 +4542,11 @@ impl UiController {
     /// already at the root clears it. Every key or encoder push already held
     /// is suppressed until its release.
     pub fn return_to_root(&mut self, held_keys: u16, encoder_held: bool) {
+        if self.pattern_repeat_editor.take().is_some() {
+            self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
+            self.encoder_suppressed = encoder_held;
+            return;
+        }
         let clear_selection = self.page == UiPage::Root;
         self.page = UiPage::Root;
         if clear_selection {
@@ -4285,6 +4676,41 @@ pub fn adjust_base_interval(current_ms: u32, delta_steps: i32) -> u32 {
     }
 }
 
+/// Adjust a per-pad Cycle length where zero means “follow Global.”
+///
+/// The editable domain is zero plus every value at or above the 50 ms safety
+/// minimum. Moving clockwise from zero enters that range at the minimum;
+/// moving counter-clockwise below the minimum returns directly to zero.
+pub fn adjust_pad_cycle_length(current_ms: u32, delta_steps: i32) -> u32 {
+    if delta_steps == 0 {
+        return current_ms;
+    }
+    if current_ms < MIN_BASE_INTERVAL_MS {
+        return if delta_steps.is_negative() {
+            0
+        } else {
+            MIN_BASE_INTERVAL_MS.saturating_add(
+                delta_steps
+                    .unsigned_abs()
+                    .saturating_sub(1)
+                    .saturating_mul(BASE_INTERVAL_STEP_MS),
+            )
+        };
+    }
+
+    let delta_ms = delta_steps
+        .unsigned_abs()
+        .saturating_mul(BASE_INTERVAL_STEP_MS);
+    if delta_steps.is_negative() {
+        current_ms
+            .checked_sub(delta_ms)
+            .filter(|value| *value >= MIN_BASE_INTERVAL_MS)
+            .unwrap_or(0)
+    } else {
+        current_ms.saturating_add(delta_ms)
+    }
+}
+
 pub fn adjust_led_brightness(current_percent: u8, delta: i32) -> u8 {
     i32::from(current_percent)
         .saturating_add(delta)
@@ -4299,6 +4725,8 @@ pub fn adjust_volume_percent(current_percent: u8, delta: i32) -> u8 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternEditorAction {
+    RepeatEditorOpened,
+    RepeatEditorClosed,
     AllMenuOpened,
     AllMenuCancelled,
     SetAll { pad: usize, enabled: bool },
@@ -4426,6 +4854,23 @@ pub fn scale_color(color: (u8, u8, u8), brightness_percent: u8) -> (u8, u8, u8) 
     (scale(color.0), scale(color.1), scale(color.2))
 }
 
+/// Blend a trigger flash into the selected-pad white indicator. Keeping the
+/// trigger contribution small ensures a fast, effectively continuous trigger
+/// still reads primarily as selected rather than replacing white altogether.
+pub fn selected_trigger_color(trigger_color: (u8, u8, u8)) -> (u8, u8, u8) {
+    let trigger_weight = u16::from(SELECTED_TRIGGER_COLOR_PERCENT);
+    let selected_weight = 100 - trigger_weight;
+    let blend = |trigger: u8| {
+        ((u16::from(u8::MAX) * selected_weight + u16::from(trigger) * trigger_weight + 50) / 100)
+            as u8
+    };
+    (
+        blend(trigger_color.0),
+        blend(trigger_color.1),
+        blend(trigger_color.2),
+    )
+}
+
 /// Red mute-control LED, scaled by the configured brightness. Active mute is
 /// shown at a fixed fraction of the unmuted red level.
 pub fn mute_led_color(muted: bool, brightness_percent: u8) -> (u8, u8, u8) {
@@ -4475,7 +4920,9 @@ pub fn voice_led_color(
     light_preview: bool,
 ) -> (u8, u8, u8) {
     let palette = colorwheel((21 * pad) as u8);
-    let base_color = if trigger_active {
+    let base_color = if selected && trigger_active {
+        selected_trigger_color(palette)
+    } else if trigger_active {
         palette
     } else if selected {
         (u8::MAX, u8::MAX, u8::MAX)
@@ -5095,7 +5542,7 @@ mod tests {
                 for from_frame in starts {
                     let mut actual = PadState::new(0);
                     actual.beats_per_interval = division;
-                    actual.align_clock(division, base_interval_ms, from_frame);
+                    actual.align_clock(division, division, base_interval_ms, from_frame);
                     let mut reference =
                         ReferencePadClock::aligned(division, base_interval_ms, from_frame);
 
@@ -5129,7 +5576,7 @@ mod tests {
         for division in 1..=MAX_BEAT_MULTIPLIER {
             let mut clock = PadState::new(0);
             clock.beats_per_interval = division;
-            clock.align_clock(division, DEFAULT_BASE_INTERVAL_MS, 0);
+            clock.align_clock(division, division, DEFAULT_BASE_INTERVAL_MS, 0);
 
             for expected_step in 0..division {
                 assert_eq!(clock.next_step, expected_step, "division={division}");
@@ -5146,6 +5593,147 @@ mod tests {
     }
 
     #[test]
+    fn repeat_multiplier_expands_pattern_without_changing_tick_cadence() {
+        assert_eq!(max_pattern_repeats(0), 1);
+        assert_eq!(max_pattern_repeats(3), 85);
+        assert_eq!(effective_pattern_steps(3, 2), 6);
+
+        let mut sequencer = test_sequencer(KICK_WAV, HAT_WAV);
+        let mut beats = [0_u16; BEAT_PAD_COUNT];
+        let mut repeats = [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT];
+        beats[0] = 3;
+        repeats[0] = 2;
+        sequencer.apply_timing_with_repeats(&beats, &repeats, 1_000, 0);
+        assert_eq!(sequencer.pads[0].beats_per_interval, 3);
+        assert_eq!(sequencer.pads[0].pattern_steps, 6);
+        let deadline = sequencer.pads[0].next_frame;
+
+        repeats[0] = 3;
+        sequencer.apply_timing_with_repeats(&beats, &repeats, 1_000, 1);
+        assert_eq!(sequencer.pads[0].pattern_steps, 9);
+        assert_eq!(sequencer.pads[0].next_frame, deadline);
+
+        let mut clock = PadState::new(0);
+        clock.beats_per_interval = 3;
+        clock.align_clock(3, 6, 1_000, 0);
+        let mut pattern = Pattern::all_enabled();
+        pattern.fill(false);
+        assert!(pattern.set_bit(3, true));
+        for expected in [false, false, false, true, false, false] {
+            let frame = clock.next_frame.unwrap();
+            assert_eq!(clock.take_due(frame, &pattern), expected);
+        }
+        assert_eq!(clock.next_step, 0);
+    }
+
+    #[test]
+    fn repeat_multiplier_fast_forward_preserves_pattern_phase_across_frame_wrap() {
+        const BEATS: u16 = 3;
+        const PATTERN_STEPS: u16 = 6;
+        let pattern = Pattern::all_enabled();
+
+        for from_frame in [0, u64::MAX - 10_000] {
+            let mut clock = PadState::new(0);
+            clock.beats_per_interval = BEATS;
+            clock.align_clock(BEATS, PATTERN_STEPS, DEFAULT_BASE_INTERVAL_MS, from_frame);
+            assert_eq!(clock.period_remainder, 0);
+
+            let ordinal_before = clock.tick_ordinal;
+            let overdue_frame = clock
+                .next_frame
+                .unwrap()
+                .wrapping_add(clock.whole_frames * 3);
+            assert!(clock.take_due(overdue_frame, &pattern));
+            assert_eq!(clock.tick_ordinal, ordinal_before + 4);
+            assert_eq!(
+                clock.next_step,
+                ((clock.tick_ordinal - 1) % u128::from(PATTERN_STEPS)) as u16
+            );
+        }
+    }
+
+    #[test]
+    fn beat_changes_clamp_repeats_without_erasing_hidden_slots() {
+        let mut state = SharedState::default();
+        assert!(state.set_desired_beats(0, 3));
+        assert!(state.set_pattern_repeat(0, 80));
+        assert_eq!(state.effective_pattern_steps(0), Some(240));
+        assert_eq!(state.toggle_pattern_step(0, 200), Some(false));
+        assert!(state.set_desired_beats(0, 128));
+        assert_eq!(state.pattern_repeat(0), Some(2));
+        assert_eq!(state.effective_pattern_steps(0), Some(256));
+        assert_eq!(state.pattern(0).unwrap().bit(200), Some(false));
+        assert!(state.set_desired_beats(0, 200));
+        assert_eq!(state.pattern_repeat(0), Some(1));
+        assert_eq!(state.pattern(0).unwrap().bit(200), Some(false));
+    }
+
+    #[test]
+    fn shared_cycle_length_zero_follows_global_and_nonzero_sets_an_override() {
+        let mut state = SharedState::default();
+        assert_eq!(state.pad_uses_cycle_length_override(0), Some(false));
+        assert_eq!(state.pad_cycle_length_override_ms(0), None);
+        assert_eq!(
+            state.effective_cycle_length_ms(0),
+            Some(DEFAULT_BASE_INTERVAL_MS)
+        );
+        assert_eq!(
+            state.effective_cycle_lengths_ms(),
+            [DEFAULT_BASE_INTERVAL_MS; BEAT_PAD_COUNT]
+        );
+        assert_eq!(state.effective_cycle_length_ms(BEAT_PAD_COUNT), None);
+        assert!(!state.set_pad_cycle_length_override_enabled(BEAT_PAD_COUNT, true));
+        assert_eq!(state.toggle_pad_cycle_length_override(BEAT_PAD_COUNT), None);
+        assert!(!state.set_pad_cycle_length_ms(BEAT_PAD_COUNT, 0));
+        assert!(!state.set_pad_cycle_length_ms(BEAT_PAD_COUNT, MIN_BASE_INTERVAL_MS));
+        assert!(!state.set_pad_cycle_length_ms(0, MIN_BASE_INTERVAL_MS - 1));
+        assert!(state.set_pad_cycle_length_ms(0, 0));
+        assert_eq!(state.song_revision, 0);
+
+        assert!(state.set_pad_cycle_length_ms(0, MIN_BASE_INTERVAL_MS));
+        assert_eq!(
+            state.pad_cycle_length_override_ms(0),
+            Some(MIN_BASE_INTERVAL_MS)
+        );
+        assert_eq!(
+            state.effective_cycle_length_ms(0),
+            Some(MIN_BASE_INTERVAL_MS)
+        );
+        assert_eq!(state.song_revision, 1);
+        assert!(state.set_pad_cycle_length_ms(0, MIN_BASE_INTERVAL_MS));
+        assert_eq!(state.song_revision, 1);
+
+        assert!(state.set_base_interval_ms(2_000));
+        assert_eq!(
+            state.effective_cycle_length_ms(0),
+            Some(MIN_BASE_INTERVAL_MS)
+        );
+        assert_eq!(state.effective_cycle_length_ms(1), Some(2_000));
+        assert_eq!(state.song_revision, 2);
+
+        assert!(state.set_pad_cycle_length_ms(0, 3_000));
+        assert_eq!(state.effective_cycle_length_ms(0), Some(3_000));
+        assert_eq!(state.song_revision, 3);
+        assert!(!state.set_pad_cycle_length_ms(0, MIN_BASE_INTERVAL_MS - 1));
+        assert_eq!(state.effective_cycle_length_ms(0), Some(3_000));
+        assert_eq!(state.song_revision, 3);
+
+        assert!(state.set_pad_cycle_length_ms(0, 0));
+        assert_eq!(state.pad_cycle_length_override_ms(0), None);
+        assert_eq!(state.effective_cycle_length_ms(0), Some(2_000));
+        assert_eq!(state.song_revision, 4);
+        assert!(state.set_pad_cycle_length_ms(0, 0));
+        assert_eq!(state.song_revision, 4);
+
+        assert!(state.set_pad_cycle_length_override_enabled(0, true));
+        assert_eq!(state.pad_cycle_length_override_ms(0), Some(2_000));
+        assert_eq!(state.song_revision, 5);
+        assert_eq!(state.toggle_pad_cycle_length_override(0), Some(false));
+        assert_eq!(state.pad_cycle_length_override_ms(0), None);
+        assert_eq!(state.song_revision, 6);
+    }
+
+    #[test]
     fn division_256_uses_slot_255_then_wraps_to_slot_zero_with_its_own_gain() {
         let mut pattern = Pattern::default();
         pattern.fill(false);
@@ -5158,7 +5746,12 @@ mod tests {
 
         let mut clock = PadState::new(0);
         clock.beats_per_interval = MAX_BEAT_MULTIPLIER;
-        clock.align_clock(MAX_BEAT_MULTIPLIER, DENSE_TEST_INTERVAL_MS, 0);
+        clock.align_clock(
+            MAX_BEAT_MULTIPLIER,
+            MAX_BEAT_MULTIPLIER,
+            DENSE_TEST_INTERVAL_MS,
+            0,
+        );
         let through_wrap = frame_for_tick(
             u128::from(MAX_BEAT_MULTIPLIER) + 1,
             MAX_BEAT_MULTIPLIER,
@@ -5198,7 +5791,7 @@ mod tests {
         let base_interval_ms = MIN_BASE_INTERVAL_MS;
         let mut actual = PadState::new(0);
         actual.beats_per_interval = division;
-        actual.align_clock(division, base_interval_ms, 0);
+        actual.align_clock(division, division, base_interval_ms, 0);
         let mut reference = ReferencePadClock::aligned(division, base_interval_ms, 0);
 
         // Every jump after the first takes the bounded fast-forward path. The
@@ -5222,7 +5815,7 @@ mod tests {
         let from_frame = u64::MAX - 1_000;
         let mut actual = PadState::new(0);
         actual.beats_per_interval = division;
-        actual.align_clock(division, base_interval_ms, from_frame);
+        actual.align_clock(division, division, base_interval_ms, from_frame);
         let mut reference = ReferencePadClock::aligned(division, base_interval_ms, from_frame);
 
         for frame in [from_frame, u64::MAX - 10, 0, 1_024] {
@@ -5323,6 +5916,52 @@ mod tests {
         sequencer.apply_timing(&beats, 500, 11_025);
         assert_eq!(sequencer.pads()[0].next_frame, Some(22_050));
         assert_eq!(sequencer.pads()[1].next_frame, None);
+    }
+
+    #[test]
+    fn per_pad_cycle_lengths_schedule_independently_and_realign_selectively() {
+        let mut sequencer = test_sequencer(KICK_WAV, HAT_WAV);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        let mut repeats = [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT];
+        let mut cycle_lengths = [1_000; BEAT_PAD_COUNT];
+        beats[0] = 1;
+        beats[1] = 1;
+        cycle_lengths[1] = 500;
+
+        sequencer.apply_timing_with_cycles(&beats, &repeats, &cycle_lengths, 1_000, 0);
+        assert_eq!(sequencer.base_interval_ms(), 1_000);
+        assert_eq!(sequencer.pad_cycle_length_ms(0), Some(1_000));
+        assert_eq!(sequencer.pad_cycle_length_ms(1), Some(500));
+        assert_eq!(sequencer.pads()[0].next_frame, Some(22_050));
+        assert_eq!(sequencer.pads()[1].next_frame, Some(11_025));
+
+        let own_deadline = sequencer.pads()[1].next_frame;
+        let own_ordinal = sequencer.pads()[1].tick_ordinal;
+        let own_step = sequencer.pads()[1].next_step;
+        cycle_lengths[0] = 2_000;
+        sequencer.apply_timing_with_cycles(&beats, &repeats, &cycle_lengths, 2_000, 1_000);
+        assert_eq!(sequencer.base_interval_ms(), 2_000);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(44_100));
+        assert_eq!(sequencer.pads()[1].next_frame, own_deadline);
+        assert_eq!(sequencer.pads()[1].tick_ordinal, own_ordinal);
+        assert_eq!(sequencer.pads()[1].next_step, own_step);
+
+        repeats[1] = 2;
+        sequencer.apply_timing_with_cycles(&beats, &repeats, &cycle_lengths, 2_000, 5_000);
+        assert_eq!(sequencer.pads()[1].pattern_steps, 2);
+        assert_eq!(sequencer.pads()[1].next_frame, own_deadline);
+        assert_eq!(sequencer.pads()[1].tick_ordinal, own_ordinal);
+
+        cycle_lengths[1] = 250;
+        sequencer.apply_timing_with_cycles(&beats, &repeats, &cycle_lengths, 2_000, 12_000);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(44_100));
+        assert_eq!(sequencer.pads()[1].next_frame, Some(16_538));
+        assert_eq!(sequencer.pad_cycle_length_ms(1), Some(250));
+
+        cycle_lengths[2] = 321;
+        sequencer.apply_timing_with_cycles(&beats, &repeats, &cycle_lengths, 2_000, 12_001);
+        assert_eq!(sequencer.pad_cycle_length_ms(2), Some(321));
+        assert_eq!(sequencer.pads()[2].next_frame, None);
     }
 
     #[test]
@@ -6838,6 +7477,16 @@ mod tests {
         assert_eq!(adjust_base_interval(1_000, -1), 990);
         assert_eq!(adjust_base_interval(MIN_BASE_INTERVAL_MS, -1), 50);
         assert_eq!(adjust_base_interval(u32::MAX, 1), u32::MAX);
+        assert_eq!(adjust_pad_cycle_length(0, -1), 0);
+        assert_eq!(adjust_pad_cycle_length(0, 0), 0);
+        assert_eq!(adjust_pad_cycle_length(0, 1), MIN_BASE_INTERVAL_MS);
+        assert_eq!(adjust_pad_cycle_length(0, 10), 140);
+        assert_eq!(adjust_pad_cycle_length(MIN_BASE_INTERVAL_MS, -1), 0);
+        assert_eq!(adjust_pad_cycle_length(60, -1), MIN_BASE_INTERVAL_MS);
+        assert_eq!(adjust_pad_cycle_length(60, -10), 0);
+        assert_eq!(adjust_pad_cycle_length(1_000, 1), 1_010);
+        assert_eq!(adjust_pad_cycle_length(1_000, -10), 900);
+        assert_eq!(adjust_pad_cycle_length(u32::MAX, 1), u32::MAX);
         assert_eq!(accelerated_encoder_delta(1, None), 1);
         assert_eq!(accelerated_encoder_delta(1, Some(41)), 1);
         assert_eq!(accelerated_encoder_delta(1, Some(40)), 10);
@@ -6869,15 +7518,15 @@ mod tests {
             1
         );
         assert_eq!(
-            acceleration.update(1_070, UiEncoderTarget::BeatsGlobal, 1),
+            acceleration.update(1_070, UiEncoderTarget::CycleGlobal, 1),
             1
         );
         assert_eq!(
-            acceleration.update(1_080, UiEncoderTarget::BeatsGlobal, -1),
+            acceleration.update(1_080, UiEncoderTarget::CycleGlobal, -1),
             -1
         );
         assert_eq!(
-            acceleration.update(1_090, UiEncoderTarget::BeatsGlobal, -1),
+            acceleration.update(1_090, UiEncoderTarget::CycleGlobal, -1),
             -10
         );
         let trigger = UiEncoderTarget::PatternVolume(PatternVolumeTarget::Step { pad: 3, step: 7 });
@@ -6899,6 +7548,9 @@ mod tests {
         assert_eq!(scale_color((200, 100, 50), 100), (200, 100, 50));
         assert_eq!(scale_color((200, 100, 50), 50), (100, 50, 25));
         assert_eq!(scale_color((200, 100, 50), 0), (0, 0, 0));
+        assert_eq!(selected_trigger_color((255, 0, 0)), (255, 204, 204));
+        assert_eq!(selected_trigger_color((0, 255, 0)), (204, 255, 204));
+        assert_eq!(selected_trigger_color((0, 0, 255)), (204, 204, 255));
         assert_eq!(mute_led_color(false, 100), (255, 0, 0));
         assert_eq!(mute_led_color(true, 100), (51, 0, 0));
         assert_eq!(mute_led_color(false, 50), (128, 0, 0));
@@ -6941,7 +7593,14 @@ mod tests {
         );
         assert_eq!(voice_led_color(0, 50, true, false, true, false), (26, 0, 0));
         assert_eq!(voice_led_color(0, 50, true, false, false, true), (26, 0, 0));
-        assert_eq!(voice_led_color(0, 50, true, true, true, false), (128, 0, 0));
+        assert_eq!(
+            voice_led_color(0, 50, true, true, true, false),
+            (128, 102, 102)
+        );
+        assert_eq!(
+            voice_led_color(0, 20, true, true, true, false),
+            (51, 41, 41)
+        );
         assert_eq!(
             voice_led_color(0, 50, true, true, false, true),
             (128, 128, 128)
@@ -7019,6 +7678,7 @@ mod tests {
             RootMode::ALL,
             [
                 RootMode::Beats,
+                RootMode::CycleLength,
                 RootMode::Pattern,
                 RootMode::Sample,
                 RootMode::Light,
@@ -7039,21 +7699,21 @@ mod tests {
         assert_eq!(ui.root_mode(), RootMode::ResetAll);
         ui.rotate_root(-100);
         assert_eq!(ui.root_mode(), RootMode::Beats);
-        ui.rotate_root(1);
+        ui.rotate_root(RootMode::Pattern.index() as i32);
         assert_eq!(ui.root_mode(), RootMode::Pattern);
         ui.enter_root_mode();
         assert_eq!(ui.page(), UiPage::Pattern);
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::PatternNone);
 
         assert!(ui.press_voice(2));
-        ui.rotate_pattern(2, 8, 3);
-        assert_eq!(ui.pattern_cursor(2), Some(3));
+        ui.rotate_pattern(2, 9, 4);
+        assert_eq!(ui.pattern_cursor(2), Some(4));
         assert!(ui.press_voice(6));
         assert_eq!(ui.page(), UiPage::Pattern);
         ui.rotate_pattern(6, 4, 2);
         assert_eq!(ui.pattern_cursor(6), Some(2));
         assert!(ui.press_voice(2));
-        assert_eq!(ui.pattern_cursor(2), Some(3));
+        assert_eq!(ui.pattern_cursor(2), Some(4));
         let mut loaded_divisions = [MAX_BEAT_MULTIPLIER; BEAT_PAD_COUNT];
         loaded_divisions[2] = 1;
         loaded_divisions[6] = 0;
@@ -7080,7 +7740,7 @@ mod tests {
         let mut ui = UiController::new();
         assert_eq!(ui.root_mode(), RootMode::Beats);
         ui.enter_root_mode();
-        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsGlobal);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsNone);
         ui.press_voice(4);
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsPad(4));
         assert_eq!(
@@ -7114,6 +7774,55 @@ mod tests {
     }
 
     #[test]
+    fn beats_and_cycle_length_have_independent_top_level_routes() {
+        let mut ui = UiController::new();
+        ui.enter_root_mode();
+        assert_eq!(ui.page(), UiPage::Beats);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsNone);
+        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsSelectVoice);
+        assert!(ui.press_voice(2));
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsPad(2));
+        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 2 });
+        assert_eq!(
+            ui.encoder_target(true),
+            UiEncoderTarget::Volume(VolumeTarget::Pad(2))
+        );
+        assert_eq!(ui.press_encoder(None), None);
+
+        ui.return_to_root(0, false);
+        assert_eq!(ui.page(), UiPage::Root);
+        ui.rotate_root(RootMode::CycleLength.index() as i32);
+        ui.enter_root_mode();
+        assert_eq!(ui.page(), UiPage::CycleLength);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CyclePadLength(2));
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::CyclePadLength { pad: 2 }
+        );
+        assert_eq!(
+            ui.encoder_target(true),
+            UiEncoderTarget::Volume(VolumeTarget::Pad(2))
+        );
+        assert_eq!(ui.press_encoder(None), None);
+        assert_eq!(ui.page(), UiPage::CycleLength);
+
+        ui.return_to_root(0, false);
+        assert_eq!(ui.page(), UiPage::Root);
+        assert_eq!(ui.selected_pad(), Some(2));
+        ui.enter_root_mode();
+        assert!(ui.press_voice(4));
+        assert_eq!(ui.selected_pad(), Some(4));
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CyclePadLength(4));
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::CyclePadLength { pad: 4 }
+        );
+        assert!(ui.press_voice(4));
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CycleGlobal);
+        assert_eq!(ui.display_model(false), UiDisplayModel::CycleGlobal);
+    }
+
+    #[test]
     fn display_model_explicitly_covers_root_overlays_prompts_and_editors() {
         let mut ui = UiController::new();
         assert_eq!(
@@ -7125,14 +7834,14 @@ mod tests {
                 song_dirty: false,
             }
         );
-        ui.rotate_root(1);
+        ui.rotate_root(RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
         assert_eq!(ui.display_model(false), UiDisplayModel::PatternSelectVoice);
         ui.press_voice(2);
-        ui.rotate_pattern(2, 8, 3);
+        ui.rotate_pattern(2, 9, 4);
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::PatternEditor { pad: 2, cursor: 3 }
+            UiDisplayModel::PatternEditor { pad: 2, cursor: 4 }
         );
         assert_eq!(
             ui.display_model(true),
@@ -7140,7 +7849,7 @@ mod tests {
                 target: PatternVolumeTarget::Step { pad: 2, step: 2 },
             }
         );
-        ui.rotate_pattern(2, 8, -3);
+        ui.rotate_pattern(2, 9, -3);
         assert_eq!(
             ui.press_encoder(Some(8)),
             Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
@@ -7163,16 +7872,27 @@ mod tests {
                 song_dirty: false,
             }
         );
-        ui.rotate_root(-1);
+        ui.rotate_root(RootMode::Beats.index() as i32 - RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
         assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 2 });
         ui.press_voice(2);
-        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsGlobal);
+        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsSelectVoice);
         ui.press_voice(4);
         assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 4 });
 
         ui.return_to_root(0, false);
-        ui.rotate_root(2);
+        ui.rotate_root(RootMode::CycleLength.index() as i32);
+        ui.enter_root_mode();
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::CyclePadLength { pad: 4 }
+        );
+        ui.press_voice(4);
+        assert_eq!(ui.display_model(false), UiDisplayModel::CycleGlobal);
+        ui.press_voice(4);
+
+        ui.return_to_root(0, false);
+        ui.rotate_root(RootMode::Sample.index() as i32 - RootMode::CycleLength.index() as i32);
         ui.enter_root_mode();
         assert_eq!(
             ui.display_model(false),
@@ -7503,7 +8223,7 @@ mod tests {
     #[test]
     fn pattern_volume_modifier_targets_all_or_the_highlighted_trigger() {
         let mut ui = UiController::new();
-        ui.rotate_root(1);
+        ui.rotate_root(RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
 
         // Without a selected voice, Volume retains its ordinary master target.
@@ -7515,6 +8235,11 @@ mod tests {
         ui.press_voice(4);
         assert_eq!(
             ui.encoder_target(true),
+            UiEncoderTarget::Volume(VolumeTarget::Pad(4))
+        );
+        ui.rotate_pattern(4, 9, 1);
+        assert_eq!(
+            ui.encoder_target(true),
             UiEncoderTarget::PatternVolume(PatternVolumeTarget::All { pad: 4 })
         );
         assert_eq!(
@@ -7524,7 +8249,7 @@ mod tests {
             }
         );
 
-        ui.rotate_pattern(4, 8, 3);
+        ui.rotate_pattern(4, 9, 3);
         assert_eq!(
             ui.encoder_target(true),
             UiEncoderTarget::PatternVolume(PatternVolumeTarget::Step { pad: 4, step: 2 })
@@ -7537,9 +8262,9 @@ mod tests {
         );
 
         // The modifier temporarily claims the encoder without moving the row.
-        assert_eq!(ui.pattern_cursor(4), Some(3));
+        assert_eq!(ui.pattern_cursor(4), Some(4));
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::Pattern(4));
-        ui.rotate_pattern(4, 8, -3);
+        ui.rotate_pattern(4, 9, -3);
         assert_eq!(
             ui.press_encoder(Some(8)),
             Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
@@ -7555,12 +8280,33 @@ mod tests {
         let mut ui = UiController::new();
         assert_eq!(ui.press_pattern_control(None), None);
 
-        ui.rotate_root(1);
+        ui.rotate_root(RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
         assert_eq!(ui.page(), UiPage::Pattern);
         assert_eq!(ui.press_pattern_control(Some(4)), None);
 
         ui.press_voice(2);
+        assert_eq!(
+            ui.press_pattern_control(Some(4)),
+            Some(UiAction::Pattern(PatternEditorAction::RepeatEditorOpened))
+        );
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::PatternRepeat(2));
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::PatternRepeat { pad: 2 }
+        );
+        assert_eq!(
+            ui.press_pattern_control(Some(4)),
+            Some(UiAction::Pattern(PatternEditorAction::RepeatEditorClosed))
+        );
+        assert_eq!(
+            ui.press_pattern_control(Some(4)),
+            Some(UiAction::Pattern(PatternEditorAction::RepeatEditorOpened))
+        );
+        ui.return_to_root(0, false);
+        assert_eq!(ui.page(), UiPage::Pattern);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::Pattern(2));
+        ui.rotate_pattern(2, 4, 1);
         assert_eq!(
             ui.press_pattern_control(Some(4)),
             Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
@@ -7600,6 +8346,7 @@ mod tests {
             ui.press_voice(3);
             ui.enter_root_mode();
             if mode == RootMode::Pattern {
+                ui.rotate_pattern(3, 9, 1);
                 assert_eq!(
                     ui.press_encoder(Some(8)),
                     Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
@@ -7644,9 +8391,10 @@ mod tests {
     #[test]
     fn persistent_pattern_menu_is_cancel_first_and_voice_switch_cancels_it() {
         let mut ui = UiController::new();
-        ui.rotate_root(1);
+        ui.rotate_root(RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
         ui.press_voice(1);
+        ui.rotate_pattern(1, 5, 1);
         assert_eq!(
             ui.press_encoder(Some(4)),
             Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
@@ -7669,22 +8417,23 @@ mod tests {
         assert_eq!(ui.selected_pad(), Some(5));
         assert_eq!(ui.pattern_all_menu(), None);
 
+        ui.rotate_pattern(5, 1, 1);
         assert_eq!(
-            ui.press_encoder(Some(0)),
+            ui.press_encoder(Some(1)),
             Some(UiAction::Pattern(PatternEditorAction::AllMenuOpened))
         );
-        ui.rotate_pattern(5, 0, 100);
+        ui.rotate_pattern(5, 1, 100);
         assert_eq!(
             ui.pattern_all_menu().map(|menu| menu.choice),
             Some(PatternAllChoice::None)
         );
-        ui.rotate_pattern(5, 0, 1);
+        ui.rotate_pattern(5, 1, 1);
         assert_eq!(
             ui.pattern_all_menu().map(|menu| menu.choice),
             Some(PatternAllChoice::None)
         );
         assert_eq!(
-            ui.press_encoder(Some(0)),
+            ui.press_encoder(Some(1)),
             Some(UiAction::Pattern(PatternEditorAction::SetAll {
                 pad: 5,
                 enabled: false,
@@ -7748,6 +8497,8 @@ mod tests {
         }));
         assert_eq!(state.adjust_volume(VolumeTarget::Global, -25), Some(75));
         assert_eq!(state.adjust_volume(VolumeTarget::Pad(3), -40), Some(60));
+        assert!(state.set_pad_cycle_length_override_enabled(3, true));
+        assert!(state.set_pad_cycle_length_ms(3, 4_444));
         let preview = PreviewRequest::new(3, sample(5)).unwrap();
         assert_eq!(state.queue_preview(preview), None);
         state.base_interval_ms = 12_345;
@@ -7761,6 +8512,7 @@ mod tests {
         state.reset_musical_state();
 
         assert_eq!(state.desired_beats, [0; BEAT_PAD_COUNT]);
+        assert_eq!(state.pad_cycle_length_overrides_ms, [None; BEAT_PAD_COUNT]);
         assert_eq!(state.pad_samples(), &DEFAULT_PAD_SAMPLES);
         assert_eq!(state.take_preview(), None);
         assert_eq!(state.base_interval_ms, DEFAULT_BASE_INTERVAL_MS);
@@ -7927,6 +8679,10 @@ mod tests {
         let mut source = SharedState::default();
         assert!(source.set_base_interval_ms(71_073));
         assert!(source.set_desired_beats(3, MAX_BEAT_MULTIPLIER));
+        assert!(source.set_desired_beats(4, 3));
+        assert!(source.set_pattern_repeat(4, 2));
+        assert!(source.set_pad_cycle_length_override_enabled(3, true));
+        assert!(source.set_pad_cycle_length_ms(3, 12_345));
         assert!(source.set_pad_sample(3, sample(23)));
         assert_eq!(source.toggle_pattern_step(3, 255), Some(false));
         assert_eq!(
@@ -7946,9 +8702,9 @@ mod tests {
             tapped: true,
         }));
 
-        let song = StoredSongV1::snapshot(&source);
+        let song = StoredSongV3::snapshot(&source);
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
-        let encoded = encode_song_v1(&song, &mut bytes).unwrap();
+        let encoded = encode_song_v3(&song, &mut bytes).unwrap();
         assert_eq!(&encoded[..4], &SONG_FORMAT_MAGIC);
         assert_eq!(
             u16::from_le_bytes([encoded[4], encoded[5]]),
@@ -7975,7 +8731,7 @@ mod tests {
 
         decoded.apply_to(&mut destination).unwrap();
 
-        assert_eq!(StoredSongV1::snapshot(&destination), song);
+        assert_eq!(StoredSongV3::snapshot(&destination), song);
         assert_eq!(destination.led_brightness_percent, 17);
         assert_eq!(destination.playback_frame, 9_876_543);
         assert_eq!(destination.underrun_count, 12);
@@ -7990,8 +8746,8 @@ mod tests {
     }
 
     #[test]
-    fn default_song_v1_encoding_is_frozen() {
-        const EXPECTED_FNV1A64: u64 = 0x4256_730a_616c_b5ef;
+    fn default_song_v2_encoding_is_frozen() {
+        const EXPECTED_FNV1A64: u64 = 0x1263_2f72_983e_7d3e;
 
         fn fnv1a64(bytes: &[u8]) -> u64 {
             bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -8000,22 +8756,45 @@ mod tests {
         }
 
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
-        let encoded = encode_song_v1(&StoredSongV1::default(), &mut bytes).unwrap();
+        let encoded = encode_song_v2(&StoredSongV2::default(), &mut bytes).unwrap();
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), SONG_FORMAT_V2);
         assert_eq!(
             (encoded.len(), fnv1a64(encoded)),
-            (SONG_V1_DEFAULT_ENCODED_LEN, EXPECTED_FNV1A64)
+            (SONG_V2_DEFAULT_ENCODED_LEN, EXPECTED_FNV1A64)
         );
         assert_eq!(
             usize::from(u16::from_le_bytes([encoded[6], encoded[7]])),
-            SONG_V1_DEFAULT_ENCODED_LEN - SONG_FORMAT_HEADER_LEN
+            SONG_V2_DEFAULT_ENCODED_LEN - SONG_FORMAT_HEADER_LEN
+        );
+    }
+
+    #[test]
+    fn default_song_v3_encoding_is_frozen() {
+        const EXPECTED_FNV1A64: u64 = 0x42cd_1a34_34ff_0c44;
+
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+
+        let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
+        let encoded = encode_song_v3(&StoredSongV3::default(), &mut bytes).unwrap();
+        assert_eq!(
+            (encoded.len(), fnv1a64(encoded)),
+            (SONG_V3_DEFAULT_ENCODED_LEN, EXPECTED_FNV1A64)
+        );
+        assert_eq!(
+            usize::from(u16::from_le_bytes([encoded[6], encoded[7]])),
+            SONG_V3_DEFAULT_ENCODED_LEN - SONG_FORMAT_HEADER_LEN
         );
     }
 
     #[test]
     fn song_validation_rejects_each_bounded_field_and_apply_is_atomic() {
-        let mut song = StoredSongV1 {
+        let mut song = StoredSongV3 {
             base_interval_ms: MIN_BASE_INTERVAL_MS - 1,
-            ..StoredSongV1::default()
+            ..StoredSongV3::default()
         };
         assert_eq!(
             song.validate(),
@@ -8024,14 +8803,14 @@ mod tests {
             })
         );
 
-        song = StoredSongV1::default();
+        song = StoredSongV3::default();
         song.master_volume_percent = 101;
         assert_eq!(
             song.validate(),
             Err(SongValidationError::MasterVolumeOutOfRange { value: 101 })
         );
 
-        song = StoredSongV1::default();
+        song = StoredSongV3::default();
         song.pads[2].division = MAX_BEAT_MULTIPLIER + 1;
         assert_eq!(
             song.validate(),
@@ -8041,7 +8820,29 @@ mod tests {
             })
         );
 
-        song = StoredSongV1::default();
+        song = StoredSongV3::default();
+        song.pads[2].division = 100;
+        song.pads[2].pattern_repeats = 3;
+        assert_eq!(
+            song.validate(),
+            Err(SongValidationError::PatternRepeatsOutOfRange {
+                pad: 2,
+                value: 3,
+                maximum: 2,
+            })
+        );
+
+        song = StoredSongV3::default();
+        song.pads[3].cycle_length_override_ms = Some(MIN_BASE_INTERVAL_MS - 1);
+        assert_eq!(
+            song.validate(),
+            Err(SongValidationError::CycleLengthOverrideTooShort {
+                pad: 3,
+                value: MIN_BASE_INTERVAL_MS - 1,
+            })
+        );
+
+        song = StoredSongV3::default();
         song.pads[3].sample_id = SAMPLE_COUNT as u8;
         assert_eq!(
             song.validate(),
@@ -8051,14 +8852,14 @@ mod tests {
             })
         );
 
-        song = StoredSongV1::default();
+        song = StoredSongV3::default();
         song.pads[4].volume_percent = 200;
         assert_eq!(
             song.validate(),
             Err(SongValidationError::PadVolumeOutOfRange { pad: 4, value: 200 })
         );
 
-        song = StoredSongV1::default();
+        song = StoredSongV3::default();
         song.pads[5].trigger_levels[7][31] = 101;
         assert_eq!(
             song.validate(),
@@ -8072,7 +8873,7 @@ mod tests {
         let mut state = SharedState::default();
         assert!(state.set_base_interval_ms(2_000));
         state.led_brightness_percent = 91;
-        let before = StoredSongV1::snapshot(&state);
+        let before = StoredSongV3::snapshot(&state);
         let revision = state.song_revision;
         assert_eq!(
             song.apply_to(&mut state),
@@ -8082,18 +8883,18 @@ mod tests {
                 value: 101
             })
         );
-        assert_eq!(StoredSongV1::snapshot(&state), before);
+        assert_eq!(StoredSongV3::snapshot(&state), before);
         assert_eq!(state.song_revision, revision);
         assert_eq!(state.led_brightness_percent, 91);
     }
 
     #[test]
     fn song_decoder_distinguishes_versions_corruption_and_semantic_errors() {
-        let song = StoredSongV1::default();
+        let song = StoredSongV3::default();
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
-        let encoded_len = encode_song_v1(&song, &mut bytes).unwrap().len();
+        let encoded_len = encode_song_v3(&song, &mut bytes).unwrap().len();
 
-        for unsupported in [0_u16, SONG_FORMAT_VERSION + 1] {
+        for unsupported in [0_u16, 1_u16, SONG_FORMAT_VERSION + 1] {
             let mut versioned = bytes;
             versioned[4..6].copy_from_slice(&unsupported.to_le_bytes());
             assert_eq!(
@@ -8150,7 +8951,7 @@ mod tests {
             Err(SongDecodeError::InvalidPayload)
         );
 
-        let mut invalid_song = StoredSongV1::default();
+        let mut invalid_song = StoredSongV3::default();
         invalid_song.pads[7].sample_id = SAMPLE_COUNT as u8;
         let mut semantic = [0_u8; SONG_ENCODED_MAX_LEN];
         let payload_len =
@@ -8172,29 +8973,51 @@ mod tests {
     }
 
     #[test]
+    fn song_decoder_migrates_v2_with_global_cycle_lengths() {
+        let mut legacy = StoredSongV2::default();
+        legacy.base_interval_ms = 7_777;
+        legacy.pads[4].division = 3;
+        legacy.pads[4].pattern_repeats = 2;
+        let expected = StoredSongV3::from(legacy.clone());
+
+        let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
+        let encoded = encode_song_v2(&legacy, &mut bytes).unwrap();
+        let decoded = decode_song(encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+        assert!(
+            decoded
+                .pads
+                .iter()
+                .all(|pad| pad.cycle_length_override_ms.is_none())
+        );
+    }
+
+    #[test]
     fn song_encoder_is_bounded_and_rejects_invalid_input() {
-        let mut song = StoredSongV1 {
+        let mut song = StoredSongV3 {
             base_interval_ms: u32::MAX,
             global_mute: true,
-            ..StoredSongV1::default()
+            ..StoredSongV3::default()
         };
         for pad in &mut song.pads {
             pad.division = MAX_BEAT_MULTIPLIER;
+            pad.cycle_length_override_ms = Some(u32::MAX);
             pad.sample_id = (SAMPLE_COUNT - 1) as u8;
             pad.pattern = [0x55; PATTERN_BYTES];
             pad.mute = true;
         }
         let mut exact_budget = [0_u8; SONG_ENCODED_MAX_LEN];
-        assert!(encode_song_v1(&song, &mut exact_budget).is_ok());
+        assert!(encode_song_v3(&song, &mut exact_budget).is_ok());
         let mut tiny = [0_u8; SONG_FORMAT_HEADER_LEN];
         assert_eq!(
-            encode_song_v1(&song, &mut tiny),
+            encode_song_v3(&song, &mut tiny),
             Err(SongEncodeError::BufferTooSmall)
         );
-        let mut invalid = StoredSongV1::default();
+        let mut invalid = StoredSongV3::default();
         invalid.pads[0].volume_percent = 101;
         assert_eq!(
-            encode_song_v1(&invalid, &mut exact_budget),
+            encode_song_v3(&invalid, &mut exact_budget),
             Err(SongEncodeError::InvalidSong(
                 SongValidationError::PadVolumeOutOfRange { pad: 0, value: 101 }
             ))
@@ -8215,23 +9038,25 @@ mod tests {
         assert_eq!(state.song_revision, 1);
         assert!(state.set_desired_beats(0, 4));
         assert_eq!(state.song_revision, 2);
-        assert_eq!(state.toggle_pattern_step(0, 0), Some(false));
+        assert!(state.set_pattern_repeat(0, 2));
         assert_eq!(state.song_revision, 3);
-        assert_eq!(state.adjust_volume(VolumeTarget::Pad(0), -1), Some(99));
+        assert_eq!(state.toggle_pattern_step(0, 0), Some(false));
         assert_eq!(state.song_revision, 4);
+        assert_eq!(state.adjust_volume(VolumeTarget::Pad(0), -1), Some(99));
+        assert_eq!(state.song_revision, 5);
         assert!(state.begin_mute_gesture(MuteTarget::Pad(0)));
         assert!(state.end_mute_gesture(MuteRelease {
             target: MuteTarget::Pad(0),
             tapped: false,
         }));
-        assert_eq!(state.song_revision, 4);
+        assert_eq!(state.song_revision, 5);
         assert!(state.begin_mute_gesture(MuteTarget::Pad(0)));
         assert!(state.end_mute_gesture(MuteRelease {
             target: MuteTarget::Pad(0),
             tapped: true,
         }));
-        assert_eq!(state.song_revision, 5);
-        state.reset_musical_state();
         assert_eq!(state.song_revision, 6);
+        state.reset_musical_state();
+        assert_eq!(state.song_revision, 7);
     }
 }

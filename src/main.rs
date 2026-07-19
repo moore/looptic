@@ -50,12 +50,12 @@ use looptic::{
     PatternVolumeTarget, RETURN_KEY_INDEX, ResetAllChoice, RootMode, SAMPLE_COUNT, SAMPLE_RATE,
     SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN, SONG_FORMAT_VERSION, Sequencer, SharedState,
     SongBrowserPurpose, SongConfirmChoice, SongLibraryStatus, SongMenuOperation, SongSlot,
-    SongSlotOccupancy, SongStorageOperation, SongUiStatus, SongsView, StoredSongV1, UiAction,
+    SongSlotOccupancy, SongStorageOperation, SongUiStatus, SongsView, StoredSongV3, UiAction,
     UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX,
     VolumeTarget, adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness,
-    adjust_sample_selection, decode_song, encode_song_v1, led_pulse_active, mute_led_color,
-    resolve_mute_scan, return_led_color, sample_assets, sample_selection_preview_request,
-    scroll_menu_window, voice_led_color, volume_led_color,
+    adjust_pad_cycle_length, adjust_sample_selection, decode_song, encode_song_v3,
+    led_pulse_active, mute_led_color, resolve_mute_scan, return_led_color, sample_assets,
+    sample_selection_preview_request, scroll_menu_window, voice_led_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -334,8 +334,8 @@ async fn storage_task(
                 }
 
                 pause_audio_for_storage().await;
-                let song = shared.lock(|state| StoredSongV1::snapshot(&state.borrow()));
-                let encoded_len = match encode_song_v1(&song, record_buffer) {
+                let song = shared.lock(|state| StoredSongV3::snapshot(&state.borrow()));
+                let encoded_len = match encode_song_v3(&song, record_buffer) {
                     Ok(encoded) => encoded.len(),
                     Err(_) => {
                         resume_audio_after_storage();
@@ -398,7 +398,12 @@ async fn storage_task(
                                     if song.apply_to(&mut state).is_ok() {
                                         SongLoadResult::Loaded {
                                             revision: state.song_revision,
-                                            divisions: state.desired_beats,
+                                            divisions: core::array::from_fn(|pad| {
+                                                state
+                                                    .effective_pattern_steps(pad)
+                                                    .unwrap_or(0)
+                                                    .saturating_add(1)
+                                            }),
                                         }
                                     } else {
                                         SongLoadResult::Corrupt
@@ -571,7 +576,10 @@ fn apply_pattern_editor_action(shared: &Shared, action: PatternEditorAction) -> 
             });
             true
         }
-        PatternEditorAction::AllMenuOpened | PatternEditorAction::AllMenuCancelled => true,
+        PatternEditorAction::RepeatEditorOpened
+        | PatternEditorAction::RepeatEditorClosed
+        | PatternEditorAction::AllMenuOpened
+        | PatternEditorAction::AllMenuCancelled => true,
     }
 }
 
@@ -653,6 +661,8 @@ async fn audio_task(
     let mut front_start = 0_u64;
     let (
         initial_beats,
+        initial_repeats,
+        initial_cycle_lengths,
         initial_pad_samples,
         initial_base_interval,
         initial_mute_mask,
@@ -662,6 +672,8 @@ async fn audio_task(
         let state = state.borrow();
         (
             state.desired_beats,
+            *state.pattern_repeats(),
+            state.effective_cycle_lengths_ms(),
             *state.pad_samples(),
             state.base_interval_ms,
             state.effective_mute_mask(),
@@ -669,7 +681,13 @@ async fn audio_task(
             *state.pad_volume_percents(),
         )
     });
-    sequencer.apply_timing(&initial_beats, initial_base_interval, front_start);
+    sequencer.apply_timing_with_cycles(
+        &initial_beats,
+        &initial_repeats,
+        &initial_cycle_lengths,
+        initial_base_interval,
+        front_start,
+    );
     sequencer.set_pad_samples(&initial_pad_samples);
     sequencer.set_mute_mask(initial_mute_mask);
     sequencer.set_volumes(initial_global_volume, &initial_pad_volumes);
@@ -731,6 +749,8 @@ async fn audio_task(
         let back_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
         let (
             beats,
+            repeats,
+            cycle_lengths,
             pad_samples,
             preview,
             base_interval,
@@ -746,6 +766,8 @@ async fn audio_task(
             state.playback_frame = front_start;
             (
                 state.desired_beats,
+                *state.pattern_repeats(),
+                state.effective_cycle_lengths_ms(),
                 *state.pad_samples(),
                 state.take_preview(),
                 state.base_interval_ms,
@@ -755,7 +777,13 @@ async fn audio_task(
                 state.take_release_all_request(),
             )
         });
-        sequencer.apply_timing(&beats, base_interval, back_start);
+        sequencer.apply_timing_with_cycles(
+            &beats,
+            &repeats,
+            &cycle_lengths,
+            base_interval,
+            back_start,
+        );
         sequencer.set_pad_samples(&pad_samples);
         sequencer.set_mute_mask(mute_mask);
         sequencer.set_volumes(global_volume, &pad_volumes);
@@ -832,6 +860,8 @@ async fn audio_task(
 
             let (
                 beats,
+                repeats,
+                cycle_lengths,
                 pad_samples,
                 preview,
                 base_interval,
@@ -844,6 +874,8 @@ async fn audio_task(
                 state.playback_frame = front_start;
                 (
                     state.desired_beats,
+                    *state.pattern_repeats(),
+                    state.effective_cycle_lengths_ms(),
                     *state.pad_samples(),
                     state.take_preview(),
                     state.base_interval_ms,
@@ -853,7 +885,13 @@ async fn audio_task(
                     state.take_release_all_request(),
                 )
             });
-            sequencer.apply_timing(&beats, base_interval, front_start);
+            sequencer.apply_timing_with_cycles(
+                &beats,
+                &repeats,
+                &cycle_lengths,
+                base_interval,
+                front_start,
+            );
             sequencer.set_pad_samples(&pad_samples);
             sequencer.set_mute_mask(mute_mask);
             sequencer.set_volumes(global_volume, &pad_volumes);
@@ -1002,6 +1040,8 @@ async fn controls_task(
                 let unaccelerated = matches!(
                     target,
                     UiEncoderTarget::Root
+                        | UiEncoderTarget::BeatsNone
+                        | UiEncoderTarget::PatternRepeat(_)
                         | UiEncoderTarget::PatternAll(_)
                         | UiEncoderTarget::PatternNone
                         | UiEncoderTarget::Sample(_)
@@ -1020,7 +1060,13 @@ async fn controls_task(
                         state.borrow_mut().controller.rotate_root(delta);
                     }),
                     UiEncoderTarget::Pattern(pad) | UiEncoderTarget::PatternAll(pad) => {
-                        let division = shared.lock(|state| state.borrow().desired_beats[pad]);
+                        let division = shared.lock(|state| {
+                            state
+                                .borrow()
+                                .effective_pattern_steps(pad)
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                        });
                         ui.lock(|state| {
                             state
                                 .borrow_mut()
@@ -1028,6 +1074,15 @@ async fn controls_task(
                                 .rotate_pattern(pad, division, delta);
                         });
                     }
+                    UiEncoderTarget::PatternRepeat(pad) => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        let current = state.pattern_repeat(pad).unwrap_or(1);
+                        let adjusted = i32::from(current).saturating_add(direction_delta).clamp(
+                            1,
+                            i32::from(looptic::max_pattern_repeats(state.desired_beats[pad])),
+                        ) as u16;
+                        let _ = state.set_pattern_repeat(pad, adjusted);
+                    }),
                     UiEncoderTarget::PatternNone => {}
                     UiEncoderTarget::Sample(Some(pad)) => shared.lock(|state| {
                         let mut state = state.borrow_mut();
@@ -1059,17 +1114,21 @@ async fn controls_task(
                     UiEncoderTarget::PatternVolume(target) => shared.lock(|state| {
                         let _ = state.borrow_mut().adjust_pattern_volume(target, delta);
                     }),
-                    UiEncoderTarget::BeatsGlobal => shared.lock(|state| {
+                    UiEncoderTarget::CycleGlobal => shared.lock(|state| {
                         let mut state = state.borrow_mut();
                         let adjusted = adjust_base_interval(state.base_interval_ms, delta);
                         let _ = state.set_base_interval_ms(adjusted);
                     }),
+                    UiEncoderTarget::BeatsNone => {}
                     UiEncoderTarget::BeatsPad(pad) => {
                         let division = shared.lock(|state| {
                             let mut state = state.borrow_mut();
                             let adjusted = adjust_beat_multiplier(state.desired_beats[pad], delta);
                             let _ = state.set_desired_beats(pad, adjusted);
-                            state.desired_beats[pad]
+                            state
+                                .effective_pattern_steps(pad)
+                                .unwrap_or(0)
+                                .saturating_add(1)
                         });
                         ui.lock(|state| {
                             state
@@ -1078,6 +1137,12 @@ async fn controls_task(
                                 .clamp_pattern_cursor(pad, division);
                         });
                     }
+                    UiEncoderTarget::CyclePadLength(pad) => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        let current = state.pad_cycle_length_override_ms(pad).unwrap_or(0);
+                        let adjusted = adjust_pad_cycle_length(current, delta);
+                        let _ = state.set_pad_cycle_length_ms(pad, adjusted);
+                    }),
                     UiEncoderTarget::Light => shared.lock(|state| {
                         let mut state = state.borrow_mut();
                         state.led_brightness_percent =
@@ -1164,7 +1229,13 @@ async fn controls_task(
                     let pad = pressed_beats.trailing_zeros() as usize;
                     next_ui.controller.press_voice(pad);
                     if let Some(selected) = next_ui.controller.selected_pad() {
-                        let division = shared.lock(|state| state.borrow().desired_beats[selected]);
+                        let division = shared.lock(|state| {
+                            state
+                                .borrow()
+                                .effective_pattern_steps(selected)
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                        });
                         next_ui.controller.clamp_pattern_cursor(selected, division);
                     }
                 }
@@ -1185,10 +1256,15 @@ async fn controls_task(
                 next_ui.volume_pressed = volume_pressed;
 
                 if button_changes.pressed & 1 != 0 && encoder_pressed && !volume_pressed {
-                    let selected_division = next_ui
-                        .controller
-                        .selected_pad()
-                        .map(|pad| shared.lock(|state| state.borrow().desired_beats[pad]));
+                    let selected_division = next_ui.controller.selected_pad().map(|pad| {
+                        shared.lock(|state| {
+                            state
+                                .borrow()
+                                .effective_pattern_steps(pad)
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                        })
+                    });
                     let songs_page = next_ui.controller.page() == UiPage::Songs;
                     let action = next_ui.controller.press_encoder(selected_division);
                     if songs_page {
@@ -1321,48 +1397,62 @@ fn draw_pattern_editor<D>(
     D: DrawTarget<Color = BinaryColor>,
 {
     const VISIBLE_ROWS: u16 = 5;
-    let (division, cursor, window, fill_state, all_volume, enabled_rows, volume_rows) = shared
-        .lock(|state| {
-            let state = state.borrow();
-            let division = state.desired_beats[pad];
-            let cursor = cursor.min(division);
-            let window = scroll_menu_window(
-                usize::from(cursor),
-                usize::from(division) + 1,
-                usize::from(VISIBLE_ROWS),
-            );
-            let mut enabled_rows = [false; VISIBLE_ROWS as usize];
-            let mut volume_rows = [0_u8; VISIBLE_ROWS as usize];
-            let mut fill_state = PatternFillState::Empty;
-            let mut all_volume = 0;
-            if let Some(pattern) = state.pattern(pad) {
-                fill_state = pattern.fill_state();
-                for row in 0..window.item_rows {
-                    let entry = window.start + row;
-                    if entry != 0 && entry <= usize::from(division) {
-                        let step = entry - 1;
-                        enabled_rows[row] =
-                            pattern.step_enabled(step as u16, division).unwrap_or(false);
-                        volume_rows[row] = state.trigger_volume(pad, step).unwrap_or(0);
-                    }
+    let (
+        beats,
+        repeats,
+        pattern_steps,
+        cursor,
+        window,
+        fill_state,
+        all_volume,
+        enabled_rows,
+        volume_rows,
+    ) = shared.lock(|state| {
+        let state = state.borrow();
+        let beats = state.desired_beats[pad];
+        let repeats = state.pattern_repeat(pad).unwrap_or(1);
+        let pattern_steps = state.effective_pattern_steps(pad).unwrap_or(0);
+        let cursor = cursor.min(pattern_steps.saturating_add(1));
+        let window = scroll_menu_window(
+            usize::from(cursor),
+            usize::from(pattern_steps) + 2,
+            usize::from(VISIBLE_ROWS),
+        );
+        let mut enabled_rows = [false; VISIBLE_ROWS as usize];
+        let mut volume_rows = [0_u8; VISIBLE_ROWS as usize];
+        let mut fill_state = PatternFillState::Empty;
+        let mut all_volume = 0;
+        if let Some(pattern) = state.pattern(pad) {
+            fill_state = pattern.fill_state();
+            for row in 0..window.item_rows {
+                let entry = window.start + row;
+                if entry >= 2 && entry <= usize::from(pattern_steps) + 1 {
+                    let step = entry - 2;
+                    enabled_rows[row] = pattern
+                        .step_enabled(step as u16, pattern_steps)
+                        .unwrap_or(false);
+                    volume_rows[row] = state.trigger_volume(pad, step).unwrap_or(0);
                 }
             }
-            if let Some(volumes) = state.trigger_volumes(pad) {
-                all_volume = volumes.average_percent();
-            }
-            (
-                division,
-                cursor,
-                window,
-                fill_state,
-                all_volume,
-                enabled_rows,
-                volume_rows,
-            )
-        });
+        }
+        if let Some(volumes) = state.trigger_volumes(pad) {
+            all_volume = volumes.average_percent();
+        }
+        (
+            beats,
+            repeats,
+            pattern_steps,
+            cursor,
+            window,
+            fill_state,
+            all_volume,
+            enabled_rows,
+            volume_rows,
+        )
+    });
 
     let mut header: String<24> = String::new();
-    let _ = write!(&mut header, "LoopTic P{} {}", pad + 1, division);
+    let _ = write!(&mut header, "LoopTic P{} {}x{}", pad + 1, beats, repeats);
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
     if window.more_above {
@@ -1377,6 +1467,8 @@ fn draw_pattern_editor<D>(
         };
         let mut line: String<20> = String::new();
         if entry == 0 {
+            let _ = write!(&mut line, "{} Cycles {}x", marker, repeats);
+        } else if entry == 1 {
             let state = match fill_state {
                 PatternFillState::Empty => "off",
                 PatternFillState::Full => "ON",
@@ -1388,7 +1480,10 @@ fn draw_pattern_editor<D>(
             let _ = write!(
                 &mut line,
                 "{} {:04} {} {}%",
-                marker, entry, state, volume_rows[row]
+                marker,
+                entry - 1,
+                state,
+                volume_rows[row]
             );
         }
         let _ = Text::with_baseline(
@@ -1403,8 +1498,8 @@ fn draw_pattern_editor<D>(
         draw_scroll_triangle(display, 14 + (window.item_rows - 1) as i32 * 10, false);
     }
 
-    if division == 0 {
-        let _ = Text::with_baseline("No triggers", Point::new(0, 28), style, Baseline::Top)
+    if pattern_steps == 0 {
+        let _ = Text::with_baseline("No triggers", Point::new(0, 38), style, Baseline::Top)
             .draw(display);
     }
 }
@@ -1486,6 +1581,7 @@ fn draw_root_menu<D>(
         let label = match mode {
             RootMode::Pattern => "Pattern",
             RootMode::Beats => "Beats",
+            RootMode::CycleLength => "Cycle length",
             RootMode::Sample => "Sample",
             RootMode::Light => "Light",
             RootMode::Save => "Save",
@@ -1848,12 +1944,19 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     u32::from(state.pattern_volume_percent(target).unwrap_or(0)),
                     state.pattern_revision,
                 ),
-                UiDisplayModel::BeatsGlobal => (state.base_interval_ms, 0),
                 UiDisplayModel::BeatsPad { pad } => (u32::from(state.desired_beats[pad]), 0),
+                UiDisplayModel::CycleGlobal => (state.base_interval_ms, 0),
+                UiDisplayModel::CyclePadLength { pad } => {
+                    (state.pad_cycle_length_override_ms(pad).unwrap_or(0), 0)
+                }
                 UiDisplayModel::PatternEditor { pad, .. }
                 | UiDisplayModel::PatternAll { pad, .. } => {
                     (u32::from(state.desired_beats[pad]), state.pattern_revision)
                 }
+                UiDisplayModel::PatternRepeat { pad } => (
+                    u32::from(state.pattern_repeat(pad).unwrap_or(1)),
+                    state.pattern_revision,
+                ),
                 UiDisplayModel::SamplePad { pad } => (
                     state
                         .pad_sample(pad)
@@ -1863,6 +1966,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 UiDisplayModel::Light => (u32::from(state.led_brightness_percent), 0),
                 UiDisplayModel::Root { .. }
                 | UiDisplayModel::PatternSelectVoice
+                | UiDisplayModel::BeatsSelectVoice
                 | UiDisplayModel::SampleSelectVoice
                 | UiDisplayModel::SongsMenu { .. }
                 | UiDisplayModel::SongBrowser { .. }
@@ -1937,23 +2041,84 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 UiDisplayModel::PatternSelectVoice => {
                     draw_select_voice(&mut display, style, "Pattern");
                 }
+                UiDisplayModel::PatternRepeat { pad } => {
+                    let beats = shared.lock(|state| state.borrow().desired_beats[pad]);
+                    let maximum = looptic::max_pattern_repeats(beats);
+                    let _ = Text::with_baseline(
+                        "LoopTic Cycles",
+                        Point::new(0, 0),
+                        style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    let _ = write!(
+                        &mut line,
+                        "P{} {}x (1-{})",
+                        pad + 1,
+                        displayed_value,
+                        maximum
+                    );
+                    let _ = Text::with_baseline(&line, Point::new(0, 18), style, Baseline::Top)
+                        .draw(&mut display);
+                    let _ = Text::with_baseline(
+                        "Push/Return done",
+                        Point::new(0, 38),
+                        style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display);
+                }
                 UiDisplayModel::PatternEditor { pad, cursor } => {
                     draw_pattern_editor(&mut display, style, shared, pad, cursor);
                 }
                 UiDisplayModel::PatternAll { pad, choice } => {
                     draw_pattern_all_menu(&mut display, style, pad, choice);
                 }
-                UiDisplayModel::BeatsGlobal | UiDisplayModel::BeatsPad { .. } => {
+                UiDisplayModel::BeatsSelectVoice => {
+                    draw_select_voice(&mut display, style, "Beats");
+                }
+                UiDisplayModel::BeatsPad { pad } => {
+                    let mut header: String<24> = String::new();
+                    let _ = write!(&mut header, "LoopTic P{} Beats", pad + 1);
+                    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    let _ = write!(&mut line, "Beats {}", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 18), style, Baseline::Top)
+                        .draw(&mut display);
+                }
+                UiDisplayModel::CycleGlobal => {
                     let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
                         .draw(&mut display);
                     let mut line: String<24> = String::new();
-                    if let UiDisplayModel::BeatsPad { pad } = model {
-                        let _ = write!(&mut line, "P{} Beat {}", pad + 1, displayed_value);
-                    } else {
-                        let _ = write!(&mut line, "Base {} ms", displayed_value);
-                    }
-                    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
+                    let _ = Text::with_baseline(
+                        "Cycle length",
+                        Point::new(0, 16),
+                        style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display);
+                    let _ = write!(&mut line, "{} ms", displayed_value);
+                    let _ = Text::with_baseline(&line, Point::new(0, 30), style, Baseline::Top)
                         .draw(&mut display);
+                }
+                UiDisplayModel::CyclePadLength { pad } => {
+                    let mut header: String<24> = String::new();
+                    let _ = write!(&mut header, "LoopTic P{} Cycle", pad + 1);
+                    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top)
+                        .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    if displayed_value == 0 {
+                        let _ = write!(&mut line, "Length 0 (Global)");
+                    } else {
+                        let _ = write!(&mut line, "Length {} ms", displayed_value);
+                    }
+                    let _ = Text::with_baseline(&line, Point::new(0, 18), style, Baseline::Top)
+                        .draw(&mut display);
+                    let _ =
+                        Text::with_baseline("0 = Global", Point::new(0, 38), style, Baseline::Top)
+                            .draw(&mut display);
                 }
                 UiDisplayModel::SampleSelectVoice => {
                     draw_select_voice(&mut display, style, "Sample");
