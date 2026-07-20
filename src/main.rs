@@ -39,7 +39,7 @@ use embassy_time::{Delay, Duration, Instant, Timer, with_deadline};
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_6X10};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Triangle};
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, Triangle};
 use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
@@ -78,6 +78,7 @@ struct UiState {
     controller: UiController,
     volume_pressed: bool,
     song_library: SongLibraryStatus,
+    song_library_ready: bool,
     pending_song_operation: Option<SongStorageOperation>,
     clean_song_revision: u32,
 }
@@ -252,6 +253,7 @@ async fn storage_task(
     ui.lock(|state| {
         let mut state = state.borrow_mut();
         state.song_library.occupied = occupancy;
+        state.song_library_ready = true;
         if let Some(status) = boot_status {
             state.controller.set_song_status(status);
         }
@@ -311,9 +313,7 @@ async fn storage_task(
                         let mut state = state.borrow_mut();
                         state.song_library = SongLibraryStatus::empty();
                         state.clean_song_revision = 0;
-                        state
-                            .controller
-                            .set_song_status(SongUiStatus::Success { operation });
+                        state.controller.complete_song_operation(operation);
                     });
                 } else {
                     set_song_status(ui, SongUiStatus::Failed { operation });
@@ -330,7 +330,12 @@ async fn storage_task(
                 if operation == SongStorageOperation::SaveCurrent
                     && live_revision == ui.lock(|state| state.borrow().clean_song_revision)
                 {
-                    set_song_status(ui, SongUiStatus::NoChanges { slot });
+                    ui.lock(|state| {
+                        state
+                            .borrow_mut()
+                            .controller
+                            .complete_song_operation(operation);
+                    });
                     continue;
                 }
 
@@ -375,9 +380,7 @@ async fn storage_task(
                         state.song_library.current_slot = Some(slot);
                         state.song_library.dirty = false;
                         state.clean_song_revision = live_revision;
-                        state
-                            .controller
-                            .set_song_status(SongUiStatus::Success { operation });
+                        state.controller.complete_song_operation(operation);
                     });
                 } else {
                     set_song_status(ui, SongUiStatus::Failed { operation });
@@ -434,9 +437,7 @@ async fn storage_task(
                         state.song_library.current_slot = Some(slot);
                         state.song_library.dirty = false;
                         state.clean_song_revision = revision;
-                        state
-                            .controller
-                            .set_song_status(SongUiStatus::Success { operation });
+                        state.controller.complete_song_operation(operation);
                     }),
                     SongLoadResult::Unsupported { found, supported } => set_song_status(
                         ui,
@@ -509,8 +510,8 @@ async fn storage_task(
                     if library.current_slot == Some(destination) {
                         // The live controls did not change, but their backing
                         // slot now contains the copied source. Advance the edit
-                        // generation so root Save correctly offers to restore
-                        // the live song instead of reporting No changes.
+                        // generation so root Save correctly restores the live
+                        // song instead of silently treating it as unchanged.
                         shared.lock(|state| state.borrow_mut().mark_song_changed());
                     }
                     ui.lock(|state| {
@@ -519,9 +520,7 @@ async fn storage_task(
                         if state.song_library.current_slot == Some(destination) {
                             state.song_library.dirty = true;
                         }
-                        state
-                            .controller
-                            .set_song_status(SongUiStatus::Success { operation });
+                        state.controller.complete_song_operation(operation);
                     });
                 } else {
                     set_song_status(ui, SongUiStatus::Failed { operation });
@@ -549,9 +548,7 @@ async fn storage_task(
                         if state.song_library.current_slot == Some(slot) {
                             state.song_library.current_slot = None;
                         }
-                        state
-                            .controller
-                            .set_song_status(SongUiStatus::Success { operation });
+                        state.controller.complete_song_operation(operation);
                     });
                 } else {
                     set_song_status(ui, SongUiStatus::Failed { operation });
@@ -1415,7 +1412,17 @@ async fn controls_task(
                         })
                     });
                     let songs_page = next_ui.controller.page() == UiPage::Songs;
-                    let action = next_ui.controller.press_encoder(selected_division);
+                    let action = if songs_page {
+                        let revision = shared.lock(|state| state.borrow().song_revision);
+                        next_ui.song_library.dirty = revision != next_ui.clean_song_revision;
+                        next_ui.controller.press_encoder_with_library_readiness(
+                            selected_division,
+                            next_ui.song_library,
+                            next_ui.song_library_ready,
+                        )
+                    } else {
+                        next_ui.controller.press_encoder(selected_division)
+                    };
                     if songs_page {
                         encoder_acceleration = UiEncoderAcceleration::new();
                     }
@@ -1575,6 +1582,42 @@ async fn led_task(
     }
 }
 
+fn draw_menu_item<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    label: &str,
+    text_y: i32,
+    row_height: u32,
+    selected: bool,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let bounds = display.bounding_box();
+    let vertical_padding = row_height.saturating_sub(style.font.character_size.height) / 2;
+    let row_top = text_y - vertical_padding as i32;
+    if selected {
+        let _ = Rectangle::new(
+            Point::new(bounds.top_left.x, row_top),
+            Size::new(bounds.size.width, row_height),
+        )
+        .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+        .draw(display);
+    }
+
+    let row_style = if selected {
+        MonoTextStyle::new(style.font, BinaryColor::Off)
+    } else {
+        style
+    };
+    let _ = Text::with_baseline(
+        label,
+        Point::new(bounds.top_left.x + 12, text_y),
+        row_style,
+        Baseline::Top,
+    )
+    .draw(display);
+}
+
 fn draw_pattern_editor<D>(
     display: &mut D,
     style: MonoTextStyle<'_, BinaryColor>,
@@ -1643,47 +1686,47 @@ fn draw_pattern_editor<D>(
     let _ = write!(&mut header, "LoopTic P{} {}x{}", pad + 1, beats, repeats);
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
-    if window.more_above {
-        draw_scroll_triangle(display, 14, true);
-    }
     for row in 0..window.item_rows {
         let entry = window.start + row;
-        let marker = if entry == usize::from(cursor) {
-            '>'
-        } else {
-            ' '
-        };
         let mut line: String<20> = String::new();
         if entry == 0 {
-            let _ = write!(&mut line, "{} Cycles {}x", marker, repeats);
+            let _ = write!(&mut line, "Cycles {}x", repeats);
         } else if entry == 1 {
             let state = match fill_state {
                 PatternFillState::Empty => "off",
                 PatternFillState::Full => "ON",
                 PatternFillState::Mixed => "mix",
             };
-            let _ = write!(&mut line, "{} All {} avg{}%", marker, state, all_volume);
+            let _ = write!(&mut line, "All {} avg{}%", state, all_volume);
         } else {
             let state = if enabled_rows[row] { "ON" } else { "off" };
             let _ = write!(
                 &mut line,
-                "{} {:04} {} {}%",
-                marker,
+                "{:04} {} {}%",
                 entry - 1,
                 state,
                 volume_rows[row]
             );
         }
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 14 + row as i32 * 10),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            &line,
+            14 + row as i32 * 10,
+            10,
+            entry == usize::from(cursor),
+        );
+    }
+    if window.more_above {
+        draw_scroll_triangle(display, 14, true, window.start == usize::from(cursor));
     }
     if window.more_below {
-        draw_scroll_triangle(display, 14 + (window.item_rows - 1) as i32 * 10, false);
+        draw_scroll_triangle(
+            display,
+            14 + (window.item_rows - 1) as i32 * 10,
+            false,
+            window.start + window.item_rows - 1 == usize::from(cursor),
+        );
     }
 
     if pattern_steps == 0 {
@@ -1712,16 +1755,14 @@ fn draw_pattern_all_menu<D>(
     .iter()
     .enumerate()
     {
-        let marker = if *choice == selected { '>' } else { ' ' };
-        let mut line: String<16> = String::new();
-        let _ = write!(&mut line, "{} {}", marker, label);
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 16 + row as i32 * 14),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            label,
+            16 + row as i32 * 14,
+            14,
+            *choice == selected,
+        );
     }
 }
 
@@ -1765,15 +1806,11 @@ fn draw_root_menu<D>(
 
     const VISIBLE_ROWS: usize = 5;
     let window = scroll_menu_window(highlighted.index(), RootMode::COUNT, VISIBLE_ROWS);
-    if window.more_above {
-        draw_scroll_triangle(display, 14, true);
-    }
     for (row, mode) in RootMode::ALL[window.start..window.start + window.item_rows]
         .iter()
         .copied()
         .enumerate()
     {
-        let marker = if mode == highlighted { '>' } else { ' ' };
         let label = match mode {
             RootMode::Pattern => "Pattern",
             RootMode::Beats => "Beats",
@@ -1784,18 +1821,25 @@ fn draw_root_menu<D>(
             RootMode::Songs => "Songs",
             RootMode::ResetAll => "Reset all",
         };
-        let mut line: String<24> = String::new();
-        let _ = write!(&mut line, "{} {}", marker, label);
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 14 + row as i32 * 10),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            label,
+            14 + row as i32 * 10,
+            10,
+            mode == highlighted,
+        );
+    }
+    if window.more_above {
+        draw_scroll_triangle(display, 14, true, window.start == highlighted.index());
     }
     if window.more_below {
-        draw_scroll_triangle(display, 14 + (window.item_rows - 1) as i32 * 10, false);
+        draw_scroll_triangle(
+            display,
+            14 + (window.item_rows - 1) as i32 * 10,
+            false,
+            window.start + window.item_rows - 1 == highlighted.index(),
+        );
     }
 }
 
@@ -1809,22 +1853,20 @@ fn draw_songs_menu<D>(
     let _ =
         Text::with_baseline("LoopTic Songs", Point::new(0, 0), style, Baseline::Top).draw(display);
     for (row, operation) in SongMenuOperation::ALL.iter().copied().enumerate() {
-        let marker = if operation == selected { '>' } else { ' ' };
         let label = match operation {
             SongMenuOperation::Load => "Load",
             SongMenuOperation::SaveAs => "Save as",
             SongMenuOperation::Copy => "Copy",
             SongMenuOperation::Delete => "Delete",
         };
-        let mut line: String<20> = String::new();
-        let _ = write!(&mut line, "{} {}", marker, label);
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 16 + row as i32 * 12),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            label,
+            16 + row as i32 * 12,
+            12,
+            operation == selected,
+        );
     }
 }
 
@@ -1848,36 +1890,40 @@ fn draw_song_browser<D>(
 
     const VISIBLE_ROWS: usize = 4;
     let window = scroll_menu_window(selected.index(), looptic::SONG_SLOT_COUNT, VISIBLE_ROWS);
-    if window.more_above {
-        draw_scroll_triangle(display, 16, true);
-    }
     for row in 0..window.item_rows {
         let slot = SongSlot::from_index(window.start + row).unwrap_or_default();
-        let marker = if slot == selected { '>' } else { ' ' };
         let stored = if occupied.contains(slot) { '*' } else { '-' };
         let mut line: String<24> = String::new();
         let _ = write!(
             &mut line,
-            "{}{:03}{} {}",
-            marker,
+            "{:03}{} {}",
             slot.number(),
             stored,
             slot.animal_name()
         );
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 16 + row as i32 * 12),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            &line,
+            16 + row as i32 * 12,
+            12,
+            slot == selected,
+        );
+    }
+    if window.more_above {
+        draw_scroll_triangle(display, 16, true, window.start == selected.index());
     }
     if window.more_below {
-        draw_scroll_triangle(display, 16 + (window.item_rows - 1) as i32 * 12, false);
+        draw_scroll_triangle(
+            display,
+            16 + (window.item_rows - 1) as i32 * 12,
+            false,
+            window.start + window.item_rows - 1 == selected.index(),
+        );
     }
 }
 
-fn draw_scroll_triangle<D>(display: &mut D, row_y: i32, points_up: bool)
+fn draw_scroll_triangle<D>(display: &mut D, row_y: i32, points_up: bool, inverted: bool)
 where
     D: DrawTarget<Color = BinaryColor>,
 {
@@ -1891,7 +1937,11 @@ where
         Point::new(0, base_y),
         Point::new(6, base_y),
     )
-    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .into_styled(PrimitiveStyle::with_fill(if inverted {
+        BinaryColor::Off
+    } else {
+        BinaryColor::On
+    }))
     .draw(display);
 }
 
@@ -1944,7 +1994,7 @@ fn draw_song_confirmation<D>(
     let warning = if destination_occupied {
         Some("Overwrite stored")
     } else if matches!(operation, SongStorageOperation::Load { .. }) && live_song_dirty {
-        Some("Unsaved changes!")
+        Some("Lose unsaved changes")
     } else {
         None
     };
@@ -1958,16 +2008,14 @@ fn draw_song_confirmation<D>(
     .iter()
     .enumerate()
     {
-        let marker = if *choice == selected { '>' } else { ' ' };
-        let mut line: String<16> = String::new();
-        let _ = write!(&mut line, "{} {}", marker, label);
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 37 + row as i32 * 13),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            label,
+            37 + row as i32 * 13,
+            13,
+            *choice == selected,
+        );
     }
 }
 
@@ -2146,16 +2194,14 @@ fn draw_reset_menu<D>(
     .iter()
     .enumerate()
     {
-        let marker = if *choice == selected { '>' } else { ' ' };
-        let mut line: String<16> = String::new();
-        let _ = write!(&mut line, "{} {}", marker, label);
-        let _ = Text::with_baseline(
-            &line,
-            Point::new(0, 18 + row as i32 * 16),
+        draw_menu_item(
+            display,
             style,
-            Baseline::Top,
-        )
-        .draw(display);
+            label,
+            18 + row as i32 * 16,
+            16,
+            *choice == selected,
+        );
     }
 }
 

@@ -4111,6 +4111,13 @@ impl SongStorageOperation {
             Self::Copy { destination, .. } => Some(destination),
         }
     }
+
+    /// Successful Save and Load operations return directly to navigation.
+    /// Destructive/library maintenance operations retain an acknowledged
+    /// completion screen.
+    pub const fn shows_success_dialog(self) -> bool {
+        matches!(self, Self::Format | Self::Copy { .. } | Self::Delete { .. })
+    }
 }
 
 /// Status overlay supplied by the storage runtime.
@@ -4128,8 +4135,8 @@ pub enum SongUiStatus {
     Success {
         operation: SongStorageOperation,
     },
-    /// The requested Save already matches the live song revision, or Copy
-    /// selected the same source and destination. No flash write occurred.
+    /// Copy selected the same source and destination, so no flash write
+    /// occurred.
     NoChanges {
         slot: SongSlot,
     },
@@ -4329,7 +4336,7 @@ pub enum UiDisplayModel {
     SongConfirmation {
         operation: SongStorageOperation,
         choice: SongConfirmChoice,
-        /// Whether Save-as or Copy will replace an existing destination.
+        /// Whether the staged operation will replace an existing destination.
         destination_occupied: bool,
         /// Whether Load will discard edits made since the current song was
         /// saved or loaded.
@@ -4565,6 +4572,14 @@ impl UiController {
         self.song_status = Some(status);
     }
 
+    /// Finish a successful storage operation using its UI completion policy.
+    pub fn complete_song_operation(&mut self, operation: SongStorageOperation) {
+        self.clear_transient_notices();
+        self.song_status = operation
+            .shows_success_dialog()
+            .then_some(SongUiStatus::Success { operation });
+    }
+
     pub fn clear_song_status(&mut self) {
         self.song_status = None;
     }
@@ -4650,6 +4665,37 @@ impl UiController {
     }
 
     pub fn press_encoder(&mut self, selected_division: Option<u16>) -> Option<UiAction> {
+        // Callers without live song-library state conservatively retain the
+        // Load confirmation. Firmware should use `press_encoder_with_library`
+        // so clean songs and empty source slots can proceed immediately.
+        self.press_encoder_with_library_state(selected_division, None)
+    }
+
+    /// Handle a push with a complete song-library snapshot.
+    pub fn press_encoder_with_library(
+        &mut self,
+        selected_division: Option<u16>,
+        library: SongLibraryStatus,
+    ) -> Option<UiAction> {
+        self.press_encoder_with_library_readiness(selected_division, library, true)
+    }
+
+    /// Handle a push while explicitly identifying whether slot occupancy is
+    /// authoritative. Dirty Loads remain conservative until it is ready.
+    pub fn press_encoder_with_library_readiness(
+        &mut self,
+        selected_division: Option<u16>,
+        library: SongLibraryStatus,
+        occupancy_ready: bool,
+    ) -> Option<UiAction> {
+        self.press_encoder_with_library_state(selected_division, Some((library, occupancy_ready)))
+    }
+
+    fn press_encoder_with_library_state(
+        &mut self,
+        selected_division: Option<u16>,
+        library: Option<(SongLibraryStatus, bool)>,
+    ) -> Option<UiAction> {
         if let Some(status) = self.song_status {
             if matches!(status, SongUiStatus::UnsupportedStorage { .. }) {
                 self.song_status = None;
@@ -4681,7 +4727,7 @@ impl UiController {
                 }
             }
             UiPage::Pattern => self.press_pattern_control(selected_division),
-            UiPage::Songs => self.press_songs_control(),
+            UiPage::Songs => self.press_songs_control(library),
             UiPage::ResetAll => {
                 let confirmed = self.reset_choice == ResetAllChoice::Reset;
                 self.page = UiPage::Root;
@@ -4698,7 +4744,10 @@ impl UiController {
         }
     }
 
-    fn press_songs_control(&mut self) -> Option<UiAction> {
+    fn press_songs_control(
+        &mut self,
+        library: Option<(SongLibraryStatus, bool)>,
+    ) -> Option<UiAction> {
         match self.songs_view {
             SongsView::Operations { selected } => {
                 let purpose = match selected {
@@ -4732,6 +4781,22 @@ impl UiController {
                         SongBrowserPurpose::Delete => SongStorageOperation::Delete { slot },
                         SongBrowserPurpose::CopySource => unreachable!(),
                     };
+                    let immediate_selection = match operation {
+                        SongStorageOperation::SaveAs { .. } => Some(SongMenuOperation::SaveAs),
+                        SongStorageOperation::Load { slot }
+                            if library.is_some_and(|(library, occupancy_ready)| {
+                                !library.dirty
+                                    || (occupancy_ready && !library.occupied.contains(slot))
+                            }) =>
+                        {
+                            Some(SongMenuOperation::Load)
+                        }
+                        _ => None,
+                    };
+                    if let Some(selected) = immediate_selection {
+                        self.songs_view = SongsView::Operations { selected };
+                        return Some(self.begin_song_operation(operation));
+                    }
                     self.songs_view = SongsView::Confirmation {
                         operation,
                         choice: SongConfirmChoice::Cancel,
@@ -5243,7 +5308,7 @@ pub fn pattern_window_start(cursor: u16, division: u16, visible_rows: u16) -> u1
 
 /// A selectable slice plus continuation flags for a scrolling OLED menu.
 /// Firmware renders the flags beside the first and last item, so they consume
-/// horizontal marker space rather than reducing the number of visible items.
+/// the left indicator gutter rather than reducing the number of visible items.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScrollMenuWindow {
     pub start: usize,
@@ -5264,7 +5329,7 @@ pub fn scroll_menu_window(
     let item_rows = item_count.min(visible_rows);
     // When more items remain below, keep the selection one row above the
     // bottom so the final row can carry the continuation triangle in the
-    // ordinary selection-marker column. Each further selection still shifts
+    // ordinary left indicator gutter. Each further selection still shifts
     // the window by exactly one entry.
     let start = selected
         .saturating_sub(item_rows.saturating_sub(2))
@@ -7962,6 +8027,25 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_ui_keeps_continuation_rows_separate_from_the_selection() {
+        for visible_rows in [4, 5] {
+            for item_count in 1..=300 {
+                for selected in 0..item_count {
+                    let window = scroll_menu_window(selected, item_count, visible_rows);
+                    assert!(selected >= window.start);
+                    assert!(selected < window.start + window.item_rows);
+                    if window.more_above {
+                        assert_ne!(selected, window.start);
+                    }
+                    if window.more_below {
+                        assert_ne!(selected, window.start + window.item_rows - 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn timing_palette_and_led_helpers_are_bounded() {
         assert_eq!(adjust_beat_multiplier(0, -1), 0);
         assert_eq!(
@@ -9106,37 +9190,124 @@ mod tests {
     }
 
     #[test]
-    fn song_confirmations_expose_overwrite_and_dirty_load_context() {
+    fn save_as_is_immediate_while_dirty_occupied_load_still_confirms() {
         let slot = SongSlot::from_number(1).unwrap();
         let mut occupied = SongSlotOccupancy::empty();
         occupied.set(slot, true);
+
+        for occupancy in [SongSlotOccupancy::empty(), occupied] {
+            let library = SongLibraryStatus {
+                occupied: occupancy,
+                current_slot: Some(slot),
+                dirty: true,
+            };
+            let mut save_as = UiController::new();
+            save_as.rotate_root(RootMode::Songs.index() as i32);
+            save_as.enter_root_mode();
+            save_as.rotate_songs(1);
+            assert_eq!(save_as.press_encoder(None), None);
+            assert_eq!(
+                save_as.display_model_with_library(false, library),
+                UiDisplayModel::SongBrowser {
+                    purpose: SongBrowserPurpose::SaveAs,
+                    slot,
+                    occupied: occupancy,
+                }
+            );
+
+            let operation = SongStorageOperation::SaveAs { slot };
+            assert_eq!(save_as.press_encoder(None), Some(UiAction::Song(operation)));
+            assert_eq!(
+                save_as.song_status(),
+                Some(SongUiStatus::Busy { operation })
+            );
+            assert_eq!(
+                save_as.songs_view(),
+                SongsView::Operations {
+                    selected: SongMenuOperation::SaveAs,
+                }
+            );
+        }
+
+        for current_slot in [None, Some(slot)] {
+            let library = SongLibraryStatus {
+                occupied,
+                current_slot,
+                dirty: true,
+            };
+            let mut load = UiController::new();
+            load.rotate_root(RootMode::Songs.index() as i32);
+            load.enter_root_mode();
+            assert_eq!(load.press_encoder_with_library(None, library), None);
+            assert_eq!(load.press_encoder_with_library(None, library), None);
+            assert_eq!(
+                load.display_model_with_library(false, library),
+                UiDisplayModel::SongConfirmation {
+                    operation: SongStorageOperation::Load { slot },
+                    choice: SongConfirmChoice::Cancel,
+                    destination_occupied: false,
+                    live_song_dirty: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn clean_or_empty_load_is_immediate_without_confirmation() {
+        let slot = SongSlot::from_number(1).unwrap();
+        let operation = SongStorageOperation::Load { slot };
+
+        for (dirty, target_occupied, current_slot) in [
+            (false, true, None),
+            (false, true, Some(slot)),
+            (false, false, None),
+            (true, false, None),
+            (true, false, Some(slot)),
+        ] {
+            let mut occupied = SongSlotOccupancy::empty();
+            occupied.set(slot, target_occupied);
+            let library = SongLibraryStatus {
+                occupied,
+                current_slot,
+                dirty,
+            };
+            let mut load = UiController::new();
+            load.rotate_root(RootMode::Songs.index() as i32);
+            load.enter_root_mode();
+            assert_eq!(load.press_encoder_with_library(None, library), None);
+            assert_eq!(
+                load.press_encoder_with_library(None, library),
+                Some(UiAction::Song(operation))
+            );
+            assert_eq!(load.song_status(), Some(SongUiStatus::Busy { operation }));
+            assert_eq!(
+                load.songs_view(),
+                SongsView::Operations {
+                    selected: SongMenuOperation::Load,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_load_is_conservative_until_occupancy_is_ready() {
+        let slot = SongSlot::from_number(1).unwrap();
         let library = SongLibraryStatus {
-            occupied,
-            current_slot: Some(slot),
+            occupied: SongSlotOccupancy::empty(),
+            current_slot: None,
             dirty: true,
         };
-
-        let mut save_as = UiController::new();
-        save_as.rotate_root(RootMode::Songs.index() as i32);
-        save_as.enter_root_mode();
-        save_as.rotate_songs(1);
-        assert_eq!(save_as.press_encoder(None), None);
-        assert_eq!(save_as.press_encoder(None), None);
-        assert_eq!(
-            save_as.display_model_with_library(false, library),
-            UiDisplayModel::SongConfirmation {
-                operation: SongStorageOperation::SaveAs { slot },
-                choice: SongConfirmChoice::Cancel,
-                destination_occupied: true,
-                live_song_dirty: true,
-            }
-        );
-
         let mut load = UiController::new();
         load.rotate_root(RootMode::Songs.index() as i32);
         load.enter_root_mode();
-        assert_eq!(load.press_encoder(None), None);
-        assert_eq!(load.press_encoder(None), None);
+        assert_eq!(
+            load.press_encoder_with_library_readiness(None, library, false),
+            None
+        );
+        assert_eq!(
+            load.press_encoder_with_library_readiness(None, library, false),
+            None
+        );
         assert_eq!(
             load.display_model_with_library(false, library),
             UiDisplayModel::SongConfirmation {
@@ -9145,6 +9316,22 @@ mod tests {
                 destination_occupied: false,
                 live_song_dirty: true,
             }
+        );
+
+        let clean = SongLibraryStatus {
+            dirty: false,
+            ..library
+        };
+        let mut clean_load = UiController::new();
+        clean_load.rotate_root(RootMode::Songs.index() as i32);
+        clean_load.enter_root_mode();
+        assert_eq!(
+            clean_load.press_encoder_with_library_readiness(None, clean, false),
+            None
+        );
+        assert_eq!(
+            clean_load.press_encoder_with_library_readiness(None, clean, false),
+            Some(UiAction::Song(SongStorageOperation::Load { slot }))
         );
     }
 
@@ -9212,6 +9399,36 @@ mod tests {
         ui.set_song_status(SongUiStatus::Success { operation });
         assert_eq!(ui.press_encoder(None), None);
         assert_eq!(ui.song_status(), None);
+    }
+
+    #[test]
+    fn successful_save_and_load_are_silent_but_maintenance_completion_is_visible() {
+        let slot = SongSlot::from_number(42).unwrap();
+        let other = SongSlot::from_number(43).unwrap();
+        let mut ui = UiController::new();
+
+        for operation in [
+            SongStorageOperation::SaveCurrent,
+            SongStorageOperation::SaveAs { slot },
+            SongStorageOperation::Load { slot },
+        ] {
+            ui.set_song_status(SongUiStatus::Busy { operation });
+            ui.complete_song_operation(operation);
+            assert_eq!(ui.song_status(), None);
+        }
+
+        for operation in [
+            SongStorageOperation::Format,
+            SongStorageOperation::Copy {
+                source: slot,
+                destination: other,
+            },
+            SongStorageOperation::Delete { slot },
+        ] {
+            ui.set_song_status(SongUiStatus::Busy { operation });
+            ui.complete_song_operation(operation);
+            assert_eq!(ui.song_status(), Some(SongUiStatus::Success { operation }));
+        }
     }
 
     #[test]
@@ -9968,8 +10185,10 @@ mod tests {
 
     #[test]
     fn song_decoder_migrates_v2_with_global_cycle_lengths() {
-        let mut legacy = StoredSongV2::default();
-        legacy.base_interval_ms = 7_777;
+        let mut legacy = StoredSongV2 {
+            base_interval_ms: 7_777,
+            ..StoredSongV2::default()
+        };
         legacy.pads[4].division = 3;
         legacy.pads[4].pattern_repeats = 2;
         let expected = StoredSongV3::from(legacy.clone());

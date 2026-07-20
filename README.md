@@ -23,9 +23,12 @@ The OLED root menu is ordered `Beats`, `Cycle length`, `Pattern`, `Sample`,
 encoder detent moves one item, clamps at Beats and Reset all, and never
 accelerates; pressing the encoder enters the selected mode or invokes Save. The
 five visible rows scroll as the cursor reaches the later entries. The root
-cursor is remembered when leaving and returning to the menu. Beats, Cycle
-length, Pattern, Sample, Light, and Songs remain open until Return is pressed;
-the Reset all confirmation instead exits when either choice is confirmed.
+cursor is remembered when leaving and returning to the menu. Every selectable
+list uses a full-width white highlight with black text for its active row;
+continuation triangles remain visible at the left when more entries are above
+or below. Beats, Cycle length, Pattern, Sample, Light, and Songs remain open
+until Return is pressed; the Reset all confirmation instead exits when either
+choice is confirmed.
 
 Selection starts in single-voice mode. A lone beat-key press selects only that
 voice, replaces a different single selection, or clears it when it was already
@@ -305,28 +308,36 @@ initial state is shown as `Unsaved`, and Save, Load, Copy, and Delete are all
 explicit operations.
 
 The root `Save` entry saves immediately back to the current slot. If the live
-song has not changed since its last Save or Load, it reports `No changes` and
-does not write flash. If there is no current slot, Save opens the slot browser
-in Save-as mode. The root header shows the current three-digit slot or
+song has not changed since its last Save or Load, it silently returns without
+writing flash or opening a `No changes` dialog. If there is no current slot,
+Save opens the slot browser in Save-as mode. Selecting a Save-as slot starts the
+write immediately, even when that slot is occupied; Save and Save-as never add
+a confirmation step. The root header shows the current three-digit slot or
 `Unsaved`; `*` means live musical state differs from the last saved or loaded
 revision.
 
 `Songs` opens `Load`, `Save as`, `Copy`, and `Delete`. Selecting an operation
 opens a bounded slot browser; `*` marks a stored slot and `-` an empty one.
 Slow turns move one slot and eligible fast turns move ten, always clamping at
-`001` and `256` rather than wrapping. Each operation uses a `Cancel`-first
-confirmation. Copy reads one stored slot and writes another without changing
-the live song. Copy intentionally transfers the raw, self-versioned record: it
-can preserve an unsupported record for use by another firmware version, but it
-can also duplicate a corrupt record; only Load decodes and validates musical
-state. Copy and Save-as confirmations warn before replacing an occupied
-destination, and Load warns before discarding dirty live edits. Deleting the
-current slot leaves the live music intact but changes its identity to
-`Unsaved`. Return cancels any staged choice. Once the OLED says an operation is
-in progress, flash programming cannot be cancelled safely and its Busy screen
-cannot be dismissed; Return records the underlying navigation request while
-completion continues. Completed and error screens remain visible until Return
-or an encoder press acknowledges them.
+`001` and `256` rather than wrapping. Save-as starts as soon as its destination
+is selected and overwrites an occupied slot without another prompt. Selecting
+a Load slot starts immediately when the live state is clean. When it is dirty,
+selecting an occupied Load slot first opens a `Cancel`-first warning that
+explicitly says unsaved changes will be lost. An empty Load slot proceeds
+directly to its empty-slot feedback because it cannot replace the live song.
+Copy and Delete retain their confirmations, as does Format when incompatible
+storage offers reformatting.
+Copy reads one stored slot and writes another without changing the live song.
+Copy intentionally transfers the raw, self-versioned record: it can preserve an
+unsupported record for use by another firmware version, but it can also
+duplicate a corrupt record; only Load decodes and validates musical state.
+Deleting the current slot leaves the live music intact but changes its identity
+to `Unsaved`. Return cancels any staged browser or confirmation. Once the OLED
+says an operation is in progress, flash programming cannot be cancelled safely
+and its Busy/progress screen cannot be dismissed. Successful Save, Save-as, and
+Load operations return to normal navigation without a completion dialog;
+Copy/Delete/Format completion screens and operation errors remain visible until
+Return or an encoder press acknowledges them.
 
 A song stores the global Cycle length; all nine Beats values, optional per-pad
 Cycle-length overrides, Pattern Cycles multipliers, sample assignments,
@@ -353,9 +364,9 @@ Loading alone does not rewrite the stored v2 record. The next operation that
 actually writes the live song—Save after an edit or Save-as—encodes v3; raw Copy
 preserves the source's original version. V1 records remain unsupported.
 
-The first confirmed Save erases and initializes the complete reserved song
-partition before writing slot data, so it can take noticeably longer than a
-later Save. A blank partition is never initialized merely by booting.
+The first Save erases and initializes the complete reserved song partition
+before writing slot data, so it can take noticeably longer than a later Save.
+A blank partition is never initialized merely by booting.
 
 ## Reset all
 
@@ -591,9 +602,12 @@ Mute must remain red, Volume yellow, and Return white.
 Verify the root order `Beats`, `Cycle length`, `Pattern`, `Sample`, `Light`,
 `Save`, `Songs`, `Reset all`, the initial Beats highlight, five-row scrolling,
 one-detent root movement without acceleration, clamping at both ends,
-encoder-button entry, and the remembered root cursor. Select a beat with
-one press, release it, and confirm that selection persists. Verify another lone
-press replaces the selection and pressing the sole selected pad clears it.
+encoder-button entry, and the remembered root cursor. Confirm that every menu's
+active row is a full-width white band with black text, including immediately
+after returning from a submenu, and that scroll triangles remain contrasting.
+Select a beat with one press, release it, and confirm that selection persists.
+Verify another lone press replaces the selection and pressing the sole selected
+pad clears it.
 Press a two-or-more-key chord at the root and in each menu; it must replace the
 selection with that exact ascending group and enter multi-select mode. While a
 group has at least two voices, verify lone taps add and remove members, additions
@@ -616,15 +630,24 @@ replaying the opening detent. Return must cancel only the warning; a second
 Return must navigate normally. Selection changes, context changes, Load, and
 Reset must also discard an outstanding warning.
 
-With blank storage, verify root Save opens Save as and initializes only after
-confirmation. Save several distinct songs, reboot, and confirm that the slot
-markers survive while no song auto-loads. Load each song, edit it, check the
-root dirty `*`, then use root Save and verify a second unchanged Save performs
-no write. Exercise Copy and Delete (including the current slot), every
-Cancel-first confirmation, empty-slot feedback, and Return from each staged
-screen. Reflash with `cargo flash` and verify all stored songs remain. During
-power-cut and incompatible-format tests, unsupported layouts and records must
-be reported and left intact rather than reformatted silently.
+With blank storage, verify root Save opens Save as and initializes immediately
+when a slot is selected. Select both empty and occupied Save-as destinations and
+verify that writing starts without a confirmation. Save several distinct songs,
+reboot, and confirm that the slot markers survive while no song auto-loads.
+Load each song, edit it, check the root dirty `*`, then use root Save and verify
+a second unchanged Save performs no write and shows no `No changes` dialog.
+Verify successful Save, Save-as, and Load operations leave their Busy screen
+without a completion dialog, while errors remain visible. Select a Load slot
+with clean live state and verify it starts immediately. Repeat with dirty live
+state and an occupied slot; verify the `Cancel`-first warning explicitly says
+`Lose unsaved changes` before Load can proceed. A dirty-state attempt to load an
+empty slot must skip that warning and show empty-slot feedback. Exercise
+the remaining Copy, Delete, and
+Format confirmations, including Delete of the current slot, plus empty-slot
+feedback and Return from each staged screen. Reflash with `cargo flash` and
+verify all stored songs remain. During power-cut and incompatible-format tests,
+unsupported layouts and records must be reported and left intact rather than
+reformatted silently.
 
 Enter Pattern with no selection and check `Select voice`. Attempt entry with
 multiple voices selected and verify the UI remains at the root with

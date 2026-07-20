@@ -85,8 +85,10 @@ The OLED root menu is ordered `Beats`, `Cycle length`, `Pattern`, `Sample`,
 `Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot.
 Encoder navigation moves one item per detent without acceleration and clamps at
 both ends; the five-row window scrolls and its cursor survives mode entry and
-Return. Encoder push enters the highlighted mode or invokes root Save; modes do
-not close merely because a beat key is released.
+Return. Selectable lists render their active row as a full-width white band with
+black text, while continuation triangles remain contrasting at the left edge.
+Encoder push enters the highlighted mode or invokes root Save; modes do not
+close merely because a beat key is released.
 
 Beat-key press edges update a persistent ordered selection; release edges have
 no effect. Selection begins in single-voice mode, where a lone press uses the
@@ -174,12 +176,24 @@ Mode behavior is:
 - **Light:** edit brightness from 0 through 100% with the established 1% slow
   and 10% accelerated steps while supplying a steady full-palette base state.
 - **Save:** save the current live song back to its associated slot, skipping
-  the flash write when its edit revision is unchanged. With no associated slot,
-  enter the Save-as browser instead.
+  the flash write and returning silently when its edit revision is unchanged.
+  With no associated slot, enter the Save-as browser instead. Selecting any
+  Save-as destination immediately starts the write, including replacement of
+  an occupied slot; neither Save path uses a confirmation.
 - **Songs:** open bounded Load, Save-as, Copy, and Delete flows over 256 stable
   numbered/animal-named slots. Slot browsing uses 1/10-step acceleration and
-  clamps rather than wrapping. Every write/destructive choice is Cancel-first;
-  Copy operates stored-slot to stored-slot without replacing live state.
+  clamps rather than wrapping. Selecting a Load slot starts immediately when
+  live state is clean. Dirty live state and an occupied source instead open a
+  Cancel-first warning explicitly stating that unsaved changes will be lost
+  before Load can proceed. Empty Load slots proceed directly to empty feedback.
+  Until the boot occupancy scan completes, dirty Loads conservatively take the
+  confirmation path rather than treating the not-yet-known map as empty.
+  Copy and Delete retain their confirmations, as does Format when incompatible
+  storage offers reformatting. Copy operates stored-slot to stored-slot without
+  replacing live state. Busy and formatting progress overlays remain
+  authoritative during flash work, and errors remain dismissible afterward;
+  successful Save, Save-as, and Load operations return without a completion
+  dialog. Copy, Delete, and Format retain their completion screens.
 - **Reset all:** open `Cancel`/`Reset` with `Cancel` initially selected. Each
   detent moves one choice without acceleration and clamps at the ends. Pressing
   the encoder on either choice exits the confirmation.
@@ -648,6 +662,9 @@ Exercise these cases separately and confirm their diagnostic counters:
 11. Starting with Beats highlighted, navigate the eight root entries in
     `Beats`, `Cycle length`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`,
     `Reset all` order; verify five-row scrolling and clamping at both ends.
+    Verify every selectable list uses a full-width white active row with black
+    text, including after Return restores a remembered cursor, and that both
+    scroll triangles stay visible against the row beneath them.
     Verify lone presses use exclusive selection until a 2+ chord at the root or
     in any menu replaces selection with its exact ascending group. In multi
     mode, lone presses must append or remove members chronologically, primary
@@ -683,14 +700,23 @@ Exercise these cases separately and confirm their diagnostic counters:
     choices, preserve selection
     when leaving modes and confirmations, clear selection when already at the
     root, and block already-held controls until release.
-12. Exercise all 256 named song slots, unchanged Save suppression, Load,
-    Save-as overwrite, stored-slot Copy, Delete, empty-slot feedback, dirty
-    indication, Return cancellation, audio fade/pause/resume, USB firmware
-    replacement with data retained, and the version/corruption screens. Load a
-    v2 record and verify an in-memory migration with every pad following Global,
-    no automatic flash rewrite, and a v3 record after an edit followed by Save
-    or after Save-as. Run the power-cut matrix in `song-storage.md`; every slot
-    must recover as the old or new complete value, never a mixture.
+12. Exercise all 256 named song slots and verify unchanged root Save suppresses
+    the write without a `No changes` dialog. Save-as selection must immediately
+    start writing to both empty and occupied destinations without confirmation.
+    A clean-state Load must start immediately when its slot is selected. A
+    dirty-state Load of an occupied slot must first show a Cancel-first warning
+    with `Lose unsaved changes`; an empty slot must skip the warning and report
+    empty. Successful Save, Save-as, and Load must
+    leave Busy without a completion dialog; Busy/formatting progress and errors
+    must remain visible as applicable. Exercise the remaining Copy, Delete, and
+    Format confirmations, stored-slot Copy, Delete of the current slot,
+    empty-slot feedback, dirty indication, Return cancellation, audio
+    fade/pause/resume, USB firmware replacement with data retained, and the
+    version/corruption screens. Load a v2 record and verify an in-memory
+    migration with every pad following Global, no automatic flash rewrite, and
+    a v3 record after an edit followed by Save or after Save-as. Run the
+    power-cut matrix in `song-storage.md`; every slot must recover as the old or
+    new complete value, never a mixture.
 13. Alter every Reset all category and verify its default Cancel choice,
     one-detent nonaccelerated movement, end clamping, and inert Cancel path.
     Create active primaries and forced-fade tails, then confirm Reset. Verify the

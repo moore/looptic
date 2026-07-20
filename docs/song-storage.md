@@ -119,7 +119,7 @@ alive while audio remains paused. Explicit reformatting reports the completed
 erase-sector percentage on the OLED. This still clears every potentially stale map byte; the
 metadata-first write ordering makes a power cut during an erase reboot as
 Blank so the full erase can be retried safely. Saving an unchanged record
-should report `No changes` and skip the flash operation.
+silently skips the flash operation.
 
 An ordinary occupancy scan only reads flash. If a supported journal contains
 an interrupted operation, however, `sequential-storage` may automatically
