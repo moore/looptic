@@ -88,15 +88,26 @@ both ends; the five-row window scrolls and its cursor survives mode entry and
 Return. Encoder push enters the highlighted mode or invokes root Save; modes do
 not close merely because a beat key is released.
 
-Beat-key press edges update persistent selection. The current policy is
-exclusive: an unselected pad replaces the selected pad, pressing the selected
-pad clears it, and release edges have no effect. `VoiceSelection` uses a
-nine-bit mask and exposes operations that can represent multiple pads, but the
-current controller and control routing still resolve only one selected pad.
-Future multi-select editors therefore require an explicit routing policy even
-though their storage is already representable. Selection remains editable at
-the root and in every mode. Selection changes and key releases do not publish
-sample previews.
+Beat-key press edges update a persistent ordered selection; release edges have
+no effect. Selection begins in single-voice mode, where a lone press uses the
+exclusive toggle. Any chord of two or more debounced pads, at the root or in a
+menu, replaces selection with exactly that chord in ascending pad order and
+enters multi-select mode. While at least two members remain, lone presses
+independently add or remove pads, new members append chronologically, and
+removing the primary promotes the next-oldest member. Removing down to one exits
+multi-select mode; subsequent lone presses are exclusive again. A later chord
+always replaces the complete group.
+
+`VoiceSelection` stores the nine-bit mask and fixed-capacity chronological
+order. Its selected count determines whether multi-select mode is active, and
+it exposes a validated group summary
+containing the mask and primary pad. A multi-voice OLED header renders as
+`P<primary>+<additional>`, while all selected LEDs receive equal selected-white
+treatment. Pattern requires exactly one voice:
+attempting to enter it with a group leaves the controller at the root and shows
+`Pattern needs 1 voice` / `Deselect extras`. A chord pressed while Pattern is
+open installs the new ordered group, closes Pattern, and shows the same root
+warning. Selection changes and key releases never publish sample previews.
 
 The bottom-right control is Return. It is white. On the scan that recognizes
 its press, Return takes priority over other key-press edges and an
@@ -107,8 +118,8 @@ before Return is recognized. In the Pattern Cycles editor, Return closes only
 that editor and remains in Pattern. Otherwise, Return closes the current mode
 or confirmation, discards any still-uncommitted
 choice or control gesture,
-preserves beat selection, and restores the root at its remembered cursor. A
-Return press while already at the root instead clears selection. Controls
+preserves the complete selection, and restores the root at its remembered
+cursor. A Return press while already at the root instead clears selection. Controls
 already physically held at that point are blocked until release, preventing an
 input intended for the previous screen from leaking into the root.
 
@@ -116,9 +127,22 @@ Encoder acceleration applies only when consecutive detents within 40 ms address
 the same target and move in the same direction. Changing target or direction
 starts again with the slow step.
 
+Beats, Cycle length, Sample, and ordinary pad Volume edits resolve a non-empty
+selection to its group summary and display the primary member's stored value.
+If all selected values match, a detent computes from that primary value and
+atomically assigns the result to the full mask. If they differ, the first
+detent performs no mutation and opens a sticky warning containing the primary
+pad and value. Further detents are ignored; encoder push atomically copies the
+primary value to the group, and the opening detent is discarded. Return cancels
+only the warning before resuming normal navigation. Selection or context
+changes, Load, and Reset also cancel it. Opening a warning clears encoder
+acceleration state, and a Volume warning remains confirmable after Volume is
+released.
+
 Mode behavior is:
 
-- **Pattern:** with no selection, show `Select voice`. A selected pad exposes
+- **Pattern:** with no selection, show `Select voice`; group entry is blocked at
+  the root. Exactly one selected pad exposes
   a persistent `Cycles` multiplier, its direct-slot pattern list, and its own
   cursor. Beats controls tick cadence while `beats × repeat` controls Pattern
   wrap length. Every trigger row shows
@@ -128,18 +152,25 @@ Mode behavior is:
   endpoint. The encoder push toggles a trigger row or opens/confirms the safe
   `All` choice.
 - **Beats:** with no selection, show `Select voice` and ignore encoder turns. A
-  selected pad directly edits its 0–256 Beats value with 1/10-step acceleration.
-  Encoder push has no action, and Return closes the mode.
+  selected group atomically edits its primary's 0–256 Beats value with
+  1/10-step acceleration and mixed-value confirmation. Each affected pad clamps
+  Pattern Cycles and its remembered cursor independently without erasing hidden
+  Pattern state. Encoder push has no action outside a warning, and Return closes
+  the mode.
 - **Cycle length:** with no selection, directly edit the global length with
-  10/100 ms acceleration. A selected pad directly edits its persistent Cycle
-  length with the same acceleration. Zero means follow the current global
-  value; 50 ms is the minimum independent length, and values 1 through 49 are
-  skipped. Encoder push has no action, and Return closes the mode.
-- **Sample:** with no selection, show `Select voice`. For a selected pad, each
-  encoder detent moves one entry through the 24-sample catalog without
-  acceleration and clamps at the first or last sample. Each actual assignment
-  change normally previews the new sample; holding the physical encoder button
-  while turning suppresses that preview without suppressing movement.
+  10/100 ms acceleration. A selected group atomically edits its primary's
+  stored Cycle length with the same acceleration and mixed-value confirmation.
+  Zero means follow the current global value; 50 ms is the minimum independent
+  length, and values 1 through 49 are skipped. Mixed detection compares stored
+  values, so zero differs from an explicit override equal to Global. Encoder
+  push has no action outside a warning, and Return closes the mode.
+- **Sample:** with no selection, show `Select voice`. For a selected group, each
+  encoder detent moves the primary value one entry through the 24-sample catalog without
+  acceleration and clamps at the first or last sample. Group editing atomically
+  assigns the primary's resulting value and uses mixed-value confirmation. Each
+  edit or synchronization queues no more than one preview through the primary;
+  holding the physical encoder button while turning suppresses that preview
+  without suppressing movement.
 - **Light:** edit brightness from 0 through 100% with the established 1% slow
   and 10% accelerated steps while supplying a steady full-palette base state.
 - **Save:** save the current live song back to its associated slot, skipping
@@ -153,25 +184,30 @@ Mode behavior is:
   detent moves one choice without acceleration and clamps at the ends. Pressing
   the encoder on either choice exits the confirmation.
 
-Mute captures the persistent selected pad at its press edge, or Global if the
+Mute captures the persistent selected group at its press edge, or Global if the
 selection is empty, and retains that target for the complete tap/hold gesture
-on every page. Return retains priority and cancels an active gesture. Volume
-instead resolves its target dynamically while held.
-Ordinarily it edits the currently selected pad or the master when selection is
-empty. On a selected pad's Pattern page, it edits the highlighted trigger
-level; highlighting `All` targets all stored trigger levels. It then returns
-encoder control to the open mode on release.
+on every page. A group tap atomically sets every member's local latch opposite
+the primary member's latch. A group hold momentarily mutes every captured member
+and restores their persistent latches on release. Return retains priority and
+cancels an active gesture. The Mute LED follows Global when selection is empty;
+otherwise it represents the primary local latch and active captured gesture.
+Volume instead resolves its target dynamically while held. Ordinarily it edits
+the selected group or the master when selection is empty, using the common
+mixed-value warning. On a selected pad's Pattern page, it edits the highlighted
+trigger level; highlighting `All` targets all stored trigger levels. It then returns
+encoder control to the open mode on release unless a warning remains open for
+push confirmation.
 
 Beat LEDs are composed in two stages. The base color is off when idle, steady
-white for the selected beat, a pad's normal palette color for a 100 ms trigger
+white for every selected beat, a pad's normal palette color for a 100 ms trigger
 or preview indication, or the normal palette while Light mode is open. On a
 selected key, a trigger contributes 20% of its palette color to 80% white before
 global brightness is applied, so continuous fast triggers still read as selected.
 
 If a selection exists, an additional 20% multiplier is then applied to every
-non-selected beat LED. Consequently idle keys remain off; trigger, preview, and
+unselected beat LED. Consequently idle keys remain off; trigger, preview, and
 Light states on other pads are dimmed by 80% rather than replaced with a steady
-light. The selected beat retains its computed white or palette color, and no
+light. Every selected beat retains its computed white or palette color, and no
 multiplier is applied when selection is empty. The bottom controls do not
 participate: their identities remain Mute red, Volume yellow, and Return white.
 
@@ -236,6 +272,9 @@ Persistent storage is deliberately outside the real-time renderer. The final
 2 MiB flash partition, versioned superblock, Postcard song schema,
 sequential-storage journal, explicit operation semantics, and audio-quiesce
 protocol are specified in [song storage architecture](song-storage.md).
+Selection order, multi-select mode, group summaries, and mixed-value warnings
+are runtime UI state and are not encoded in a song; multi-voice editing does not
+change either the song schema or physical storage layout.
 
 ### Cycle timing
 
@@ -609,17 +648,36 @@ Exercise these cases separately and confirm their diagnostic counters:
 11. Starting with Beats highlighted, navigate the eight root entries in
     `Beats`, `Cycle length`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`,
     `Reset all` order; verify five-row scrolling and clamping at both ends.
-    Enter each persistent
-    mode, change and clear selection without holding
-    beat keys, and verify per-pad Pattern cursors. In Beats, no
-    selection must show `Select voice`; each selected pad must directly use
-    1/10-step editing, encoder push must do nothing, and Return must reach the
-    root. In Cycle length, verify direct 10/100 ms global and selected-pad
-    editing. A selected pad at zero must follow later global edits; clockwise
-    from zero must select 50 ms, counter-clockwise below 50 ms must return to
-    zero, and values 1 through 49 must remain unreachable. Nonzero pad values
-    must ignore later global edits and persist independently. Encoder push must
-    do nothing, and Return must go directly to the root.
+    Verify lone presses use exclusive selection until a 2+ chord at the root or
+    in any menu replaces selection with its exact ascending group. In multi
+    mode, lone presses must append or remove members chronologically, primary
+    removal must promote the next-oldest, removal down to one must restore
+    exclusive mode, and a later chord must replace the group. Entering Pattern
+    with a group must remain at the root with `Pattern needs 1 voice` /
+    `Deselect extras`; a chord inside Pattern must preserve the new group while
+    returning to the same warning. Verify `P<primary>+<additional>` headers,
+    equal white treatment for selected LEDs, and per-pad Pattern cursors.
+    In Beats, no selection must show `Select voice`; group edits must directly
+    use 1/10-step editing and independently clamp each member's Pattern Cycles
+    and cursor without erasing hidden data. In Cycle length, verify direct
+    10/100 ms global and group editing. A selected pad at zero must follow later
+    global edits; clockwise from zero must select 50 ms, counter-clockwise below
+    50 ms must return to zero, and values 1 through 49 must remain unreachable.
+    Stored zero must compare differently from an equal explicit override.
+    Nonzero pad values must ignore later global edits and persist independently.
+    For Beats, Cycle length, Sample, and pad Volume, matching groups must update
+    atomically on the first detent. Mixed groups must warn without mutation,
+    ignore further turns, synchronize to the primary on push without replaying
+    the discarded detent, cancel only the warning on Return, cancel on selection
+    or context changes/Load/Reset, and restart acceleration at the slow step.
+    Each detent or synchronization must publish one musical-state revision.
+    Sample group edits and confirmations must queue at most one primary preview;
+    a Volume warning must remain push-confirmable after Volume release. For a
+    mixed-mute group, a tap must set every captured latch opposite the primary
+    latch in one revision; a hold must momentarily mute the captured group and
+    restore each persistent latch on release. Selection changes during the
+    gesture must not retarget it, and the Mute LED must represent the primary
+    local latch plus the active group gesture.
     Selection changes must not preview. Return must take priority over
     simultaneous key-press and encoder-button press edges, cancel uncommitted
     choices, preserve selection
@@ -641,11 +699,11 @@ Exercise these cases separately and confirm their diagnostic counters:
     clearing, cleared previews/pulses, preserved brightness/playback/load/
     counters, and return to the root with Reset all highlighted, selection
     empty, and no current song association.
-14. Verify idle beat LEDs are off and the selected beat is steady white. Its
-    trigger/preview indication must temporarily use its normal palette color.
+14. Verify idle beat LEDs are off and every selected beat is steady white. Each
+    selected trigger/preview indication must mix in its normal palette color.
     With no selection, trigger/preview and Light states must show at their
-    normal computed brightness. With one selected, those states on every other
-    beat must be multiplied to 20% while idle-off keys remain off. Confirm the
+    normal computed brightness. With a selection, those states on every
+    unselected beat must be multiplied to 20% while idle-off keys remain off. Confirm the
     red/yellow/white bottom controls are unaffected by beat dimming.
 
 Then run the combined worst-case workload continuously for 10 minutes. Passing
@@ -669,12 +727,14 @@ full/coarse dither continuity, adaptive-policy transitions, saturating mix,
 catalog rejection, and counter saturation. Pattern tests cover all 256 direct
 slots, independent enable/level persistence, relative whole-map adjustment,
 clamping, dirty synchronization, and reset defaults. UI host tests cover
-multi-capable selection storage and the exclusive policy, Sample-mode preview
-suppression while the encoder is held, clamped list navigation and persistent
-pages, per-pad Pattern cursors and confirmations, context-sensitive master,
-pad, trigger, and whole-map Volume targets, Return cleanup with preserve-in-
-mode/clear-at-root selection behavior, held-control suppression, Mute capture/
-cancellation on every page, bounded LED helpers, reset
+ordered chord-entered multi-selection, exclusive single mode, chronological
+primary promotion, group replacement, and Pattern entry blocking; atomic group
+Beats/Cycle/Sample/Volume edits and mixed-value warning confirmation; primary-
+only Sample previews and preview suppression while the encoder is held; clamped
+list navigation and persistent pages; per-pad Pattern cursors and confirmations;
+context-sensitive master, group, trigger, and whole-map Volume targets; Return
+cleanup with preserve-in-mode/clear-at-root selection behavior; held-control
+suppression; captured group Mute taps/holds; bounded LED helpers; reset
 confirmation, selection-aware beat dimming, musical-state reset, and exact
 primary release. Whole-map state tests verify that both `All` and `None` reset
 all trigger levels to 100% while `Cancel` leaves enablement and levels intact.

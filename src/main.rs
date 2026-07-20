@@ -45,17 +45,18 @@ use fixed::types::U24F8;
 use heapless::String;
 use looptic::load_control::{AudioLoadController, LoadLevel, RenderPolicy};
 use looptic::{
-    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, KEY_COUNT, KeyDebouncer, MUTE_KEY_INDEX, MuteButtonState,
-    MuteScanAction, MuteTarget, PatternAllChoice, PatternEditorAction, PatternFillState,
-    PatternVolumeTarget, RETURN_KEY_INDEX, ResetAllChoice, RootMode, SAMPLE_COUNT, SAMPLE_RATE,
-    SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN, SONG_FORMAT_VERSION, Sequencer, SharedState,
-    SongBrowserPurpose, SongConfirmChoice, SongLibraryStatus, SongMenuOperation, SongSlot,
-    SongSlotOccupancy, SongStorageOperation, SongUiStatus, SongsView, StoredSongV3, UiAction,
-    UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX,
-    VolumeTarget, adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness,
-    adjust_pad_cycle_length, adjust_sample_selection, decode_song, encode_song_v3,
-    led_pulse_active, mute_led_color, resolve_mute_scan, return_led_color, sample_assets,
-    sample_selection_preview_request, scroll_menu_window, voice_led_color, volume_led_color,
+    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, GroupEdit, GroupEditParameter, KEY_COUNT, KeyDebouncer,
+    MUTE_KEY_INDEX, MuteButtonState, MuteScanAction, MuteTarget, PatternAllChoice,
+    PatternEditorAction, PatternFillState, PatternVolumeTarget, PreviewRequest, RETURN_KEY_INDEX,
+    ResetAllChoice, RootMode, SAMPLE_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN,
+    SONG_FORMAT_VERSION, Sequencer, SharedState, SongBrowserPurpose, SongConfirmChoice,
+    SongLibraryStatus, SongMenuOperation, SongSlot, SongSlotOccupancy, SongStorageOperation,
+    SongUiStatus, SongsView, StoredSongV3, UiAction, UiController, UiDisplayModel,
+    UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX, VoiceGroup, VolumeTarget,
+    adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness, adjust_pad_cycle_length,
+    adjust_sample_selection, decode_song, encode_song_v3, led_pulse_active, mute_led_color,
+    resolve_mute_scan, return_led_color, sample_assets, sample_selection_preview_request,
+    scroll_menu_window, voice_led_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -1006,6 +1007,72 @@ fn publish_render(shared: &Shared, report: &looptic::RenderReport, render_us: u6
     });
 }
 
+#[derive(Clone, Copy)]
+enum GroupDetentOutcome {
+    Applied {
+        previous: GroupEdit,
+        current: GroupEdit,
+    },
+    Mixed(GroupEdit),
+    Invalid,
+}
+
+fn apply_group_detent(
+    shared: &Shared,
+    parameter: GroupEditParameter,
+    group: VoiceGroup,
+    delta: i32,
+) -> GroupDetentOutcome {
+    shared.lock(|state| {
+        let mut state = state.borrow_mut();
+        let Some((current, equal)) = state.group_edit_snapshot(parameter, group) else {
+            return GroupDetentOutcome::Invalid;
+        };
+        if !equal {
+            GroupDetentOutcome::Mixed(current)
+        } else {
+            state.adjust_group(parameter, group, delta).map_or(
+                GroupDetentOutcome::Invalid,
+                |adjusted| GroupDetentOutcome::Applied {
+                    previous: current,
+                    current: adjusted,
+                },
+            )
+        }
+    })
+}
+
+fn clamp_group_pattern_cursors(shared: &Shared, ui: &UiShared, group: VoiceGroup) {
+    let divisions: [u16; BEAT_PAD_COUNT] = shared.lock(|state| {
+        let state = state.borrow();
+        core::array::from_fn(|pad| {
+            state
+                .effective_pattern_steps(pad)
+                .unwrap_or(0)
+                .saturating_add(1)
+        })
+    });
+    ui.lock(|state| {
+        let mut state = state.borrow_mut();
+        for (pad, &division) in divisions.iter().enumerate() {
+            if group.contains(pad) {
+                state.controller.clamp_pattern_cursor(pad, division);
+            }
+        }
+    });
+}
+
+fn queue_primary_sample_preview(shared: &Shared, edit: GroupEdit) {
+    let GroupEdit::Sample { group, value } = edit else {
+        return;
+    };
+    if let Some(preview) = PreviewRequest::new(group.primary(), value) {
+        shared.lock(|state| {
+            let _ = state.borrow_mut().queue_preview(preview);
+        });
+    }
+}
+
 #[embassy_executor::task]
 async fn controls_task(
     mut keys: [Input<'static>; KEY_COUNT],
@@ -1044,8 +1111,10 @@ async fn controls_task(
                         | UiEncoderTarget::PatternRepeat(_)
                         | UiEncoderTarget::PatternAll(_)
                         | UiEncoderTarget::PatternNone
-                        | UiEncoderTarget::Sample(_)
+                        | UiEncoderTarget::SampleNone
+                        | UiEncoderTarget::SampleGroup(_)
                         | UiEncoderTarget::SongStatus
+                        | UiEncoderTarget::GroupWarning
                         | UiEncoderTarget::ResetAll
                 ) || (target == UiEncoderTarget::Songs
                     && !matches!(controller.songs_view(), SongsView::Browser { .. }));
@@ -1084,30 +1153,73 @@ async fn controls_task(
                         let _ = state.set_pattern_repeat(pad, adjusted);
                     }),
                     UiEncoderTarget::PatternNone => {}
-                    UiEncoderTarget::Sample(Some(pad)) => shared.lock(|state| {
-                        let mut state = state.borrow_mut();
-                        if let Some(current) = state.pad_sample(pad) {
-                            let selected = adjust_sample_selection(current, delta);
-                            if state.set_pad_sample(pad, selected)
-                                && let Some(preview) = sample_selection_preview_request(
-                                    pad,
-                                    current,
-                                    selected,
+                    UiEncoderTarget::SampleGroup(group) if group.count() >= 2 => {
+                        match apply_group_detent(shared, GroupEditParameter::Sample, group, delta) {
+                            GroupDetentOutcome::Applied {
+                                previous:
+                                    GroupEdit::Sample {
+                                        value: previous, ..
+                                    },
+                                current: GroupEdit::Sample { value, .. },
+                            } => {
+                                if let Some(preview) = sample_selection_preview_request(
+                                    group.primary(),
+                                    previous,
+                                    value,
                                     encoder_button_held,
-                                )
-                            {
-                                let _ = state.queue_preview(preview);
+                                ) {
+                                    shared.lock(|state| {
+                                        let _ = state.borrow_mut().queue_preview(preview);
+                                    });
+                                }
                             }
+                            GroupDetentOutcome::Mixed(edit) => {
+                                ui.lock(|state| {
+                                    state.borrow_mut().controller.open_group_warning(edit);
+                                });
+                                encoder_acceleration = UiEncoderAcceleration::new();
+                            }
+                            GroupDetentOutcome::Applied { .. } | GroupDetentOutcome::Invalid => {}
                         }
-                    }),
-                    UiEncoderTarget::Sample(None) => {}
+                    }
+                    UiEncoderTarget::SampleGroup(group) => {
+                        let pad = group.primary();
+                        shared.lock(|state| {
+                            let mut state = state.borrow_mut();
+                            if let Some(current) = state.pad_sample(pad) {
+                                let selected = adjust_sample_selection(current, delta);
+                                if state.set_pad_sample(pad, selected)
+                                    && let Some(preview) = sample_selection_preview_request(
+                                        pad,
+                                        current,
+                                        selected,
+                                        encoder_button_held,
+                                    )
+                                {
+                                    let _ = state.queue_preview(preview);
+                                }
+                            }
+                        });
+                    }
+                    UiEncoderTarget::SampleNone => {}
                     UiEncoderTarget::ResetAll => ui.lock(|state| {
                         state.borrow_mut().controller.rotate_reset_choice(delta);
                     }),
                     UiEncoderTarget::Songs => ui.lock(|state| {
                         state.borrow_mut().controller.rotate_songs(delta);
                     }),
-                    UiEncoderTarget::SongStatus => {}
+                    UiEncoderTarget::SongStatus | UiEncoderTarget::GroupWarning => {}
+                    UiEncoderTarget::Volume(VolumeTarget::Pads(group)) => {
+                        match apply_group_detent(shared, GroupEditParameter::Volume, group, delta) {
+                            GroupDetentOutcome::Mixed(edit) => {
+                                ui.lock(|state| {
+                                    state.borrow_mut().controller.open_group_warning(edit);
+                                });
+                                encoder_acceleration = UiEncoderAcceleration::new();
+                            }
+                            GroupDetentOutcome::Applied { .. } | GroupDetentOutcome::Invalid => {}
+                        }
+                    }
                     UiEncoderTarget::Volume(target) => shared.lock(|state| {
                         let _ = state.borrow_mut().adjust_volume(target, delta);
                     }),
@@ -1120,7 +1232,22 @@ async fn controls_task(
                         let _ = state.set_base_interval_ms(adjusted);
                     }),
                     UiEncoderTarget::BeatsNone => {}
-                    UiEncoderTarget::BeatsPad(pad) => {
+                    UiEncoderTarget::BeatsGroup(group) if group.count() >= 2 => {
+                        match apply_group_detent(shared, GroupEditParameter::Beats, group, delta) {
+                            GroupDetentOutcome::Applied { .. } => {
+                                clamp_group_pattern_cursors(shared, ui, group);
+                            }
+                            GroupDetentOutcome::Mixed(edit) => {
+                                ui.lock(|state| {
+                                    state.borrow_mut().controller.open_group_warning(edit);
+                                });
+                                encoder_acceleration = UiEncoderAcceleration::new();
+                            }
+                            GroupDetentOutcome::Invalid => {}
+                        }
+                    }
+                    UiEncoderTarget::BeatsGroup(group) => {
+                        let pad = group.primary();
                         let division = shared.lock(|state| {
                             let mut state = state.borrow_mut();
                             let adjusted = adjust_beat_multiplier(state.desired_beats[pad], delta);
@@ -1137,8 +1264,25 @@ async fn controls_task(
                                 .clamp_pattern_cursor(pad, division);
                         });
                     }
-                    UiEncoderTarget::CyclePadLength(pad) => shared.lock(|state| {
+                    UiEncoderTarget::CycleGroup(group) if group.count() >= 2 => {
+                        match apply_group_detent(
+                            shared,
+                            GroupEditParameter::CycleLength,
+                            group,
+                            delta,
+                        ) {
+                            GroupDetentOutcome::Mixed(edit) => {
+                                ui.lock(|state| {
+                                    state.borrow_mut().controller.open_group_warning(edit);
+                                });
+                                encoder_acceleration = UiEncoderAcceleration::new();
+                            }
+                            GroupDetentOutcome::Applied { .. } | GroupDetentOutcome::Invalid => {}
+                        }
+                    }
+                    UiEncoderTarget::CycleGroup(group) => shared.lock(|state| {
                         let mut state = state.borrow_mut();
+                        let pad = group.primary();
                         let current = state.pad_cycle_length_override_ms(pad).unwrap_or(0);
                         let adjusted = adjust_pad_cycle_length(current, delta);
                         let _ = state.set_pad_cycle_length_ms(pad, adjusted);
@@ -1224,10 +1368,12 @@ async fn controls_task(
                 let allowed_pressed = changes.pressed & !next_ui.controller.suppressed_keys();
                 let pressed_beats = allowed_pressed & looptic::BEAT_PAD_MASK;
                 if pressed_beats != 0 {
-                    // Deterministic simultaneous-press policy: the lowest
-                    // logical beat key wins this scan.
-                    let pad = pressed_beats.trailing_zeros() as usize;
-                    next_ui.controller.press_voice(pad);
+                    let held_beats = stable_mask
+                        & looptic::BEAT_PAD_MASK
+                        & !next_ui.controller.suppressed_keys();
+                    next_ui
+                        .controller
+                        .press_voice_edges(pressed_beats, held_beats);
                     if let Some(selected) = next_ui.controller.selected_pad() {
                         let division = shared.lock(|state| {
                             state
@@ -1241,7 +1387,7 @@ async fn controls_task(
                 }
 
                 if allowed_pressed & mute_bit != 0 {
-                    let target = MuteTarget::for_selected_pad(next_ui.controller.selected_pad());
+                    let target = MuteTarget::for_selection(next_ui.controller.selection());
                     if mute_button.press(target, now_ms) {
                         shared.lock(|state| {
                             state.borrow_mut().begin_mute_gesture(target);
@@ -1255,7 +1401,10 @@ async fn controls_task(
                     debounced_encoder_pressed && !next_ui.controller.encoder_suppressed();
                 next_ui.volume_pressed = volume_pressed;
 
-                if button_changes.pressed & 1 != 0 && encoder_pressed && !volume_pressed {
+                if button_changes.pressed & 1 != 0
+                    && encoder_pressed
+                    && (!volume_pressed || next_ui.controller.group_warning().is_some())
+                {
                     let selected_division = next_ui.controller.selected_pad().map(|pad| {
                         shared.lock(|state| {
                             state
@@ -1275,6 +1424,38 @@ async fn controls_task(
                             if apply_pattern_editor_action(shared, action) {
                                 encoder_acceleration = UiEncoderAcceleration::new();
                             }
+                        }
+                        Some(UiAction::SynchronizeGroup(edit)) => {
+                            let synchronized =
+                                shared.lock(|state| state.borrow_mut().synchronize_group(edit));
+                            if synchronized {
+                                match edit {
+                                    GroupEdit::Beats { group, .. } => {
+                                        let divisions: [u16; BEAT_PAD_COUNT] =
+                                            shared.lock(|state| {
+                                                let state = state.borrow();
+                                                core::array::from_fn(|pad| {
+                                                    state
+                                                        .effective_pattern_steps(pad)
+                                                        .unwrap_or(0)
+                                                        .saturating_add(1)
+                                                })
+                                            });
+                                        for (pad, &division) in divisions.iter().enumerate() {
+                                            if group.contains(pad) {
+                                                next_ui
+                                                    .controller
+                                                    .clamp_pattern_cursor(pad, division);
+                                            }
+                                        }
+                                    }
+                                    GroupEdit::Sample { .. } => {
+                                        queue_primary_sample_preview(shared, edit);
+                                    }
+                                    GroupEdit::CycleLength { .. } | GroupEdit::Volume { .. } => {}
+                                }
+                            }
+                            encoder_acceleration = UiEncoderAcceleration::new();
                         }
                         Some(UiAction::ResetConfirmed) => {
                             mute_button.cancel();
@@ -1331,8 +1512,8 @@ async fn led_task(
 ) {
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
-        let selected_pad = ui_state.controller.selected_pad();
-        let mute_target = MuteTarget::for_selected_pad(selected_pad);
+        let selection = ui_state.controller.selection();
+        let fallback_mute_target = MuteTarget::for_selection(selection);
         let volume_target = ui_state.controller.encoder_target(true);
         let (playback_frame, triggers, underruns, brightness, mute_active, volume) =
             shared.lock(|state| {
@@ -1342,7 +1523,11 @@ async fn led_task(
                     state.latest_trigger_frames,
                     state.underrun_count,
                     state.led_brightness_percent,
-                    state.mute_indicator_active(mute_target).unwrap_or(false),
+                    state
+                        .mute_indicator_active(
+                            state.active_mute_target().unwrap_or(fallback_mute_target),
+                        )
+                        .unwrap_or(false),
                     match volume_target {
                         UiEncoderTarget::PatternVolume(target) => {
                             state.pattern_volume_percent(target).unwrap_or(0)
@@ -1350,6 +1535,9 @@ async fn led_task(
                         UiEncoderTarget::Volume(target) => {
                             state.volume_percent(target).unwrap_or(0)
                         }
+                        UiEncoderTarget::GroupWarning => state
+                            .volume_percent(VolumeTarget::for_selection(selection))
+                            .unwrap_or(0),
                         _ => 0,
                     },
                 )
@@ -1362,8 +1550,8 @@ async fn led_task(
             let (r, g, b) = voice_led_color(
                 pad,
                 brightness,
-                selected_pad.is_some(),
-                selected_pad == Some(pad),
+                selection.count() != 0,
+                selection.contains(pad),
                 trigger_active,
                 light_preview,
             );
@@ -1537,11 +1725,18 @@ fn draw_pattern_all_menu<D>(
     }
 }
 
+fn write_voice_group<const N: usize>(line: &mut String<N>, group: VoiceGroup) {
+    let _ = write!(line, "P{}", group.primary() + 1);
+    if group.count() > 1 {
+        let _ = write!(line, "+{}", group.count() - 1);
+    }
+}
+
 fn draw_root_menu<D>(
     display: &mut D,
     style: MonoTextStyle<'_, BinaryColor>,
     highlighted: RootMode,
-    selected_pad: Option<usize>,
+    selected_group: Option<VoiceGroup>,
     current_song: Option<SongSlot>,
     song_dirty: bool,
 ) where
@@ -1562,8 +1757,9 @@ fn draw_root_menu<D>(
             if song_dirty { "*" } else { "" }
         );
     }
-    if let Some(pad) = selected_pad {
-        let _ = write!(&mut header, " P{}", pad + 1);
+    if let Some(group) = selected_group {
+        let _ = header.push(' ');
+        write_voice_group(&mut header, group);
     }
     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
 
@@ -1880,6 +2076,60 @@ where
         Text::with_baseline("Select voice", Point::new(0, 30), style, Baseline::Top).draw(display);
 }
 
+fn draw_group_warning<D>(display: &mut D, style: MonoTextStyle<'_, BinaryColor>, edit: GroupEdit)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ =
+        Text::with_baseline("Values differ", Point::new(0, 0), style, Baseline::Top).draw(display);
+    let mut line: String<24> = String::new();
+    write_voice_group(&mut line, edit.group());
+    match edit {
+        GroupEdit::Beats { value, .. } => {
+            let _ = write!(&mut line, " Beats {}", value);
+        }
+        GroupEdit::CycleLength { value: 0, .. } => {
+            let _ = line.push_str(" Length Global");
+        }
+        GroupEdit::CycleLength { value, .. } => {
+            let _ = write!(&mut line, " Length {}ms", value);
+        }
+        GroupEdit::Sample { value, .. } => {
+            let _ = write!(&mut line, " Sample {:02}", value.index() + 1);
+        }
+        GroupEdit::Volume { value, .. } => {
+            let _ = write!(&mut line, " Volume {}%", value);
+        }
+    }
+    let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top).draw(display);
+    let _ = Text::with_baseline("Push = set all", Point::new(0, 36), style, Baseline::Top)
+        .draw(display);
+    let _ = Text::with_baseline("Return = cancel", Point::new(0, 50), style, Baseline::Top)
+        .draw(display);
+}
+
+fn draw_pattern_needs_single<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    group: VoiceGroup,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let mut header: String<24> = String::new();
+    let _ = header.push_str("LoopTic ");
+    write_voice_group(&mut header, group);
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
+    let _ = Text::with_baseline(
+        "Pattern needs 1 voice",
+        Point::new(0, 20),
+        style,
+        Baseline::Top,
+    )
+    .draw(display);
+    let _ = Text::with_baseline("Deselect extras", Point::new(0, 38), style, Baseline::Top)
+        .draw(display);
+}
+
 fn draw_reset_menu<D>(
     display: &mut D,
     style: MonoTextStyle<'_, BinaryColor>,
@@ -1944,11 +2194,16 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     u32::from(state.pattern_volume_percent(target).unwrap_or(0)),
                     state.pattern_revision,
                 ),
-                UiDisplayModel::BeatsPad { pad } => (u32::from(state.desired_beats[pad]), 0),
-                UiDisplayModel::CycleGlobal => (state.base_interval_ms, 0),
-                UiDisplayModel::CyclePadLength { pad } => {
-                    (state.pad_cycle_length_override_ms(pad).unwrap_or(0), 0)
+                UiDisplayModel::BeatsGroup { group } => {
+                    (u32::from(state.desired_beats[group.primary()]), 0)
                 }
+                UiDisplayModel::CycleGlobal => (state.base_interval_ms, 0),
+                UiDisplayModel::CycleGroup { group } => (
+                    state
+                        .pad_cycle_length_override_ms(group.primary())
+                        .unwrap_or(0),
+                    0,
+                ),
                 UiDisplayModel::PatternEditor { pad, .. }
                 | UiDisplayModel::PatternAll { pad, .. } => {
                     (u32::from(state.desired_beats[pad]), state.pattern_revision)
@@ -1957,10 +2212,19 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     u32::from(state.pattern_repeat(pad).unwrap_or(1)),
                     state.pattern_revision,
                 ),
-                UiDisplayModel::SamplePad { pad } => (
+                UiDisplayModel::SampleGroup { group } => (
                     state
-                        .pad_sample(pad)
+                        .pad_sample(group.primary())
                         .map_or(0, |sample| sample.index() as u32),
+                    0,
+                ),
+                UiDisplayModel::GroupWarning { edit } => (
+                    match edit {
+                        GroupEdit::Beats { value, .. } => u32::from(value),
+                        GroupEdit::CycleLength { value, .. } => value,
+                        GroupEdit::Sample { value, .. } => value.index() as u32,
+                        GroupEdit::Volume { value, .. } => u32::from(value),
+                    },
                     0,
                 ),
                 UiDisplayModel::Light => (u32::from(state.led_brightness_percent), 0),
@@ -1968,6 +2232,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 | UiDisplayModel::PatternSelectVoice
                 | UiDisplayModel::BeatsSelectVoice
                 | UiDisplayModel::SampleSelectVoice
+                | UiDisplayModel::PatternNeedsSingle { .. }
                 | UiDisplayModel::SongsMenu { .. }
                 | UiDisplayModel::SongBrowser { .. }
                 | UiDisplayModel::SongConfirmation { .. }
@@ -1986,14 +2251,14 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
             match model {
                 UiDisplayModel::Root {
                     highlighted,
-                    selected_pad,
+                    selected_group,
                     current_song,
                     song_dirty,
                 } => draw_root_menu(
                     &mut display,
                     style,
                     highlighted,
-                    selected_pad,
+                    selected_group,
                     current_song,
                     song_dirty,
                 ),
@@ -2007,6 +2272,10 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                         }
                         VolumeTarget::Pad(pad) => {
                             let _ = write!(&mut line, "P{} Vol {}%", pad + 1, displayed_value);
+                        }
+                        VolumeTarget::Pads(group) => {
+                            write_voice_group(&mut line, group);
+                            let _ = write!(&mut line, " Vol {}%", displayed_value);
                         }
                     }
                     let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
@@ -2078,9 +2347,11 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 UiDisplayModel::BeatsSelectVoice => {
                     draw_select_voice(&mut display, style, "Beats");
                 }
-                UiDisplayModel::BeatsPad { pad } => {
+                UiDisplayModel::BeatsGroup { group } => {
                     let mut header: String<24> = String::new();
-                    let _ = write!(&mut header, "LoopTic P{} Beats", pad + 1);
+                    let _ = header.push_str("LoopTic ");
+                    write_voice_group(&mut header, group);
+                    let _ = header.push_str(" Beats");
                     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top)
                         .draw(&mut display);
                     let mut line: String<24> = String::new();
@@ -2103,9 +2374,11 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     let _ = Text::with_baseline(&line, Point::new(0, 30), style, Baseline::Top)
                         .draw(&mut display);
                 }
-                UiDisplayModel::CyclePadLength { pad } => {
+                UiDisplayModel::CycleGroup { group } => {
                     let mut header: String<24> = String::new();
-                    let _ = write!(&mut header, "LoopTic P{} Cycle", pad + 1);
+                    let _ = header.push_str("LoopTic ");
+                    write_voice_group(&mut header, group);
+                    let _ = header.push_str(" Cycle");
                     let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top)
                         .draw(&mut display);
                     let mut line: String<24> = String::new();
@@ -2123,7 +2396,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 UiDisplayModel::SampleSelectVoice => {
                     draw_select_voice(&mut display, style, "Sample");
                 }
-                UiDisplayModel::SamplePad { pad } => {
+                UiDisplayModel::SampleGroup { group } => {
                     let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
                         .draw(&mut display);
                     let sample = displayed_value as usize;
@@ -2132,17 +2405,18 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                         .get(sample)
                         .copied()
                         .unwrap_or("?");
-                    let _ = write!(
-                        &mut line,
-                        "P{} Sample {:02}/{}",
-                        pad + 1,
-                        sample + 1,
-                        SAMPLE_COUNT
-                    );
+                    write_voice_group(&mut line, group);
+                    let _ = write!(&mut line, " Sample {:02}/{}", sample + 1, SAMPLE_COUNT);
                     let _ = Text::with_baseline(&line, Point::new(0, 16), style, Baseline::Top)
                         .draw(&mut display);
                     let _ = Text::with_baseline(name, Point::new(0, 30), style, Baseline::Top)
                         .draw(&mut display);
+                }
+                UiDisplayModel::GroupWarning { edit } => {
+                    draw_group_warning(&mut display, style, edit);
+                }
+                UiDisplayModel::PatternNeedsSingle { group } => {
+                    draw_pattern_needs_single(&mut display, style, group);
                 }
                 UiDisplayModel::Light => {
                     let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)

@@ -2210,6 +2210,7 @@ pub fn scale_audio_percent(value: i32, volume_percent: u8) -> i32 {
 pub enum MuteTarget {
     Global,
     Pad(usize),
+    Pads(VoiceGroup),
 }
 
 impl MuteTarget {
@@ -2220,10 +2221,25 @@ impl MuteTarget {
         }
     }
 
+    pub const fn for_selection(selection: VoiceSelection) -> Self {
+        match selection.count() {
+            0 => Self::Global,
+            1 => match selection.primary() {
+                Some(pad) => Self::Pad(pad),
+                None => Self::Global,
+            },
+            _ => match selection.group() {
+                Some(group) => Self::Pads(group),
+                None => Self::Global,
+            },
+        }
+    }
+
     const fn is_valid(self) -> bool {
         match self {
             Self::Global => true,
             Self::Pad(pad) => pad < BEAT_PAD_COUNT,
+            Self::Pads(group) => group.count() >= 2,
         }
     }
 }
@@ -2232,6 +2248,7 @@ impl MuteTarget {
 pub enum VolumeTarget {
     Global,
     Pad(usize),
+    Pads(VoiceGroup),
 }
 
 impl VolumeTarget {
@@ -2244,10 +2261,25 @@ impl VolumeTarget {
         }
     }
 
+    pub const fn for_selection(selection: VoiceSelection) -> Self {
+        match selection.count() {
+            0 => Self::Global,
+            1 => match selection.primary() {
+                Some(pad) => Self::Pad(pad),
+                None => Self::Global,
+            },
+            _ => match selection.group() {
+                Some(group) => Self::Pads(group),
+                None => Self::Global,
+            },
+        }
+    }
+
     const fn is_valid(self) -> bool {
         match self {
             Self::Global => true,
             Self::Pad(pad) => pad < BEAT_PAD_COUNT,
+            Self::Pads(group) => group.count() >= 2,
         }
     }
 }
@@ -2582,6 +2614,125 @@ impl SharedState {
         true
     }
 
+    /// Capture the primary value and whether every pad in a multi-selection
+    /// already shares it. Cycle length compares its raw editor value, where
+    /// zero means Global.
+    pub fn group_edit_snapshot(
+        &self,
+        parameter: GroupEditParameter,
+        group: VoiceGroup,
+    ) -> Option<(GroupEdit, bool)> {
+        if group.count() < 2 {
+            return None;
+        }
+        let primary = group.primary();
+        let edit = match parameter {
+            GroupEditParameter::Beats => GroupEdit::Beats {
+                group,
+                value: *self.desired_beats.get(primary)?,
+            },
+            GroupEditParameter::CycleLength => GroupEdit::CycleLength {
+                group,
+                value: self.pad_cycle_length_override_ms(primary).unwrap_or(0),
+            },
+            GroupEditParameter::Sample => GroupEdit::Sample {
+                group,
+                value: self.pad_sample(primary)?,
+            },
+            GroupEditParameter::Volume => GroupEdit::Volume {
+                group,
+                value: *self.pad_volume_percents.get(primary)?,
+            },
+        };
+        let equal = (0..BEAT_PAD_COUNT)
+            .filter(|&pad| group.contains(pad))
+            .all(|pad| match edit {
+                GroupEdit::Beats { value, .. } => self.desired_beats[pad] == value,
+                GroupEdit::CycleLength { value, .. } => {
+                    self.pad_cycle_length_overrides_ms[pad].unwrap_or(0) == value
+                }
+                GroupEdit::Sample { value, .. } => self.pad_samples[pad] == value,
+                GroupEdit::Volume { value, .. } => self.pad_volume_percents[pad] == value,
+            });
+        Some((edit, equal))
+    }
+
+    /// Copy a captured primary value to an entire multi-selection as one
+    /// logical persistent edit.
+    pub fn synchronize_group(&mut self, edit: GroupEdit) -> bool {
+        let group = edit.group();
+        if group.count() < 2 {
+            return false;
+        }
+        if matches!(edit, GroupEdit::Beats { value, .. } if value > MAX_BEAT_MULTIPLIER)
+            || matches!(edit, GroupEdit::CycleLength { value, .. } if value != 0 && value < MIN_BASE_INTERVAL_MS)
+            || matches!(edit, GroupEdit::Volume { value, .. } if value > 100)
+        {
+            return false;
+        }
+
+        let mut changed = false;
+        for pad in 0..BEAT_PAD_COUNT {
+            if !group.contains(pad) {
+                continue;
+            }
+            match edit {
+                GroupEdit::Beats { value, .. } => {
+                    changed |= self.desired_beats[pad] != value;
+                    self.desired_beats[pad] = value;
+                    self.pattern_repeats[pad] =
+                        self.pattern_repeats[pad].min(max_pattern_repeats(value));
+                }
+                GroupEdit::CycleLength { value, .. } => {
+                    let value = (value != 0).then_some(value);
+                    changed |= self.pad_cycle_length_overrides_ms[pad] != value;
+                    self.pad_cycle_length_overrides_ms[pad] = value;
+                }
+                GroupEdit::Sample { value, .. } => {
+                    changed |= self.pad_samples[pad] != value;
+                    self.pad_samples[pad] = value;
+                }
+                GroupEdit::Volume { value, .. } => {
+                    changed |= self.pad_volume_percents[pad] != value;
+                    self.pad_volume_percents[pad] = value;
+                }
+            }
+        }
+        if changed {
+            self.mark_song_changed();
+        }
+        true
+    }
+
+    /// Apply one relative encoder edit to a uniform multi-selection.
+    pub fn adjust_group(
+        &mut self,
+        parameter: GroupEditParameter,
+        group: VoiceGroup,
+        delta: i32,
+    ) -> Option<GroupEdit> {
+        let (current, _) = self.group_edit_snapshot(parameter, group)?;
+        let adjusted = match current {
+            GroupEdit::Beats { value, .. } => GroupEdit::Beats {
+                group,
+                value: adjust_beat_multiplier(value, delta),
+            },
+            GroupEdit::CycleLength { value, .. } => GroupEdit::CycleLength {
+                group,
+                value: adjust_pad_cycle_length(value, delta),
+            },
+            GroupEdit::Sample { value, .. } => GroupEdit::Sample {
+                group,
+                value: adjust_sample_selection(value, delta),
+            },
+            GroupEdit::Volume { value, .. } => GroupEdit::Volume {
+                group,
+                value: adjust_volume_percent(value, delta),
+            },
+        };
+        self.synchronize_group(adjusted).then_some(adjusted)
+    }
+
     pub fn queue_preview(&mut self, request: PreviewRequest) -> Option<PreviewRequest> {
         self.pending_preview.replace(request)
     }
@@ -2720,6 +2871,10 @@ impl SharedState {
         match target {
             MuteTarget::Global => Some(self.global_mute_latched),
             MuteTarget::Pad(pad) => self.pad_mute_latched.get(pad).copied(),
+            MuteTarget::Pads(group) if group.count() >= 2 => {
+                self.pad_mute_latched.get(group.primary()).copied()
+            }
+            MuteTarget::Pads(_) => None,
         }
     }
 
@@ -2744,6 +2899,14 @@ impl SharedState {
                 MuteTarget::Pad(pad) => {
                     self.pad_mute_latched[pad] = !self.pad_mute_latched[pad];
                 }
+                MuteTarget::Pads(group) => {
+                    let muted = !self.pad_mute_latched[group.primary()];
+                    for pad in 0..BEAT_PAD_COUNT {
+                        if group.contains(pad) {
+                            self.pad_mute_latched[pad] = muted;
+                        }
+                    }
+                }
             }
             self.mark_song_changed();
         }
@@ -2754,6 +2917,10 @@ impl SharedState {
     /// Clear a momentary mute without changing its persistent latch.
     pub fn cancel_mute_gesture(&mut self) -> Option<MuteTarget> {
         self.momentary_mute_target.take()
+    }
+
+    pub const fn active_mute_target(&self) -> Option<MuteTarget> {
+        self.momentary_mute_target
     }
 
     /// The local status shown by the mute key: global state for the global
@@ -2768,9 +2935,13 @@ impl SharedState {
             return BEAT_PAD_MASK;
         }
 
-        let mut mask = 0_u16;
+        let mut mask = match self.momentary_mute_target {
+            Some(MuteTarget::Pad(pad)) => 1_u16 << pad,
+            Some(MuteTarget::Pads(group)) => group.mask(),
+            Some(MuteTarget::Global) | None => 0,
+        };
         for (pad, muted) in self.pad_mute_latched.iter().copied().enumerate() {
-            if muted || self.momentary_mute_target == Some(MuteTarget::Pad(pad)) {
+            if muted {
                 mask |= 1_u16 << pad;
             }
         }
@@ -2789,6 +2960,10 @@ impl SharedState {
         match target {
             VolumeTarget::Global => Some(self.global_volume_percent),
             VolumeTarget::Pad(pad) => self.pad_volume_percents.get(pad).copied(),
+            VolumeTarget::Pads(group) if group.count() >= 2 => {
+                self.pad_volume_percents.get(group.primary()).copied()
+            }
+            VolumeTarget::Pads(_) => None,
         }
     }
 
@@ -2800,6 +2975,18 @@ impl SharedState {
         let volume = match target {
             VolumeTarget::Global => &mut self.global_volume_percent,
             VolumeTarget::Pad(pad) => &mut self.pad_volume_percents[pad],
+            VolumeTarget::Pads(group) => {
+                let (_, equal) = self.group_edit_snapshot(GroupEditParameter::Volume, group)?;
+                if !equal {
+                    return self.volume_percent(target);
+                }
+                return self
+                    .adjust_group(GroupEditParameter::Volume, group, delta)
+                    .and_then(|edit| match edit {
+                        GroupEdit::Volume { value, .. } => Some(value),
+                        _ => None,
+                    });
+            }
         };
         let previous = *volume;
         *volume = adjust_volume_percent(*volume, delta);
@@ -3529,22 +3716,73 @@ pub struct KeyChanges {
     pub released: u16,
 }
 
-/// Persistent beat-pad selection. The storage supports any combination of
-/// pads even though the current controller applies an exclusive policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Compact validated summary of a non-empty pad selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoiceGroup {
+    mask: u16,
+    primary: u8,
+}
+
+impl VoiceGroup {
+    pub const fn new(mask: u16, primary: usize) -> Option<Self> {
+        let mask = mask & BEAT_PAD_MASK;
+        if mask == 0 || primary >= BEAT_PAD_COUNT || mask & (1_u16 << primary) == 0 {
+            None
+        } else {
+            Some(Self {
+                mask,
+                primary: primary as u8,
+            })
+        }
+    }
+
+    pub const fn mask(self) -> u16 {
+        self.mask
+    }
+
+    pub const fn primary(self) -> usize {
+        self.primary as usize
+    }
+
+    pub const fn count(self) -> u32 {
+        self.mask.count_ones()
+    }
+
+    pub const fn contains(self, pad: usize) -> bool {
+        pad < BEAT_PAD_COUNT && self.mask & (1_u16 << pad) != 0
+    }
+}
+
+/// Persistent runtime beat-pad selection with chronological primary ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VoiceSelection {
     mask: u16,
+    order: [u8; BEAT_PAD_COUNT],
+    len: u8,
 }
 
 impl VoiceSelection {
     pub const fn new() -> Self {
-        Self { mask: 0 }
+        Self {
+            mask: 0,
+            order: [u8::MAX; BEAT_PAD_COUNT],
+            len: 0,
+        }
     }
 
     pub const fn from_mask(mask: u16) -> Self {
-        Self {
-            mask: mask & BEAT_PAD_MASK,
+        let mask = mask & BEAT_PAD_MASK;
+        let mut selection = Self::new();
+        let mut pad = 0;
+        while pad < BEAT_PAD_COUNT {
+            if mask & (1_u16 << pad) != 0 {
+                selection.order[selection.len as usize] = pad as u8;
+                selection.len += 1;
+            }
+            pad += 1;
         }
+        selection.mask = mask;
+        selection
     }
 
     pub const fn mask(self) -> u16 {
@@ -3556,23 +3794,40 @@ impl VoiceSelection {
     }
 
     pub const fn count(self) -> u32 {
-        self.mask.count_ones()
+        self.len as u32
+    }
+
+    /// Return the earliest still-selected pad.
+    pub const fn primary(self) -> Option<usize> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.order[0] as usize)
+        }
+    }
+
+    pub const fn group(self) -> Option<VoiceGroup> {
+        match self.primary() {
+            Some(primary) => VoiceGroup::new(self.mask, primary),
+            None => None,
+        }
     }
 
     /// Return the selected pad only when the selection is exclusive.
     pub const fn selected(self) -> Option<usize> {
-        if self.mask.count_ones() == 1 {
-            Some(self.mask.trailing_zeros() as usize)
-        } else {
-            None
-        }
+        if self.len == 1 { self.primary() } else { None }
     }
 
     pub fn insert(&mut self, pad: usize) -> bool {
         if pad >= BEAT_PAD_COUNT {
             return false;
         }
+        if self.contains(pad) {
+            return true;
+        }
         self.mask |= 1_u16 << pad;
+        self.order[self.len as usize] = pad as u8;
+        self.len += 1;
         true
     }
 
@@ -3580,7 +3835,20 @@ impl VoiceSelection {
         if pad >= BEAT_PAD_COUNT {
             return false;
         }
+        if !self.contains(pad) {
+            return true;
+        }
         self.mask &= !(1_u16 << pad);
+        let mut index = 0;
+        while index < self.len as usize && self.order[index] as usize != pad {
+            index += 1;
+        }
+        while index + 1 < self.len as usize {
+            self.order[index] = self.order[index + 1];
+            index += 1;
+        }
+        self.len -= 1;
+        self.order[self.len as usize] = u8::MAX;
         true
     }
 
@@ -3588,8 +3856,11 @@ impl VoiceSelection {
         if pad >= BEAT_PAD_COUNT {
             return false;
         }
-        self.mask ^= 1_u16 << pad;
-        true
+        if self.contains(pad) {
+            self.remove(pad)
+        } else {
+            self.insert(pad)
+        }
     }
 
     /// Toggle one pad under the current exclusive-selection policy.
@@ -3597,8 +3868,12 @@ impl VoiceSelection {
         if pad >= BEAT_PAD_COUNT {
             return false;
         }
-        let bit = 1_u16 << pad;
-        self.mask = if self.mask == bit { 0 } else { bit };
+        if self.selected() == Some(pad) {
+            self.clear();
+        } else {
+            self.clear();
+            let _ = self.insert(pad);
+        }
         true
     }
 
@@ -3606,12 +3881,24 @@ impl VoiceSelection {
         if pad >= BEAT_PAD_COUNT {
             return false;
         }
-        self.mask = 1_u16 << pad;
+        self.clear();
+        let _ = self.insert(pad);
         true
     }
 
+    /// Replace the selection with a deterministic ascending-order chord.
+    pub fn replace_with_mask(&mut self, mask: u16) {
+        *self = Self::from_mask(mask);
+    }
+
     pub fn clear(&mut self) {
-        self.mask = 0;
+        *self = Self::new();
+    }
+}
+
+impl Default for VoiceSelection {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3916,6 +4203,43 @@ impl ResetAllChoice {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupEditParameter {
+    Beats,
+    CycleLength,
+    Sample,
+    Volume,
+}
+
+/// Captured primary value used by a mixed-value synchronization warning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupEdit {
+    Beats { group: VoiceGroup, value: u16 },
+    CycleLength { group: VoiceGroup, value: u32 },
+    Sample { group: VoiceGroup, value: SampleId },
+    Volume { group: VoiceGroup, value: u8 },
+}
+
+impl GroupEdit {
+    pub const fn parameter(self) -> GroupEditParameter {
+        match self {
+            Self::Beats { .. } => GroupEditParameter::Beats,
+            Self::CycleLength { .. } => GroupEditParameter::CycleLength,
+            Self::Sample { .. } => GroupEditParameter::Sample,
+            Self::Volume { .. } => GroupEditParameter::Volume,
+        }
+    }
+
+    pub const fn group(self) -> VoiceGroup {
+        match self {
+            Self::Beats { group, .. }
+            | Self::CycleLength { group, .. }
+            | Self::Sample { group, .. }
+            | Self::Volume { group, .. } => group,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiEncoderTarget {
     Volume(VolumeTarget),
     PatternVolume(PatternVolumeTarget),
@@ -3925,19 +4249,22 @@ pub enum UiEncoderTarget {
     PatternAll(usize),
     PatternNone,
     BeatsNone,
-    BeatsPad(usize),
+    BeatsGroup(VoiceGroup),
     CycleGlobal,
-    CyclePadLength(usize),
-    Sample(Option<usize>),
+    CycleGroup(VoiceGroup),
+    SampleNone,
+    SampleGroup(VoiceGroup),
     Light,
     Songs,
     SongStatus,
+    GroupWarning,
     ResetAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiAction {
     Pattern(PatternEditorAction),
+    SynchronizeGroup(GroupEdit),
     Song(SongStorageOperation),
     ResetConfirmed,
 }
@@ -3950,7 +4277,7 @@ pub enum UiAction {
 pub enum UiDisplayModel {
     Root {
         highlighted: RootMode,
-        selected_pad: Option<usize>,
+        selected_group: Option<VoiceGroup>,
         current_song: Option<SongSlot>,
         song_dirty: bool,
     },
@@ -3973,16 +4300,22 @@ pub enum UiDisplayModel {
         choice: PatternAllChoice,
     },
     BeatsSelectVoice,
-    BeatsPad {
-        pad: usize,
+    BeatsGroup {
+        group: VoiceGroup,
     },
     CycleGlobal,
-    CyclePadLength {
-        pad: usize,
+    CycleGroup {
+        group: VoiceGroup,
     },
     SampleSelectVoice,
-    SamplePad {
-        pad: usize,
+    SampleGroup {
+        group: VoiceGroup,
+    },
+    GroupWarning {
+        edit: GroupEdit,
+    },
+    PatternNeedsSingle {
+        group: VoiceGroup,
     },
     Light,
     SongsMenu {
@@ -4020,6 +4353,8 @@ pub struct UiController {
     pattern_cursors: [u16; BEAT_PAD_COUNT],
     pattern_repeat_editor: Option<usize>,
     pattern_all_menu: Option<PatternAllMenu>,
+    group_warning: Option<GroupEdit>,
+    pattern_needs_single: Option<VoiceGroup>,
     reset_choice: ResetAllChoice,
     songs_view: SongsView,
     song_status: Option<SongUiStatus>,
@@ -4036,6 +4371,8 @@ impl UiController {
             pattern_cursors: [0; BEAT_PAD_COUNT],
             pattern_repeat_editor: None,
             pattern_all_menu: None,
+            group_warning: None,
+            pattern_needs_single: None,
             reset_choice: ResetAllChoice::Cancel,
             songs_view: SongsView::Operations {
                 selected: SongMenuOperation::Load,
@@ -4062,20 +4399,111 @@ impl UiController {
         self.selection.selected()
     }
 
+    pub const fn selected_group(self) -> Option<VoiceGroup> {
+        self.selection.group()
+    }
+
+    /// Apply one debounced beat-key scan. `pressed_mask` contains only new
+    /// allowed press edges, while `held_mask` contains the allowed stable
+    /// levels. A later edge that completes a held chord replaces any
+    /// temporary single-key selection with the exact chord.
+    pub fn press_voice_edges(&mut self, pressed_mask: u16, held_mask: u16) -> bool {
+        let pressed_mask = pressed_mask & BEAT_PAD_MASK;
+        if pressed_mask == 0 {
+            return false;
+        }
+        let held_mask = held_mask & BEAT_PAD_MASK;
+        if held_mask.count_ones() >= 2 {
+            self.press_voice_chord(held_mask)
+        } else {
+            self.press_voice(pressed_mask.trailing_zeros() as usize)
+        }
+    }
+
     pub fn press_voice(&mut self, pad: usize) -> bool {
         let before = self.selection;
-        if !self.selection.toggle_exclusive(pad) {
+        let pattern_guard_active = self.pattern_needs_single.is_some();
+        let valid = if self.selection.count() >= 2 {
+            self.selection.toggle(pad)
+        } else {
+            self.selection.toggle_exclusive(pad)
+        };
+        if !valid {
             return false;
         }
         if self.selection != before {
-            self.pattern_all_menu = None;
-            self.pattern_repeat_editor = None;
+            self.selection_did_change();
+            self.restore_pattern_guard(pattern_guard_active);
         }
         true
     }
 
+    /// Replace the selection with a newly held chord. A chord is always
+    /// deterministic ascending order and always enters multi mode.
+    pub fn press_voice_chord(&mut self, mask: u16) -> bool {
+        let mask = mask & BEAT_PAD_MASK;
+        if mask.count_ones() < 2 {
+            return false;
+        }
+        let pattern_guard_active = self.pattern_needs_single.is_some();
+        self.selection.replace_with_mask(mask);
+        self.selection_did_change();
+        if self.page == UiPage::Pattern {
+            self.page = UiPage::Root;
+            self.root_mode = RootMode::Pattern;
+            self.pattern_needs_single = self.selection.group();
+        } else {
+            self.restore_pattern_guard(pattern_guard_active);
+        }
+        true
+    }
+
+    fn selection_did_change(&mut self) {
+        self.pattern_all_menu = None;
+        self.pattern_repeat_editor = None;
+        self.group_warning = None;
+        self.pattern_needs_single = None;
+    }
+
+    fn restore_pattern_guard(&mut self, was_active: bool) {
+        if was_active
+            && self.page == UiPage::Root
+            && self.root_mode == RootMode::Pattern
+            && self.selection.count() >= 2
+        {
+            self.pattern_needs_single = self.selection.group();
+        }
+    }
+
+    pub const fn group_warning(self) -> Option<GroupEdit> {
+        self.group_warning
+    }
+
+    pub fn open_group_warning(&mut self, edit: GroupEdit) -> bool {
+        let valid_context = match edit.parameter() {
+            GroupEditParameter::Beats => self.page == UiPage::Beats,
+            GroupEditParameter::CycleLength => self.page == UiPage::CycleLength,
+            GroupEditParameter::Sample => self.page == UiPage::Sample,
+            GroupEditParameter::Volume => true,
+        };
+        if edit.group().count() < 2
+            || self.selection.group() != Some(edit.group())
+            || !valid_context
+        {
+            return false;
+        }
+        self.group_warning = Some(edit);
+        true
+    }
+
+    pub fn clear_transient_notices(&mut self) {
+        self.group_warning = None;
+        self.pattern_needs_single = None;
+    }
+
     pub fn rotate_root(&mut self, delta: i32) {
         if self.page == UiPage::Root {
+            self.pattern_needs_single = None;
             self.root_mode = self.root_mode.clamped_offset(delta);
         }
     }
@@ -4084,8 +4512,17 @@ impl UiController {
         if self.page != UiPage::Root {
             return;
         }
+        self.group_warning = None;
         self.pattern_all_menu = None;
         self.reset_choice = ResetAllChoice::Cancel;
+        if self.root_mode == RootMode::Pattern
+            && self.selection.count() >= 2
+            && let Some(group) = self.selection.group()
+        {
+            self.pattern_needs_single = Some(group);
+            return;
+        }
+        self.pattern_needs_single = None;
         self.page = match self.root_mode {
             RootMode::Pattern => UiPage::Pattern,
             RootMode::Beats => UiPage::Beats,
@@ -4124,6 +4561,7 @@ impl UiController {
 
     /// Replace the storage overlay after an operation or boot scan completes.
     pub fn set_song_status(&mut self, status: SongUiStatus) {
+        self.clear_transient_notices();
         self.song_status = Some(status);
     }
 
@@ -4133,6 +4571,7 @@ impl UiController {
 
     /// Resolve root-level Save when there is no current slot.
     pub fn open_save_as(&mut self, initial_slot: Option<SongSlot>) {
+        self.clear_transient_notices();
         self.song_status = None;
         self.page = UiPage::Songs;
         self.songs_view = SongsView::Browser {
@@ -4229,6 +4668,9 @@ impl UiController {
             }
             return None;
         }
+        if let Some(edit) = self.group_warning.take() {
+            return Some(UiAction::SynchronizeGroup(edit));
+        }
         match self.page {
             UiPage::Root => {
                 if self.root_mode == RootMode::Save {
@@ -4246,6 +4688,7 @@ impl UiController {
                 self.reset_choice = ResetAllChoice::Cancel;
                 if confirmed {
                     self.selection.clear();
+                    self.clear_transient_notices();
                     Some(UiAction::ResetConfirmed)
                 } else {
                     None
@@ -4318,6 +4761,7 @@ impl UiController {
     }
 
     fn begin_song_operation(&mut self, operation: SongStorageOperation) -> UiAction {
+        self.clear_transient_notices();
         self.song_status = Some(SongUiStatus::Busy { operation });
         UiAction::Song(operation)
     }
@@ -4398,13 +4842,19 @@ impl UiController {
         if self.song_status.is_some() {
             return UiEncoderTarget::SongStatus;
         }
+        if self.group_warning.is_some() {
+            return UiEncoderTarget::GroupWarning;
+        }
         if volume_pressed {
             if self.page == UiPage::Pattern
                 && let Some(target) = self.highlighted_pattern_volume_target()
             {
                 return UiEncoderTarget::PatternVolume(target);
             }
-            return UiEncoderTarget::Volume(VolumeTarget::for_selected_pad(self.selected_pad()));
+            return UiEncoderTarget::Volume(VolumeTarget::for_selection(self.selection));
+        }
+        if self.pattern_needs_single.is_some() {
+            return UiEncoderTarget::Root;
         }
         match self.page {
             UiPage::Root => UiEncoderTarget::Root,
@@ -4417,13 +4867,14 @@ impl UiController {
                 None => UiEncoderTarget::PatternNone,
             },
             UiPage::Beats => self
-                .selected_pad()
-                .map_or(UiEncoderTarget::BeatsNone, UiEncoderTarget::BeatsPad),
-            UiPage::CycleLength => self.selected_pad().map_or(
-                UiEncoderTarget::CycleGlobal,
-                UiEncoderTarget::CyclePadLength,
-            ),
-            UiPage::Sample => UiEncoderTarget::Sample(self.selected_pad()),
+                .selected_group()
+                .map_or(UiEncoderTarget::BeatsNone, UiEncoderTarget::BeatsGroup),
+            UiPage::CycleLength => self
+                .selected_group()
+                .map_or(UiEncoderTarget::CycleGlobal, UiEncoderTarget::CycleGroup),
+            UiPage::Sample => self
+                .selected_group()
+                .map_or(UiEncoderTarget::SampleNone, UiEncoderTarget::SampleGroup),
             UiPage::Light => UiEncoderTarget::Light,
             UiPage::Songs => UiEncoderTarget::Songs,
             UiPage::ResetAll => UiEncoderTarget::ResetAll,
@@ -4442,6 +4893,9 @@ impl UiController {
         if let Some(status) = self.song_status {
             return UiDisplayModel::SongStatus { status };
         }
+        if let Some(edit) = self.group_warning {
+            return UiDisplayModel::GroupWarning { edit };
+        }
         if volume_pressed {
             if self.page == UiPage::Pattern
                 && let Some(target) = self.highlighted_pattern_volume_target()
@@ -4449,13 +4903,16 @@ impl UiController {
                 return UiDisplayModel::PatternVolume { target };
             }
             return UiDisplayModel::Volume {
-                target: VolumeTarget::for_selected_pad(self.selected_pad()),
+                target: VolumeTarget::for_selection(self.selection),
             };
+        }
+        if let Some(group) = self.pattern_needs_single {
+            return UiDisplayModel::PatternNeedsSingle { group };
         }
         match self.page {
             UiPage::Root => UiDisplayModel::Root {
                 highlighted: self.root_mode,
-                selected_pad: self.selected_pad(),
+                selected_group: self.selected_group(),
                 current_song: library.current_slot,
                 song_dirty: library.dirty,
             },
@@ -4475,16 +4932,16 @@ impl UiController {
                 },
                 None => UiDisplayModel::PatternSelectVoice,
             },
-            UiPage::Beats => match self.selected_pad() {
-                Some(pad) => UiDisplayModel::BeatsPad { pad },
+            UiPage::Beats => match self.selected_group() {
+                Some(group) => UiDisplayModel::BeatsGroup { group },
                 None => UiDisplayModel::BeatsSelectVoice,
             },
-            UiPage::CycleLength => match self.selected_pad() {
-                Some(pad) => UiDisplayModel::CyclePadLength { pad },
+            UiPage::CycleLength => match self.selected_group() {
+                Some(group) => UiDisplayModel::CycleGroup { group },
                 None => UiDisplayModel::CycleGlobal,
             },
-            UiPage::Sample => match self.selected_pad() {
-                Some(pad) => UiDisplayModel::SamplePad { pad },
+            UiPage::Sample => match self.selected_group() {
+                Some(group) => UiDisplayModel::SampleGroup { group },
                 None => UiDisplayModel::SampleSelectVoice,
             },
             UiPage::Light => UiDisplayModel::Light,
@@ -4542,6 +4999,11 @@ impl UiController {
     /// already at the root clears it. Every key or encoder push already held
     /// is suppressed until its release.
     pub fn return_to_root(&mut self, held_keys: u16, encoder_held: bool) {
+        if self.group_warning.take().is_some() {
+            self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
+            self.encoder_suppressed = encoder_held;
+            return;
+        }
         if self.pattern_repeat_editor.take().is_some() {
             self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
             self.encoder_suppressed = encoder_held;
@@ -4552,6 +5014,7 @@ impl UiController {
         if clear_selection {
             self.selection.clear();
         }
+        self.pattern_needs_single = None;
         self.pattern_all_menu = None;
         self.reset_choice = ResetAllChoice::Cancel;
         let selected_song_operation = match self.songs_view {
@@ -7244,6 +7707,38 @@ mod tests {
     }
 
     #[test]
+    fn staggered_debounced_voice_edges_complete_a_chord_and_releases_are_inert() {
+        let first = 1_u16 << 6;
+        let second = 1_u16 << 2;
+        let mut debounce = KeyDebouncer::new(2);
+        let mut ui = UiController::new();
+
+        let changes = debounce.update(first);
+        assert!(!ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        let changes = debounce.update(first);
+        assert!(ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        assert_eq!(ui.selected_pad(), Some(6));
+
+        // The first key remains held while the second crosses its debounce
+        // threshold, so the second edge replaces the temporary single choice
+        // with the exact ascending chord.
+        let changes = debounce.update(first | second);
+        assert!(!ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        let changes = debounce.update(first | second);
+        assert!(ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        assert_eq!(ui.selection().mask(), first | second);
+        assert_eq!(ui.selection().primary(), Some(2));
+
+        let selection = ui.selection();
+        let changes = debounce.update(0);
+        assert!(!ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        let changes = debounce.update(0);
+        assert_ne!(changes.released, 0);
+        assert!(!ui.press_voice_edges(changes.pressed, debounce.stable_mask()));
+        assert_eq!(ui.selection(), selection);
+    }
+
+    #[test]
     fn physical_control_keys_debounce_but_never_become_selected_beats() {
         assert_eq!(KEY_COUNT, 12);
         assert_eq!(BEAT_PAD_COUNT, 9);
@@ -7504,12 +7999,13 @@ mod tests {
         assert_eq!(adjust_sample_selection(sample(7), 0), sample(7));
 
         let mut acceleration = UiEncoderAcceleration::new();
+        let beats_group = VoiceGroup::new(1 << 3, 3).unwrap();
         assert_eq!(
-            acceleration.update(1_000, UiEncoderTarget::BeatsPad(3), 1),
+            acceleration.update(1_000, UiEncoderTarget::BeatsGroup(beats_group), 1),
             1
         );
         assert_eq!(
-            acceleration.update(1_030, UiEncoderTarget::BeatsPad(3), 1),
+            acceleration.update(1_030, UiEncoderTarget::BeatsGroup(beats_group), 1),
             10
         );
         assert_eq!(acceleration.update(1_060, UiEncoderTarget::Light, 1), 1);
@@ -7620,18 +8116,32 @@ mod tests {
     }
 
     #[test]
-    fn persistent_voice_selection_is_exclusive_but_mask_storage_is_multi_capable() {
+    fn voice_selection_tracks_chronological_primary_and_deterministic_chords() {
         let mut selection = VoiceSelection::from_mask((1 << 1) | (1 << 7) | (1 << 14));
         assert_eq!(selection.mask(), (1 << 1) | (1 << 7));
         assert_eq!(selection.count(), 2);
         assert_eq!(selection.selected(), None);
+        assert_eq!(selection.primary(), Some(1));
+        assert_eq!(selection.group(), VoiceGroup::new((1 << 1) | (1 << 7), 1));
         assert!(selection.contains(1));
-        assert!(selection.insert(4));
-        assert_eq!(selection.count(), 3);
-        assert!(selection.remove(7));
-        assert!(selection.toggle(8));
         assert!(!selection.toggle(BEAT_PAD_COUNT));
 
+        selection.clear();
+        assert!(selection.insert(7));
+        assert!(selection.insert(1));
+        assert!(selection.insert(4));
+        assert_eq!(selection.primary(), Some(7));
+        assert!(selection.remove(7));
+        assert_eq!(selection.primary(), Some(1));
+        assert!(selection.toggle(1));
+        assert_eq!(selection.primary(), Some(4));
+        assert!(selection.toggle(1));
+        assert_eq!(selection.primary(), Some(4));
+        assert!(selection.remove(4));
+        assert_eq!(selection.primary(), Some(1));
+
+        selection.replace_with_mask((1 << 6) | (1 << 2));
+        assert_eq!(selection.primary(), Some(2));
         assert!(selection.toggle_exclusive(3));
         assert_eq!(selection.selected(), Some(3));
         assert!(selection.toggle_exclusive(3));
@@ -7640,6 +8150,456 @@ mod tests {
         assert_eq!(selection.selected(), Some(8));
         selection.clear();
         assert_eq!(selection, VoiceSelection::new());
+
+        assert_eq!(VoiceGroup::new(0, 0), None);
+        assert_eq!(VoiceGroup::new(1 << 2, 1), None);
+        assert_eq!(VoiceGroup::new(1 << 2, BEAT_PAD_COUNT), None);
+    }
+
+    #[test]
+    fn controller_chords_replace_groups_and_single_taps_edit_multi_membership() {
+        let mut ui = UiController::new();
+        assert!(ui.press_voice_chord((1 << 5) | (1 << 2)));
+        assert_eq!(ui.selection().mask(), (1 << 2) | (1 << 5));
+        assert_eq!(ui.selection().primary(), Some(2));
+        let initial_group = ui.selected_group().unwrap();
+        assert_eq!(
+            ui.encoder_target(true),
+            UiEncoderTarget::Volume(VolumeTarget::Pads(initial_group))
+        );
+
+        assert!(ui.press_voice(7));
+        assert_eq!(ui.selection().mask(), (1 << 2) | (1 << 5) | (1 << 7));
+        assert_eq!(ui.selection().primary(), Some(2));
+        assert!(ui.press_voice(2));
+        assert_eq!(ui.selection().mask(), (1 << 5) | (1 << 7));
+        assert_eq!(ui.selection().primary(), Some(5));
+        assert!(ui.press_voice(5));
+        assert_eq!(ui.selected_pad(), Some(7));
+
+        // With only one voice left, ordinary taps are exclusive again.
+        assert!(ui.press_voice(1));
+        assert_eq!(ui.selected_pad(), Some(1));
+        assert!(ui.press_voice(1));
+        assert_eq!(ui.selection().mask(), 0);
+
+        assert!(!ui.press_voice_chord(1 << 4));
+        assert!(ui.press_voice_chord((1 << 8) | (1 << 3)));
+        assert_eq!(ui.selection().mask(), (1 << 3) | (1 << 8));
+        assert_eq!(ui.selection().primary(), Some(3));
+
+        // A later chord replaces, rather than extends, an augmented group.
+        assert!(ui.press_voice(6));
+        assert_eq!(ui.selection().mask(), (1 << 3) | (1 << 6) | (1 << 8));
+        assert!(ui.press_voice_chord((1 << 1) | (1 << 5)));
+        assert_eq!(ui.selection().mask(), (1 << 1) | (1 << 5));
+        assert_eq!(ui.selection().primary(), Some(1));
+
+        // Chronological edits can make the primary non-numeric; replaying the
+        // same mask as a chord restores deterministic ascending order.
+        assert!(ui.press_voice(7));
+        assert!(ui.press_voice(1));
+        assert_eq!(ui.selection().primary(), Some(5));
+        assert!(ui.press_voice(1));
+        assert_eq!(ui.selection().primary(), Some(5));
+        assert_eq!(ui.selection().mask(), (1 << 1) | (1 << 5) | (1 << 7));
+        assert!(ui.press_voice_chord((1 << 1) | (1 << 5) | (1 << 7)));
+        assert_eq!(ui.selection().primary(), Some(1));
+        assert_eq!(ui.selection().mask(), (1 << 1) | (1 << 5) | (1 << 7));
+    }
+
+    #[test]
+    fn group_state_edits_are_atomic_and_cycle_compares_raw_global_sentinel() {
+        let group = VoiceGroup::new((1 << 0) | (1 << 2) | (1 << 5), 0).unwrap();
+
+        let mut beats = SharedState::default();
+        assert!(beats.set_desired_beats(0, 3));
+        assert!(beats.set_desired_beats(2, 7));
+        assert!(beats.set_desired_beats(5, 9));
+        let revision = beats.song_revision;
+        let (edit, equal) = beats
+            .group_edit_snapshot(GroupEditParameter::Beats, group)
+            .unwrap();
+        assert_eq!(edit, GroupEdit::Beats { group, value: 3 });
+        assert!(!equal);
+        assert!(beats.synchronize_group(edit));
+        assert_eq!(beats.song_revision, revision.wrapping_add(1));
+        assert_eq!(
+            (
+                beats.desired_beats[0],
+                beats.desired_beats[2],
+                beats.desired_beats[5]
+            ),
+            (3, 3, 3)
+        );
+        let revision = beats.song_revision;
+        assert_eq!(
+            beats.adjust_group(GroupEditParameter::Beats, group, 1),
+            Some(GroupEdit::Beats { group, value: 4 })
+        );
+        assert_eq!(beats.song_revision, revision.wrapping_add(1));
+        assert_eq!(beats.desired_beats[1], 0);
+
+        let mut cycles = SharedState::default();
+        assert!(cycles.set_pad_cycle_length_ms(2, DEFAULT_BASE_INTERVAL_MS));
+        let revision = cycles.song_revision;
+        let (edit, equal) = cycles
+            .group_edit_snapshot(GroupEditParameter::CycleLength, group)
+            .unwrap();
+        assert_eq!(edit, GroupEdit::CycleLength { group, value: 0 });
+        assert!(
+            !equal,
+            "explicit Global-sized overrides remain distinct from zero"
+        );
+        assert!(cycles.synchronize_group(edit));
+        assert_eq!(cycles.song_revision, revision.wrapping_add(1));
+        assert_eq!(cycles.pad_cycle_length_override_ms(2), None);
+
+        let mut samples = SharedState::default();
+        assert!(samples.set_pad_sample(2, sample(23)));
+        let revision = samples.song_revision;
+        let (edit, equal) = samples
+            .group_edit_snapshot(GroupEditParameter::Sample, group)
+            .unwrap();
+        assert!(!equal);
+        assert!(samples.synchronize_group(edit));
+        assert_eq!(samples.song_revision, revision.wrapping_add(1));
+        let primary_sample = samples.pad_sample(0).unwrap();
+        assert_eq!(samples.pad_sample(2), Some(primary_sample));
+        assert_eq!(samples.pad_sample(5), Some(primary_sample));
+
+        let mut volumes = SharedState::default();
+        assert_eq!(volumes.adjust_volume(VolumeTarget::Pad(2), -20), Some(80));
+        let revision = volumes.song_revision;
+        let (edit, equal) = volumes
+            .group_edit_snapshot(GroupEditParameter::Volume, group)
+            .unwrap();
+        assert_eq!(edit, GroupEdit::Volume { group, value: 100 });
+        assert!(!equal);
+        assert!(volumes.synchronize_group(edit));
+        assert_eq!(volumes.song_revision, revision.wrapping_add(1));
+        let revision = volumes.song_revision;
+        assert_eq!(
+            volumes.adjust_volume(VolumeTarget::Pads(group), -1),
+            Some(99)
+        );
+        assert_eq!(volumes.song_revision, revision.wrapping_add(1));
+        assert_eq!(
+            (
+                volumes.pad_volume_percents[0],
+                volumes.pad_volume_percents[2],
+                volumes.pad_volume_percents[5]
+            ),
+            (99, 99, 99)
+        );
+    }
+
+    #[test]
+    fn group_noop_and_invalid_edits_do_not_advance_song_revision() {
+        let group = VoiceGroup::new((1 << 0) | (1 << 2) | (1 << 5), 0).unwrap();
+        let single = VoiceGroup::new(1 << 0, 0).unwrap();
+        let mut state = SharedState::default();
+
+        for edit in [
+            GroupEdit::Beats { group, value: 0 },
+            GroupEdit::CycleLength { group, value: 0 },
+            GroupEdit::Sample {
+                group,
+                value: DEFAULT_PAD_SAMPLES[0],
+            },
+            GroupEdit::Volume { group, value: 100 },
+        ] {
+            assert!(state.synchronize_group(edit));
+        }
+        assert_eq!(state.song_revision, 0);
+
+        assert_eq!(
+            state.adjust_group(GroupEditParameter::Beats, group, -1),
+            Some(GroupEdit::Beats { group, value: 0 })
+        );
+        assert_eq!(
+            state.adjust_group(GroupEditParameter::CycleLength, group, -1),
+            Some(GroupEdit::CycleLength { group, value: 0 })
+        );
+        assert_eq!(
+            state.adjust_group(GroupEditParameter::Sample, group, 0),
+            Some(GroupEdit::Sample {
+                group,
+                value: DEFAULT_PAD_SAMPLES[0],
+            })
+        );
+        assert_eq!(
+            state.adjust_group(GroupEditParameter::Volume, group, 1),
+            Some(GroupEdit::Volume { group, value: 100 })
+        );
+        assert_eq!(state.song_revision, 0);
+
+        assert_eq!(
+            state.group_edit_snapshot(GroupEditParameter::Beats, single),
+            None
+        );
+        assert!(!state.synchronize_group(GroupEdit::Beats {
+            group: single,
+            value: 0,
+        }));
+        assert!(!state.synchronize_group(GroupEdit::Beats {
+            group,
+            value: MAX_BEAT_MULTIPLIER + 1,
+        }));
+        assert!(!state.synchronize_group(GroupEdit::CycleLength {
+            group,
+            value: MIN_BASE_INTERVAL_MS - 1,
+        }));
+        assert!(!state.synchronize_group(GroupEdit::Volume { group, value: 101 }));
+        assert_eq!(state.song_revision, 0);
+    }
+
+    #[test]
+    fn group_beats_clamp_repeats_without_erasing_hidden_pattern_data() {
+        let group = VoiceGroup::new((1 << 0) | (1 << 2), 0).unwrap();
+        let mut state = SharedState::default();
+        assert!(state.set_desired_beats(0, 3));
+        assert!(state.set_pattern_repeat(0, 80));
+        assert_eq!(state.effective_pattern_steps(0), Some(240));
+        assert_eq!(state.toggle_pattern_step(0, 200), Some(false));
+        assert!(state.set_desired_beats(2, 64));
+        assert!(state.set_pattern_repeat(2, 4));
+
+        assert!(state.synchronize_group(GroupEdit::Beats { group, value: 200 }));
+        assert_eq!(state.pattern_repeat(0), Some(1));
+        assert_eq!(state.pattern_repeat(2), Some(1));
+        assert_eq!(state.pattern(0).unwrap().bit(200), Some(false));
+        assert_eq!(state.desired_beats[1], 0);
+    }
+
+    #[test]
+    fn mixed_group_warning_requires_push_and_pattern_rejects_multi_selection() {
+        let mut ui = UiController::new();
+        let mask = (1 << 1) | (1 << 4);
+        assert!(ui.press_voice_chord(mask));
+        let group = ui.selected_group().unwrap();
+        ui.enter_root_mode();
+        let edit = GroupEdit::Beats { group, value: 7 };
+        assert!(ui.open_group_warning(edit));
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::GroupWarning);
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::GroupWarning { edit }
+        );
+        assert_eq!(
+            ui.press_encoder(None),
+            Some(UiAction::SynchronizeGroup(edit))
+        );
+        assert_eq!(ui.page(), UiPage::Beats);
+
+        assert!(ui.open_group_warning(edit));
+        ui.return_to_root(0, false);
+        assert_eq!(ui.page(), UiPage::Beats);
+        assert_eq!(ui.group_warning(), None);
+        ui.return_to_root(0, false);
+        assert_eq!(ui.page(), UiPage::Root);
+        assert_eq!(ui.selection().mask(), mask);
+
+        ui.rotate_root(RootMode::Pattern.index() as i32 - RootMode::Beats.index() as i32);
+        assert_eq!(ui.press_encoder(None), None);
+        assert_eq!(ui.page(), UiPage::Root);
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group }
+        );
+        ui.return_to_root(0, false);
+        assert_eq!(ui.selection().mask(), 0);
+
+        assert!(ui.press_voice(3));
+        ui.enter_root_mode();
+        assert_eq!(ui.page(), UiPage::Pattern);
+        assert!(ui.press_voice_chord((1 << 2) | (1 << 6)));
+        assert_eq!(ui.page(), UiPage::Root);
+        assert!(matches!(
+            ui.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { .. }
+        ));
+    }
+
+    #[test]
+    fn group_warning_cancels_on_selection_and_status_and_volume_overlays_pattern_notice() {
+        let mut ui = UiController::new();
+        assert!(ui.press_voice_chord((1 << 1) | (1 << 4)));
+        ui.enter_root_mode();
+
+        let edit = GroupEdit::Beats {
+            group: ui.selected_group().unwrap(),
+            value: 7,
+        };
+        assert!(ui.open_group_warning(edit));
+        assert_eq!(
+            ui.display_model(true),
+            UiDisplayModel::GroupWarning { edit },
+            "a mixed warning remains above the Volume modifier"
+        );
+        assert!(ui.press_voice(7));
+        assert_eq!(ui.group_warning(), None);
+
+        let edit = GroupEdit::Beats {
+            group: ui.selected_group().unwrap(),
+            value: 9,
+        };
+        assert!(ui.open_group_warning(edit));
+        assert!(ui.press_voice_chord((1 << 2) | (1 << 6)));
+        assert_eq!(ui.group_warning(), None);
+
+        let edit = GroupEdit::Beats {
+            group: ui.selected_group().unwrap(),
+            value: 11,
+        };
+        assert!(ui.open_group_warning(edit));
+        let status = SongUiStatus::Success {
+            operation: SongStorageOperation::SaveCurrent,
+        };
+        ui.set_song_status(status);
+        assert_eq!(ui.group_warning(), None);
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::SongStatus { status }
+        );
+
+        let mut pattern = UiController::new();
+        assert!(pattern.press_voice_chord((1 << 0) | (1 << 5)));
+        let group = pattern.selected_group().unwrap();
+        pattern.rotate_root(RootMode::Pattern.index() as i32);
+        assert_eq!(pattern.press_encoder(None), None);
+        assert_eq!(pattern.page(), UiPage::Root);
+        assert_eq!(pattern.encoder_target(false), UiEncoderTarget::Root);
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group }
+        );
+
+        let target = VolumeTarget::Pads(group);
+        assert_eq!(
+            pattern.encoder_target(true),
+            UiEncoderTarget::Volume(target)
+        );
+        assert_eq!(
+            pattern.display_model(true),
+            UiDisplayModel::Volume { target },
+            "the OLED must show the value currently owned by the encoder"
+        );
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group },
+            "the root notice returns when Volume is released"
+        );
+
+        let volume_edit = GroupEdit::Volume { group, value: 75 };
+        assert!(pattern.open_group_warning(volume_edit));
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::GroupWarning { edit: volume_edit }
+        );
+        pattern.return_to_root(0, false);
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group },
+            "cancelling a Volume warning restores the Pattern notice"
+        );
+        assert!(pattern.open_group_warning(volume_edit));
+        assert_eq!(
+            pattern.press_encoder(None),
+            Some(UiAction::SynchronizeGroup(volume_edit))
+        );
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group },
+            "confirming a Volume warning restores the Pattern notice"
+        );
+
+        assert!(pattern.press_voice_chord((1 << 1) | (1 << 4) | (1 << 8)));
+        let three = pattern.selected_group().unwrap();
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group: three }
+        );
+        assert!(pattern.press_voice(8));
+        let two = pattern.selected_group().unwrap();
+        assert_eq!(
+            pattern.display_model(false),
+            UiDisplayModel::PatternNeedsSingle { group: two },
+            "the notice remains while more than one voice is selected"
+        );
+        assert!(pattern.press_voice(1));
+        assert_eq!(pattern.selected_pad(), Some(4));
+        assert!(matches!(
+            pattern.display_model(false),
+            UiDisplayModel::Root { .. }
+        ));
+    }
+
+    #[test]
+    fn group_mute_tap_follows_primary_and_hold_captures_the_group() {
+        let group = VoiceGroup::new((1 << 0) | (1 << 3) | (1 << 6), 0).unwrap();
+        let target = MuteTarget::Pads(group);
+        let outsider = MuteTarget::Pad(8);
+        let mut state = SharedState::default();
+
+        assert!(state.begin_mute_gesture(outsider));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: outsider,
+            tapped: true,
+        }));
+        assert!(state.begin_mute_gesture(MuteTarget::Pad(0)));
+        assert!(state.end_mute_gesture(MuteRelease {
+            target: MuteTarget::Pad(0),
+            tapped: true,
+        }));
+        assert_eq!(state.latched_mute(target), Some(true));
+        assert_eq!(state.latched_mute(outsider), Some(true));
+        let revision = state.song_revision;
+
+        assert!(state.begin_mute_gesture(target));
+        assert_eq!(state.active_mute_target(), Some(target));
+        assert_eq!(state.effective_mute_mask() & group.mask(), group.mask());
+        assert!(state.end_mute_gesture(MuteRelease {
+            target,
+            tapped: true,
+        }));
+        assert_eq!(state.song_revision, revision.wrapping_add(1));
+        for pad in [0, 3, 6] {
+            assert_eq!(state.latched_mute(MuteTarget::Pad(pad)), Some(false));
+        }
+        assert_eq!(state.latched_mute(outsider), Some(true));
+
+        let hold_revision = state.song_revision;
+        let mut ui = UiController::new();
+        assert!(ui.press_voice_chord(group.mask()));
+        let mut button = MuteButtonState::new();
+        assert!(button.press(MuteTarget::for_selection(ui.selection()), 100));
+        assert!(state.begin_mute_gesture(target));
+        assert_eq!(state.effective_mute_mask() & group.mask(), group.mask());
+
+        let replacement = VoiceGroup::new((1 << 2) | (1 << 7), 2).unwrap();
+        assert!(ui.press_voice_chord(replacement.mask()));
+        assert_eq!(button.active_target(), Some(target));
+        assert!(!button.press(MuteTarget::Pads(replacement), 200));
+        let release = button.release(400).unwrap();
+        assert_eq!(
+            release,
+            MuteRelease {
+                target,
+                tapped: false
+            }
+        );
+        assert!(state.end_mute_gesture(release));
+        assert_eq!(state.effective_mute_mask() & group.mask(), 0);
+        assert_eq!(state.latched_mute(outsider), Some(true));
+        assert_eq!(state.song_revision, hold_revision);
+
+        assert!(button.press(target, 500));
+        assert!(state.begin_mute_gesture(target));
+        assert_eq!(button.cancel(), Some(target));
+        assert_eq!(state.cancel_mute_gesture(), Some(target));
+        assert_eq!(state.song_revision, hold_revision);
+        assert_eq!(state.latched_mute(outsider), Some(true));
     }
 
     #[test]
@@ -7742,7 +8702,11 @@ mod tests {
         ui.enter_root_mode();
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsNone);
         ui.press_voice(4);
-        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsPad(4));
+        let pad_four = VoiceGroup::new(1 << 4, 4).unwrap();
+        assert_eq!(
+            ui.encoder_target(false),
+            UiEncoderTarget::BeatsGroup(pad_four)
+        );
         assert_eq!(
             ui.encoder_target(true),
             UiEncoderTarget::Volume(VolumeTarget::Pad(4))
@@ -7781,8 +8745,15 @@ mod tests {
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsNone);
         assert_eq!(ui.display_model(false), UiDisplayModel::BeatsSelectVoice);
         assert!(ui.press_voice(2));
-        assert_eq!(ui.encoder_target(false), UiEncoderTarget::BeatsPad(2));
-        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 2 });
+        let pad_two = VoiceGroup::new(1 << 2, 2).unwrap();
+        assert_eq!(
+            ui.encoder_target(false),
+            UiEncoderTarget::BeatsGroup(pad_two)
+        );
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::BeatsGroup { group: pad_two }
+        );
         assert_eq!(
             ui.encoder_target(true),
             UiEncoderTarget::Volume(VolumeTarget::Pad(2))
@@ -7794,10 +8765,13 @@ mod tests {
         ui.rotate_root(RootMode::CycleLength.index() as i32);
         ui.enter_root_mode();
         assert_eq!(ui.page(), UiPage::CycleLength);
-        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CyclePadLength(2));
+        assert_eq!(
+            ui.encoder_target(false),
+            UiEncoderTarget::CycleGroup(pad_two)
+        );
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::CyclePadLength { pad: 2 }
+            UiDisplayModel::CycleGroup { group: pad_two }
         );
         assert_eq!(
             ui.encoder_target(true),
@@ -7812,10 +8786,14 @@ mod tests {
         ui.enter_root_mode();
         assert!(ui.press_voice(4));
         assert_eq!(ui.selected_pad(), Some(4));
-        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CyclePadLength(4));
+        let pad_four = VoiceGroup::new(1 << 4, 4).unwrap();
+        assert_eq!(
+            ui.encoder_target(false),
+            UiEncoderTarget::CycleGroup(pad_four)
+        );
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::CyclePadLength { pad: 4 }
+            UiDisplayModel::CycleGroup { group: pad_four }
         );
         assert!(ui.press_voice(4));
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::CycleGlobal);
@@ -7829,7 +8807,7 @@ mod tests {
             ui.display_model(false),
             UiDisplayModel::Root {
                 highlighted: RootMode::Beats,
-                selected_pad: None,
+                selected_group: None,
                 current_song: None,
                 song_dirty: false,
             }
@@ -7867,25 +8845,37 @@ mod tests {
             ui.display_model(false),
             UiDisplayModel::Root {
                 highlighted: RootMode::Pattern,
-                selected_pad: Some(2),
+                selected_group: VoiceGroup::new(1 << 2, 2),
                 current_song: None,
                 song_dirty: false,
             }
         );
         ui.rotate_root(RootMode::Beats.index() as i32 - RootMode::Pattern.index() as i32);
         ui.enter_root_mode();
-        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 2 });
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::BeatsGroup {
+                group: VoiceGroup::new(1 << 2, 2).unwrap(),
+            }
+        );
         ui.press_voice(2);
         assert_eq!(ui.display_model(false), UiDisplayModel::BeatsSelectVoice);
         ui.press_voice(4);
-        assert_eq!(ui.display_model(false), UiDisplayModel::BeatsPad { pad: 4 });
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::BeatsGroup {
+                group: VoiceGroup::new(1 << 4, 4).unwrap(),
+            }
+        );
 
         ui.return_to_root(0, false);
         ui.rotate_root(RootMode::CycleLength.index() as i32);
         ui.enter_root_mode();
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::CyclePadLength { pad: 4 }
+            UiDisplayModel::CycleGroup {
+                group: VoiceGroup::new(1 << 4, 4).unwrap(),
+            }
         );
         ui.press_voice(4);
         assert_eq!(ui.display_model(false), UiDisplayModel::CycleGlobal);
@@ -7896,14 +8886,18 @@ mod tests {
         ui.enter_root_mode();
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::SamplePad { pad: 4 }
+            UiDisplayModel::SampleGroup {
+                group: VoiceGroup::new(1 << 4, 4).unwrap(),
+            }
         );
         ui.press_voice(4);
         assert_eq!(ui.display_model(false), UiDisplayModel::SampleSelectVoice);
         ui.press_voice(6);
         assert_eq!(
             ui.display_model(false),
-            UiDisplayModel::SamplePad { pad: 6 }
+            UiDisplayModel::SampleGroup {
+                group: VoiceGroup::new(1 << 6, 6).unwrap(),
+            }
         );
 
         ui.return_to_root(0, false);
@@ -7959,7 +8953,7 @@ mod tests {
             ui.display_model_with_library(false, library),
             UiDisplayModel::Root {
                 highlighted: RootMode::Beats,
-                selected_pad: None,
+                selected_group: None,
                 current_song: Some(last),
                 song_dirty: true,
             }
