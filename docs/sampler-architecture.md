@@ -576,10 +576,10 @@ distinct from timing failure.
 | RP2040 physical flash | 8 MiB |
 | Linker-owned firmware partition | 6 MiB |
 | Persistent song partition | 2 MiB (511 journal sectors after superblock) |
-| Current release flash use | 1,298,836 bytes |
+| Current release flash use | 1,299,104 bytes |
 | Complete 24-sample bank | 1,064,964 bytes |
-| Free flash in firmware partition | 4,992,620 bytes (about 4.76 MiB) |
-| Current executable text | 209,664 bytes (about 204.8 KiB) |
+| Free flash in firmware partition | 4,992,352 bytes (about 4.76 MiB) |
+| Current executable text | 209,832 bytes (about 204.9 KiB) |
 | Current linked static RAM span | 52,720 bytes |
 | RAM remaining before runtime stack | 217,616 bytes (about 212.5 KiB) |
 | RP2040 SRAM | 264 KiB |
@@ -593,7 +593,7 @@ distinct from timing failure.
 | Emergency threshold | 5,225 µs service |
 
 These values come from the current optimized release ELF's loadable sections:
-flash is 256 bytes boot2 + 192 bytes vectors + 209,664 bytes text + 1,082,844
+flash is 256 bytes boot2 + 192 bytes vectors + 209,832 bytes text + 1,082,944
 bytes read-only data + the 5,880-byte data load image. Static RAM is 5,880
 bytes data + 45,816 bytes BSS + the 1,024-byte reserved uninitialized region,
 ending at the 52,720-byte heap/stack boundary.

@@ -2135,6 +2135,18 @@ fn write_song_time<const N: usize>(line: &mut String<N>, frames: u32) {
     let _ = write!(line, "{:02}:{:02}", seconds / 60, seconds % 60);
 }
 
+fn write_track_timecode<const N: usize>(line: &mut String<N>, frames: u32) {
+    let seconds = frames / SAMPLE_RATE;
+    let milliseconds = (frames % SAMPLE_RATE) * 1_000 / SAMPLE_RATE;
+    let _ = write!(
+        line,
+        "{:02}:{:02}.{:03}",
+        seconds / 60,
+        seconds % 60,
+        milliseconds
+    );
+}
+
 fn track_zoom_label(zoom: TrackZoom) -> &'static str {
     match zoom {
         TrackZoom::Milliseconds50 => "50ms",
@@ -2182,9 +2194,14 @@ fn draw_tracks<D>(
         return;
     }
 
-    const TRACK_TOP: i32 = 21;
-    const TRACK_ROWS: usize = 43;
+    // Leave three pixels above and below the enlarged dots so the first row
+    // does not collide with the column labels and the final row is not clipped.
+    const TRACK_TOP: i32 = 24;
+    const TRACK_ROWS: usize = 37;
     const TRACK_X: [i32; BEAT_PAD_COUNT] = [10, 23, 36, 49, 62, 75, 88, 101, 114];
+    const TRACK_DOT_DIAMETER: u32 = 7;
+    const TRACK_DOT_RADIUS: i32 = TRACK_DOT_DIAMETER as i32 / 2;
+    const TRACK_MARKER_GAP: i32 = TRACK_DOT_RADIUS + 1;
 
     let projection = shared.lock(|state| *state.borrow());
     let mut raster = TrackRaster::<TRACK_ROWS>::empty();
@@ -2213,7 +2230,12 @@ fn draw_tracks<D>(
             TransportState::Stopped => 'X',
         };
         let _ = header.push(state_label);
-        write_song_time(&mut header, transport.position_frames.min(song_length));
+        let timecode_frame = if transport.state == TransportState::Playing {
+            transport.position_frames
+        } else {
+            cursor_frame
+        };
+        write_track_timecode(&mut header, timecode_frame.min(song_length));
         let _ = write!(
             &mut header,
             " {} {}",
@@ -2269,7 +2291,10 @@ fn draw_tracks<D>(
             if raster.projected_masks[row] & mask == 0 {
                 continue;
             }
-            let dot = Circle::new(Point::new(x - 1, y - 1), 3);
+            let dot = Circle::new(
+                Point::new(x - TRACK_DOT_RADIUS, y - TRACK_DOT_RADIUS),
+                TRACK_DOT_DIAMETER,
+            );
             let dot_style = if raster.enabled_masks[row] & mask != 0 {
                 PrimitiveStyle::with_fill(BinaryColor::On)
             } else {
@@ -2298,20 +2323,20 @@ fn draw_tracks<D>(
     let line_style = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
     let _ = Line::new(
         Point::new(0, marker_y),
-        Point::new(TRACK_X[0] - 3, marker_y),
+        Point::new(TRACK_X[0] - TRACK_MARKER_GAP, marker_y),
     )
     .into_styled(line_style)
     .draw(display);
     for pair in TRACK_X.windows(2) {
         let _ = Line::new(
-            Point::new(pair[0] + 3, marker_y),
-            Point::new(pair[1] - 3, marker_y),
+            Point::new(pair[0] + TRACK_MARKER_GAP, marker_y),
+            Point::new(pair[1] - TRACK_MARKER_GAP, marker_y),
         )
         .into_styled(line_style)
         .draw(display);
     }
     let _ = Line::new(
-        Point::new(TRACK_X[BEAT_PAD_COUNT - 1] + 3, marker_y),
+        Point::new(TRACK_X[BEAT_PAD_COUNT - 1] + TRACK_MARKER_GAP, marker_y),
         Point::new(127, marker_y),
     )
     .into_styled(line_style)
