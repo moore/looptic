@@ -9,6 +9,51 @@ pub mod flash_storage;
 pub mod load_control;
 pub mod sample_assets;
 
+/// Audio parsing, rendering, sequencing, and diagnostics APIs.
+///
+/// Crate-root re-exports remain the compatibility surface; this namespace
+/// gives new code a focused import path while implementation extraction
+/// proceeds without a breaking release.
+pub mod audio {
+    pub use super::{
+        DitherEncoder, PreviewRequest, RenderReport, SampleCatalog, SampleDefinition, SampleId,
+        SamplerDiagnostics, Sequencer, TriggerGain, WavError, WavPcm16,
+    };
+}
+
+/// Tracks arrangement and finite-transport APIs.
+pub mod tracks {
+    pub use super::{
+        EndBehavior, TrackChange, TrackRaster, TrackTimeline, TrackTimelineEditError,
+        TrackTimelineValidationError, TrackTransportStatus, TransportCommand, TransportState,
+    };
+}
+
+/// Persistent song model, codec, and library APIs.
+pub mod song {
+    pub use super::{
+        SongDecodeError, SongEncodeError, SongLibraryStatus, SongSlot, SongSlotOccupancy,
+        SongStorageOperation, SongValidationError, StoredSongV2, StoredSongV3, StoredSongV4,
+        decode_song, encode_song_v2, encode_song_v3, encode_song_v4,
+    };
+}
+
+/// Physical-control state machines and editing targets.
+pub mod controls {
+    pub use super::{
+        KeyChanges, KeyDebouncer, MuteButtonState, MuteRelease, MuteScanAction, MuteTarget,
+        VolumeTarget, resolve_mute_scan,
+    };
+}
+
+/// UI controller, display model, and selection APIs.
+pub mod ui {
+    pub use super::{
+        RootMode, UiAction, UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget,
+        UiPage, VoiceGroup, VoiceSelection,
+    };
+}
+
 use load_control::{DitherQuality, LoadLevel, RenderPolicy};
 
 pub const KEY_COUNT: usize = 12;
@@ -741,6 +786,19 @@ impl<'a> WavPcm16<'a> {
         let pair = self.data.get(byte..byte + 2)?;
         Some(i16::from_le_bytes([pair[0], pair[1]]))
     }
+
+    /// Read the sample at `cursor` and advance it exactly once on success.
+    ///
+    /// Keeping the bounds check and cursor update together avoids a second
+    /// length comparison in the per-voice render path.
+    #[inline]
+    fn sample_and_advance(&self, cursor: &mut usize) -> Option<(i16, bool)> {
+        let byte = cursor.checked_mul(2)?;
+        let pair = self.data.get(byte..byte + 2)?;
+        let sample = i16::from_le_bytes([pair[0], pair[1]]);
+        *cursor += 1;
+        Some((sample, byte + 2 == self.data.len()))
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -1312,11 +1370,10 @@ impl PlaybackVoice {
         }
 
         let pcm = catalog.pcm(self.sample);
-        let Some(raw) = pcm.sample(self.cursor) else {
+        let Some((raw, sample_ended)) = pcm.sample_and_advance(&mut self.cursor) else {
             self.phase = VoicePhase::Idle;
             return 0;
         };
-        self.cursor += 1;
 
         let effective_gain_q16 = multiply_unit_q16(gain_q16, self.trigger_gain_q16);
         let mut contribution = apply_sample_gain_q16(raw, effective_gain_q16);
@@ -1329,9 +1386,10 @@ impl PlaybackVoice {
             }
         }
 
-        if self.cursor >= pcm.len() {
+        if sample_ended {
             self.phase = VoicePhase::Idle;
         }
+
         contribution
     }
 }
@@ -1376,17 +1434,16 @@ impl FadeTail {
         }
 
         let pcm = catalog.pcm(self.sample);
-        let Some(raw) = pcm.sample(self.cursor) else {
+        let Some((raw, sample_ended)) = pcm.sample_and_advance(&mut self.cursor) else {
             self.active = false;
             return 0;
         };
-        self.cursor += 1;
         let effective_gain_q16 = multiply_unit_q16(gain_q16, self.trigger_gain_q16);
         let contribution = scale_declick(
             apply_sample_gain_q16(raw, effective_gain_q16),
             self.remaining,
         );
-        if self.remaining <= 1 || self.cursor >= pcm.len() {
+        if self.remaining <= 1 || sample_ended {
             self.active = false;
         } else {
             self.remaining -= 1;
@@ -7551,6 +7608,29 @@ mod tests {
             assert_eq!(definition.short_name, expected_names[index]);
             assert_eq!(definition.pcm.len(), expected_frames[index]);
         }
+    }
+
+    #[test]
+    fn sample_catalog_metadata_is_unique_and_stable() {
+        assert_eq!(sample_assets::SAMPLE_NAMES.len(), SAMPLE_COUNT);
+        assert_eq!(sample_assets::SAMPLE_PATHS.len(), SAMPLE_COUNT);
+        assert_eq!(sample_assets::SAMPLE_BYTES.len(), SAMPLE_COUNT);
+        for index in 0..SAMPLE_COUNT {
+            assert!(WavPcm16::parse(sample_assets::SAMPLE_BYTES[index]).is_ok());
+            for other in index + 1..SAMPLE_COUNT {
+                assert_ne!(
+                    sample_assets::SAMPLE_NAMES[index],
+                    sample_assets::SAMPLE_NAMES[other]
+                );
+                assert_ne!(
+                    sample_assets::SAMPLE_PATHS[index],
+                    sample_assets::SAMPLE_PATHS[other]
+                );
+            }
+        }
+        assert_eq!(sample_assets::SAMPLE_PATHS[0], "kit0_909/00_909kick4.wav");
+        assert_eq!(sample_assets::SAMPLE_PATHS[16], "kit2_aku/00_kick02.wav");
+        assert_eq!(sample_assets::SAMPLE_PATHS[23], "kit2_aku/07_cyq01.wav");
     }
 
     #[test]

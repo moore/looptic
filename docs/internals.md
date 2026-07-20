@@ -148,6 +148,14 @@ computation while interrupts are masked, but the copies themselves—roughly a
 full `SharedState` for projection and a 1,540-byte timeline for painting—are
 important SRAM and interrupt-latency regression watchpoints.
 
+Compile-time size ceilings make growth of `SharedState`, `UiState`, the Track
+timeline, and task-specific snapshots fail visibly. The LED task captures only
+the selection and display fields it consumes. Track publication remains a
+bounded copy under the critical-section mutex: a lock-free double buffer would
+require unsafe shared-memory synchronization between the thread and interrupt
+executors, which is not justified without hardware evidence that the bounded
+copy misses its deadline.
+
 ## Clock domains
 
 Three clocks must not be confused:

@@ -88,6 +88,42 @@ struct UiState {
     track_volume_feedback_until_ms: u64,
 }
 
+// These are interrupt-latency regression limits, not serialization contracts.
+// Large state copied under a CriticalSectionRawMutex must remain conspicuous.
+const _: () = assert!(core::mem::size_of::<UiState>() <= 256);
+const _: () = assert!(core::mem::size_of::<SharedState>() <= 5_000);
+const _: () = assert!(core::mem::size_of::<looptic::TrackTimeline>() <= 1_600);
+
+#[derive(Clone, Copy)]
+struct LedUiSnapshot {
+    selection: looptic::VoiceSelection,
+    tracks_page: bool,
+    volume_target: UiEncoderTarget,
+    light_preview: bool,
+}
+
+impl LedUiSnapshot {
+    fn capture(state: &UiState) -> Self {
+        let selection = state.controller.selection();
+        Self {
+            selection,
+            tracks_page: state.controller.page() == UiPage::Tracks,
+            volume_target: state.controller.encoder_target(true),
+            light_preview: state.controller.page() == UiPage::Light,
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<LedUiSnapshot>() <= 32);
+
+#[derive(Clone, Copy)]
+struct EncoderUiSnapshot {
+    controller: UiController,
+    volume_pressed: bool,
+}
+
+const _: () = assert!(core::mem::size_of::<EncoderUiSnapshot>() < core::mem::size_of::<UiState>());
+
 struct OledResources {
     spi: Peri<'static, SPI1>,
     sck: Peri<'static, PIN_26>,
@@ -1257,7 +1293,13 @@ async fn controls_task(
 
     loop {
         if let Ok(direction) = with_deadline(next_scan, encoder.read()).await {
-            let ui_state = ui.lock(|state| *state.borrow());
+            let ui_state = ui.lock(|state| {
+                let state = state.borrow();
+                EncoderUiSnapshot {
+                    controller: state.controller,
+                    volume_pressed: state.volume_pressed,
+                }
+            });
             let controller = ui_state.controller;
             // Return acts on its physical edge immediately: detents received
             // during its debounce window are discarded rather than editing or
@@ -1802,11 +1844,11 @@ async fn led_task(
     ui: &'static UiShared,
 ) {
     loop {
-        let ui_state = ui.lock(|state| *state.borrow());
-        let selection = ui_state.controller.selection();
-        let tracks_page = ui_state.controller.page() == UiPage::Tracks;
+        let ui_state = ui.lock(|state| LedUiSnapshot::capture(&state.borrow()));
+        let selection = ui_state.selection;
+        let tracks_page = ui_state.tracks_page;
         let fallback_mute_target = MuteTarget::for_selection(selection);
-        let volume_target = ui_state.controller.encoder_target(true);
+        let volume_target = ui_state.volume_target;
         let (playback_frame, triggers, underruns, brightness, mute_active, volume, transport) =
             shared.lock(|state| {
                 let state = state.borrow();
@@ -1839,7 +1881,7 @@ async fn led_task(
                     state.track_transport_status(),
                 )
             });
-        let light_preview = ui_state.controller.page() == UiPage::Light;
+        let light_preview = ui_state.light_preview;
 
         let mut colors = [RGB8::default(); KEY_COUNT];
         for pad in 0..BEAT_PAD_COUNT {

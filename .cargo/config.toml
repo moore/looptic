@@ -5,6 +5,7 @@ target = "thumbv6m-none-eabi"
 firmware = "build --release"
 flash = "run --release"
 host-test = "test --no-default-features --target x86_64-unknown-linux-gnu"
+host-check = "!./scripts/host-check.sh"
 firmware-bloat = "bloat --release --target thumbv6m-none-eabi --bin looptic"
 
 [target.thumbv6m-none-eabi]

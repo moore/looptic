@@ -2,113 +2,46 @@
 
 use crate::{SAMPLE_COUNT, SampleCatalog, WavError, WavPcm16};
 
-pub static SAMPLE_NAMES: [&str; SAMPLE_COUNT] = [
-    "909 Kick",
-    "909 Snare",
-    "909 Hat Closed",
-    "909 Hat Open",
-    "909 Clap",
-    "909 Tom",
-    "909 Blip",
-    "909 Cymbal",
-    "Tac Kick",
-    "Tac Snare",
-    "Tac Hat Closed",
-    "Tac Hat Open",
-    "Tac Snare Roll",
-    "Tac Tom",
-    "Tac Ride Bell",
-    "Tac Cymbal",
-    "AKU Kick",
-    "AKU Snare",
-    "AKU Hat 1",
-    "AKU Hat 2",
-    "AKU Clq",
-    "AKU Pcq 06",
-    "AKU Pcq 10",
-    "AKU Cymbal",
-];
+macro_rules! sample_catalog {
+    ($(($name:literal, $path:literal)),+ $(,)?) => {
+        pub static SAMPLE_NAMES: [&str; SAMPLE_COUNT] = [$($name),+];
+        pub const SAMPLE_PATHS: [&str; SAMPLE_COUNT] = [$($path),+];
+        pub const SAMPLE_BYTES: [&[u8]; SAMPLE_COUNT] = [
+            $(include_bytes!(concat!("../samples/", $path))),+
+        ];
 
-pub const SAMPLE_PATHS: [&str; SAMPLE_COUNT] = [
-    "kit0_909/00_909kick4.wav",
-    "kit0_909/01_909snare2.wav",
-    "kit0_909/02_909hatclosed2a.wav",
-    "kit0_909/03_909hatopen5.wav",
-    "kit0_909/04_909clap1.wav",
-    "kit0_909/05_909tommed.wav",
-    "kit0_909/06_909blip.wav",
-    "kit0_909/07_909cym2.wav",
-    "kit1_tac/00tictac_kick.wav",
-    "kit1_tac/01tictac_snare.wav",
-    "kit1_tac/02tictac_hatc2.wav",
-    "kit1_tac/03tictac_hato3.wav",
-    "kit1_tac/04tictac_snareroll.wav",
-    "kit1_tac/05tictac_tomlight.wav",
-    "kit1_tac/06tictac_ridebell.wav",
-    "kit1_tac/07tictac_cymbal1.wav",
-    "kit2_aku/00_kick02.wav",
-    "kit2_aku/01_sd02.wav",
-    "kit2_aku/02_ho02.wav",
-    "kit2_aku/03_ho02.wav",
-    "kit2_aku/04_clq02.wav",
-    "kit2_aku/05_pcq06.wav",
-    "kit2_aku/06_pcq10.wav",
-    "kit2_aku/07_cyq01.wav",
-];
-
-pub const SAMPLE_BYTES: [&[u8]; SAMPLE_COUNT] = [
-    include_bytes!("../samples/kit0_909/00_909kick4.wav"),
-    include_bytes!("../samples/kit0_909/01_909snare2.wav"),
-    include_bytes!("../samples/kit0_909/02_909hatclosed2a.wav"),
-    include_bytes!("../samples/kit0_909/03_909hatopen5.wav"),
-    include_bytes!("../samples/kit0_909/04_909clap1.wav"),
-    include_bytes!("../samples/kit0_909/05_909tommed.wav"),
-    include_bytes!("../samples/kit0_909/06_909blip.wav"),
-    include_bytes!("../samples/kit0_909/07_909cym2.wav"),
-    include_bytes!("../samples/kit1_tac/00tictac_kick.wav"),
-    include_bytes!("../samples/kit1_tac/01tictac_snare.wav"),
-    include_bytes!("../samples/kit1_tac/02tictac_hatc2.wav"),
-    include_bytes!("../samples/kit1_tac/03tictac_hato3.wav"),
-    include_bytes!("../samples/kit1_tac/04tictac_snareroll.wav"),
-    include_bytes!("../samples/kit1_tac/05tictac_tomlight.wav"),
-    include_bytes!("../samples/kit1_tac/06tictac_ridebell.wav"),
-    include_bytes!("../samples/kit1_tac/07tictac_cymbal1.wav"),
-    include_bytes!("../samples/kit2_aku/00_kick02.wav"),
-    include_bytes!("../samples/kit2_aku/01_sd02.wav"),
-    include_bytes!("../samples/kit2_aku/02_ho02.wav"),
-    include_bytes!("../samples/kit2_aku/03_ho02.wav"),
-    include_bytes!("../samples/kit2_aku/04_clq02.wav"),
-    include_bytes!("../samples/kit2_aku/05_pcq06.wav"),
-    include_bytes!("../samples/kit2_aku/06_pcq10.wav"),
-    include_bytes!("../samples/kit2_aku/07_cyq01.wav"),
-];
-
-pub fn parse_catalog() -> Result<SampleCatalog<'static>, WavError> {
-    let samples = [
-        WavPcm16::parse(SAMPLE_BYTES[0])?,
-        WavPcm16::parse(SAMPLE_BYTES[1])?,
-        WavPcm16::parse(SAMPLE_BYTES[2])?,
-        WavPcm16::parse(SAMPLE_BYTES[3])?,
-        WavPcm16::parse(SAMPLE_BYTES[4])?,
-        WavPcm16::parse(SAMPLE_BYTES[5])?,
-        WavPcm16::parse(SAMPLE_BYTES[6])?,
-        WavPcm16::parse(SAMPLE_BYTES[7])?,
-        WavPcm16::parse(SAMPLE_BYTES[8])?,
-        WavPcm16::parse(SAMPLE_BYTES[9])?,
-        WavPcm16::parse(SAMPLE_BYTES[10])?,
-        WavPcm16::parse(SAMPLE_BYTES[11])?,
-        WavPcm16::parse(SAMPLE_BYTES[12])?,
-        WavPcm16::parse(SAMPLE_BYTES[13])?,
-        WavPcm16::parse(SAMPLE_BYTES[14])?,
-        WavPcm16::parse(SAMPLE_BYTES[15])?,
-        WavPcm16::parse(SAMPLE_BYTES[16])?,
-        WavPcm16::parse(SAMPLE_BYTES[17])?,
-        WavPcm16::parse(SAMPLE_BYTES[18])?,
-        WavPcm16::parse(SAMPLE_BYTES[19])?,
-        WavPcm16::parse(SAMPLE_BYTES[20])?,
-        WavPcm16::parse(SAMPLE_BYTES[21])?,
-        WavPcm16::parse(SAMPLE_BYTES[22])?,
-        WavPcm16::parse(SAMPLE_BYTES[23])?,
-    ];
-    Ok(SampleCatalog::new(samples, &SAMPLE_NAMES))
+        pub fn parse_catalog() -> Result<SampleCatalog<'static>, WavError> {
+            let samples = [
+                $(WavPcm16::parse(include_bytes!(concat!("../samples/", $path)))?),+
+            ];
+            Ok(SampleCatalog::new(samples, &SAMPLE_NAMES))
+        }
+    };
 }
+
+sample_catalog![
+    ("909 Kick", "kit0_909/00_909kick4.wav"),
+    ("909 Snare", "kit0_909/01_909snare2.wav"),
+    ("909 Hat Closed", "kit0_909/02_909hatclosed2a.wav"),
+    ("909 Hat Open", "kit0_909/03_909hatopen5.wav"),
+    ("909 Clap", "kit0_909/04_909clap1.wav"),
+    ("909 Tom", "kit0_909/05_909tommed.wav"),
+    ("909 Blip", "kit0_909/06_909blip.wav"),
+    ("909 Cymbal", "kit0_909/07_909cym2.wav"),
+    ("Tac Kick", "kit1_tac/00tictac_kick.wav"),
+    ("Tac Snare", "kit1_tac/01tictac_snare.wav"),
+    ("Tac Hat Closed", "kit1_tac/02tictac_hatc2.wav"),
+    ("Tac Hat Open", "kit1_tac/03tictac_hato3.wav"),
+    ("Tac Snare Roll", "kit1_tac/04tictac_snareroll.wav"),
+    ("Tac Tom", "kit1_tac/05tictac_tomlight.wav"),
+    ("Tac Ride Bell", "kit1_tac/06tictac_ridebell.wav"),
+    ("Tac Cymbal", "kit1_tac/07tictac_cymbal1.wav"),
+    ("AKU Kick", "kit2_aku/00_kick02.wav"),
+    ("AKU Snare", "kit2_aku/01_sd02.wav"),
+    ("AKU Hat 1", "kit2_aku/02_ho02.wav"),
+    ("AKU Hat 2", "kit2_aku/03_ho02.wav"),
+    ("AKU Clq", "kit2_aku/04_clq02.wav"),
+    ("AKU Pcq 06", "kit2_aku/05_pcq06.wav"),
+    ("AKU Pcq 10", "kit2_aku/06_pcq10.wav"),
+    ("AKU Cymbal", "kit2_aku/07_cyq01.wav"),
+];

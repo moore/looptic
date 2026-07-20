@@ -62,12 +62,16 @@ build the firmware and run the platform-independent tests:
 
 ```console
 cargo host-test --locked
+cargo host-check --locked
 cargo firmware --locked
 ```
 
 `cargo firmware` is the project alias for the optimized RP2040 release build.
-The `host-test` alias selects `x86_64-unknown-linux-gnu`; on another host, use
-`cargo test --no-default-features --target <your-host-triple> --locked`.
+`cargo host-check` discovers the local Rust host triple and runs both tests and
+Clippy. The older `host-test` alias selects `x86_64-unknown-linux-gnu` and is
+retained for compatibility. Plain `cargo test` targets the RP2040 because this
+repository deliberately defaults to the embedded target, which has no host
+`std` test harness.
 
 To install over USB:
 
@@ -115,6 +119,12 @@ Run host tests:
 
 ```console
 cargo host-test --locked
+```
+
+Run the portable combined host test and lint check:
+
+```console
+cargo host-check --locked
 ```
 
 Run the formatting and lint checks used for firmware changes:
