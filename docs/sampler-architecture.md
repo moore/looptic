@@ -1,8 +1,10 @@
 # Sampler architecture
 
-This document defines the real-time sampler behavior for LoopTic's 24-sample
-bank. It is the implementation and benchmark contract behind the shorter
-control description in the [README](../README.md).
+This document defines the real-time sampler and hardware-benchmark contract for
+LoopTic's 24-sample bank. See [Internals](internals.md) for the broader firmware
+architecture and the [user guide](user-guide.md) for authoritative control and
+screen behavior. The control summary below records only interactions that
+affect the sampler contract.
 
 ## Audio dataflow and deadline
 
@@ -21,27 +23,27 @@ block and that FIFO elasticity. The FIFO is a final safety reserve, not extra
 rendering budget.
 
 ```text
-control snapshot             scheduled pad ticks       latest preview request
-       |                              |                          |
-       +------------------------------+--------------------------+
-                                      v
-                         exact-frame event resolution
-                                      |
-                         primary-voice allocation (24)
-                                      |
-                 +--------------------+--------------------+
-                 |                                         |
-        active primary voices                    forced-fade tails (9)
-                 |                                         |
-                 +---------------+-------------------------+
-                                 v
-           captured trigger gain x voice fade x live pad-gain ramp
-                                 |
-                            signed i32 sum
-                                 |
-                       independent master ramp
-                                 |
-                  i16 saturation -> PWM dither -> DMA
+finite transport -> rational pad ticks -> Pattern enable/trigger level
+                                                |
+                              audition OR (Track gate AND not muted)
+                                                |
+latest preview request -----------------> exact-frame event resolution
+                                                |
+                                   primary allocation (24)
+                                                |
+                          +---------------------+------------------+
+                          |                                        |
+                 active primary voices                 forced-fade tails (9)
+                          |                                        |
+                          +--------------------+-------------------+
+                                               v
+                 captured trigger gain x voice fade x live pad-gain ramp
+                                               |
+                                          signed i32 sum
+                                               |
+                                  independent master-gain ramp
+                                               |
+                             i16 saturation -> PWM dither -> DMA
 ```
 
 The audio task takes short snapshots of control state at block boundaries and
@@ -82,23 +84,24 @@ voice constant-time, independently addressable XIP reads.
 ### Control state and modes
 
 The OLED root menu is ordered `Beats`, `Song settings`, `Pattern`, `Tracks`,
-`Sample`, `Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot.
-Encoder navigation moves one item per detent without acceleration and clamps at
-both ends; the five-row window scrolls and its cursor survives mode entry and
-Return. Selectable lists render their active row as a full-width white band with
-black text, while continuation triangles remain contrasting at the left edge.
+`Sample`, `Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at
+boot. Encoder navigation moves one item per detent without acceleration and
+clamps at both ends; the five-row window scrolls and its cursor survives mode
+entry and Return. Selectable lists render their active row as a full-width white
+band with black text, while continuation triangles remain contrasting at the left edge.
 Encoder push enters the highlighted mode or invokes root Save; modes do not
 close merely because a beat key is released.
 
-Beat-key press edges update a persistent ordered selection; release edges have
-no effect. Selection begins in single-voice mode, where a lone press uses the
-exclusive toggle. Any chord of two or more debounced pads, at the root or in a
-menu, replaces selection with exactly that chord in ascending pad order and
-enters multi-select mode. While at least two members remain, lone presses
-independently add or remove pads, new members append chronologically, and
-removing the primary promotes the next-oldest member. Removing down to one exits
-multi-select mode; subsequent lone presses are exclusive again. A later chord
-always replaces the complete group.
+Outside Tracks, beat-key press edges update a persistent ordered selection;
+release edges have no selection effect. Selection begins in single-voice mode,
+where a lone press uses the exclusive toggle. Any chord of two or more
+debounced pads, at the root or in a non-Tracks menu, replaces selection with
+exactly that chord in ascending pad order and enters multi-select mode. While at
+least two members remain, lone presses independently add or remove pads, new
+members append chronologically, and removing the primary promotes the
+next-oldest member. Removing down to one exits multi-select mode; subsequent
+lone presses are exclusive again. A later chord always replaces the complete
+group.
 
 `VoiceSelection` stores the nine-bit mask and fixed-capacity chronological
 order. Its selected count determines whether multi-select mode is active, and
@@ -170,15 +173,16 @@ Mode behavior is:
 - **Tracks:** hide but preserve ordinary voice selection and render nine
   vertically scrolling projection columns. Filled/hollow dots distinguish
   enabled/disabled gate spans, enabled spans have center lines, and dense rows
-  coalesce with enabled priority. Stopped turns move one projected boundary;
-  held voice chords paint half-open spans atomically on release. Encoder-held
+  coalesce with enabled priority. Turns while not playing move one projected
+  boundary; held voice chords paint half-open spans atomically on release. Encoder-held
   turns select one of 16 display-only zooms; an unturned click opens runtime
   Loop/Stop choice. Mute is brightness-scaled blue Play/Pause. While playing,
   ordinary turns edit master volume and held voices live-audition future
-  scheduled hits through Track and mute gates without persistent mutation.
+  scheduled hits while bypassing Track and ordinary mute gates, without
+  persistent mutation.
 - **Sample:** with no selection, show `Select voice`. For a selected group, each
-  encoder detent moves the primary value one entry through the 24-sample catalog without
-  acceleration and clamps at the first or last sample. Group editing atomically
+  encoder detent moves the primary value one entry through the 24-sample catalog
+  without acceleration and clamps at the first or last sample. Group editing atomically
   assigns the primary's resulting value and uses mixed-value confirmation. Each
   edit or synchronization queues no more than one preview through the primary;
   holding the physical encoder button while turning suppresses that preview
@@ -218,8 +222,8 @@ otherwise it represents the primary local latch and active captured gesture.
 Volume instead resolves its target dynamically while held. Ordinarily it edits
 the selected group or the master when selection is empty, using the common
 mixed-value warning. On a selected pad's Pattern page, it edits the highlighted
-trigger level; highlighting `All` targets all stored trigger levels. It then returns
-encoder control to the open mode on release unless a warning remains open for
+trigger level; highlighting `All` targets all stored trigger levels. It then
+returns encoder control to the open mode on release unless a warning remains open for
 push confirmation. Tracks replaces Mute with transport and routes unmodified
 encoder turns to master volume while playing.
 
@@ -235,17 +239,17 @@ Light states on other pads are dimmed by 80% rather than replaced with a steady
 light. Every selected beat retains its computed white or palette color, and no
 multiplier is applied when selection is empty. The bottom controls do not
 participate: their identities remain Mute red, Volume yellow, and Return white,
-except that Tracks renders Mute dim/bright blue for stopped/playing transport.
+except that Tracks renders Mute dim/bright blue for non-playing/playing transport.
 
 ### Pattern representation
 
 Each pad owns 256 fixed slots. Its 256-bit (32-byte) enable map is initially
 filled, and a separate byte per slot stores an independent linear trigger level
-from 0 through 100%, initially 100%. At a beat division of `n`, scheduled step
-`s` reads enable bit and level `s` directly for `0 <= s < n`; there is no
-proportional range mapping or interpolation. Reducing a division exposes a
-shorter prefix without modifying the hidden suffix, and increasing it reveals
-the previous enable states and levels.
+from 0 through 100%, initially 100%. The effective Pattern length is
+`Beats × Cycles`; scheduled step `s` reads enable bit and level `s` directly.
+There is no proportional range mapping or interpolation. Reducing Beats or
+Cycles exposes a shorter prefix without modifying the hidden suffix, and
+increasing it reveals the previous enable states and levels.
 
 Pattern mode presents a scrollable `Cycles` row, then `All`, before the visible
 trigger rows. Pushing `Cycles` opens a one-step editor bounded by
@@ -261,11 +265,10 @@ returns to the pattern list. `All` fills all 256 enable bits and
 `None` clears all 256 enable bits. Committing either choice also resets every
 one of the 256 stored trigger levels to 100%, including hidden and disabled
 slots. `Cancel` leaves both maps unchanged. Return also cancels the choice,
-preserves selection, and returns to the root. At division zero no trigger rows
+preserves selection, and returns to the root. At zero Beats no trigger rows
 are visible, but `Cycles` and `All` remain available; Cycles is fixed at 1x and
-`All` still operates on the complete
-map. Normal division changes and individual trigger edits never alter hidden
-slots.
+`All` still operates on the complete map. Normal Beats/Cycles changes and
+individual trigger edits never alter hidden slots.
 
 Holding Volume changes Pattern navigation into level editing. A slow detent
 adds or subtracts one percentage point from the highlighted trigger; repeated
@@ -280,16 +283,19 @@ Confirming Reset all is an atomic UI-to-audio state reset: set the global Cycle
 length to 1000 ms, clear all per-pad Cycle-length overrides, set all Beats values
 to zero and Pattern Cycles to 1x, turn every pattern bit on, set every trigger
 level to 100%, assign pads 0–5 to AKU Kick and pads 6–8 to AKU Open Hat, turn
-global and per-pad mute off, and set master/per-pad volume to 100%; clear pending
-preview and visual-pulse state. At the next audio-block
+global and per-pad mute off, set master/per-pad volume to 100%, and restore a
+three-minute Song length with every Track enabled; clear pending preview and
+visual-pulse state. At the next audio-block
 boundary, active primary voices enter the normal 32-frame release. Existing
 forced-fade tails are neither restarted nor cleared and finish their bounded
 fades. Live gain ramps are frozen for those 32 frames, preventing a voice that
 was at zero volume from rising toward the restored 100% target during release.
 Emergency trimming is deferred for the same bounded window so it cannot hard-cut
-the reset fade. Brightness, playback position, adaptive-load state, and
-diagnostic counters are preserved. Completion returns to the root with
-`Reset all` highlighted, selection empty, and no current song association.
+the reset fade. Brightness, the monotonic hardware-frame epoch, adaptive-load
+state, and diagnostic counters are preserved. Finite song transport and the
+Tracks cursor restart at `00:00`, End Behavior returns to Loop, zoom returns to
+10 seconds, and playback resumes. Completion returns to the root with `Reset
+all` highlighted, selection empty, and no current song association.
 Cancel and Return change no musical settings or song association and preserve
 selection when leaving this confirmation. A confirmed Reset still clears
 selection; Return clears it only when pressed at the root.
@@ -443,11 +449,11 @@ phase. A muted pad does not produce an audible preview.
 
 ### Real-time implementation choices
 
-The release profile uses `opt-level = 3`. On ARM, `Sequencer::render` and the
-deterministic voice allocator are linked into `.data.ram_func` and copied to
-SRAM at startup. PCM remains in XIP flash, but fetching these hot paths from
-SRAM prevents their instructions from competing with simultaneous voice sample
-reads for the same XIP cache/port.
+The release profile uses `opt-level = 3`. On ARM, the Sequencer render entry
+points, their internal renderer, and the deterministic voice allocator are
+linked into `.data.ram_func` and copied to SRAM at startup. PCM remains in XIP
+flash, but fetching these hot paths from SRAM prevents their instructions from
+competing with simultaneous voice sample reads for the same XIP cache/port.
 
 The mixer uses signed `i32` fixed-point arithmetic. Trigger percentages use a
 small Q16 lookup table, and exact 0% and 100% gain paths avoid unnecessary
@@ -622,7 +628,7 @@ complete service maxima, DMA cadence, handoff delay, load transitions,
 effective voice limit, and underruns.
 
 The concrete pre-change regression baseline is important. With pads 2–9 at
-division zero, pad 1 selecting AKU Kick, a 1,000 ms base, and division 28, the
+zero Beats, pad 1 selecting AKU Kick, a 1,000 ms Cycle, and 28 Beats, the
 UI developed seconds of latency and the sound became distorted while audio
 continued. The AKU kick is 11,265 frames (about 0.5109 s), so 28 starts/s
 create an average 14.3 overlapping voices and alternate around 14–15 live
@@ -632,7 +638,7 @@ optimized/adaptive build.
 
 Exercise these cases separately and confirm their diagnostic counters:
 
-1. Reproduce that one-pad AKU-kick case, sweep through division 28 and beyond,
+1. Reproduce that one-pad AKU-kick case, sweep through 28 Beats and beyond,
    and operate the encoder and keys while recording load level, renderer and
    service timing, DMA cadence, deadline misses, and underruns through the
    selected debugger or benchmark export.
@@ -658,7 +664,7 @@ Exercise these cases separately and confirm their diagnostic counters:
 9. A recovery run long enough to observe Emergency/Pressure, voice-limit
    increments, RecoveryDither, RecoveryTails, RecoveryStarts, and Normal in
    order without chattering.
-10. At division 8, edit slots on both sides of the division-4 boundary, shrink
+10. At 8 Beats and 1x Cycles, edit slots on both sides of slot 4, shrink Beats
     to 4, and return to 8; hidden slots must retain their prior state. Verify
     that the `All` choice defaults to `Cancel`, that `All` fills and `None`
     clears the complete 256-bit enable map regardless of its prior state, and
@@ -669,19 +675,20 @@ Exercise these cases separately and confirm their diagnostic counters:
     whole-map relative deltas, independent clamping, rounded average feedback,
     and persistence across shrink/expand until a committed `All` or `None`
     deliberately resets them. Verify row clamping at `All` and the final
-    trigger, choice clamping at `Cancel` and `None`, and operation at division
-    zero. Use the encoder button to toggle rows and to open/confirm the
+    trigger, choice clamping at `Cancel` and `None`, and operation at zero
+    Beats. Use the encoder button to toggle rows and to open/confirm the
     whole-map choice. On the Pattern page, verify that Mute still performs its
     normal selected-pad tap/hold gesture. Clear selection while remaining in
     Pattern and verify that Mute targets Global.
-11. Starting with Beats highlighted, navigate the eight root entries in
-    `Beats`, `Cycle length`, `Pattern`, `Sample`, `Light`, `Save`, `Songs`,
-    `Reset all` order; verify five-row scrolling and clamping at both ends.
+11. Starting with Beats highlighted, navigate the nine root entries in
+    `Beats`, `Song settings`, `Pattern`, `Tracks`, `Sample`, `Light`, `Save`,
+    `Songs`, `Reset all` order; verify five-row scrolling and clamping at both
+    ends.
     Verify every selectable list uses a full-width white active row with black
     text, including after Return restores a remembered cursor, and that both
     scroll triangles stay visible against the row beneath them.
     Verify lone presses use exclusive selection until a 2+ chord at the root or
-    in any menu replaces selection with its exact ascending group. In multi
+    in any non-Tracks menu replaces selection with its exact ascending group. In multi
     mode, lone presses must append or remove members chronologically, primary
     removal must promote the next-oldest, removal down to one must restore
     exclusive mode, and a later chord must replace the group. Entering Pattern
@@ -691,8 +698,10 @@ Exercise these cases separately and confirm their diagnostic counters:
     equal white treatment for selected LEDs, and per-pad Pattern cursors.
     In Beats, no selection must show `Select voice`; group edits must directly
     use 1/10-step editing and independently clamp each member's Pattern Cycles
-    and cursor without erasing hidden data. In Cycle length, verify direct
-    10/100 ms global and group editing. A selected pad at zero must follow later
+    and cursor without erasing hidden data. In Song settings, verify Song length
+    uses one-second detents and that push/Return closes either nested editor
+    back to the settings list. In Cycle length, verify direct 10/100 ms global
+    and group editing. A selected pad at zero must follow later
     global edits; clockwise from zero must select 50 ms, counter-clockwise below
     50 ms must return to zero, and values 1 through 49 must remain unreachable.
     Stored zero must compare differently from an equal explicit override.
@@ -738,15 +747,30 @@ Exercise these cases separately and confirm their diagnostic counters:
     Create active primaries and forced-fade tails, then confirm Reset. Verify the
     documented defaults including all 2,304 trigger levels restored to 100%, a
     32-frame primary release, existing tails finishing without restart or
-    clearing, cleared previews/pulses, preserved brightness/playback/load/
-    counters, and return to the root with Reset all highlighted, selection
-    empty, and no current song association.
+    clearing, cleared previews/pulses, preserved brightness, monotonic hardware
+    frame, load state, and counters. Finite transport must restart playing at
+    `00:00` with Loop and 10-second zoom. The UI must return to the root with
+    Reset all highlighted, selection empty, and no current song association.
 14. Verify idle beat LEDs are off and every selected beat is steady white. Each
     selected trigger/preview indication must mix in its normal palette color.
     With no selection, trigger/preview and Light states must show at their
     normal computed brightness. With a selection, those states on every
-    unselected beat must be multiplied to 20% while idle-off keys remain off. Confirm the
-    red/yellow/white bottom controls are unaffected by beat dimming.
+    unselected beat must be multiplied to 20% while idle-off keys remain off.
+    Confirm the red/yellow/white bottom controls are unaffected by beat dimming.
+15. Enter Tracks with an existing selection and verify it is hidden but restored
+    on exit. Check all nine columns, 7x7 filled/hollow projected dots, enabled
+    center lines, paint/audition underlines, split horizontal marker, and the
+    `MM:SS.mmm` header with transport, Loop/Stop, and zoom indicators. While
+    Paused and Stopped, move through projected boundaries and both song
+    endpoints; paint forward/reverse spans, no-turn taps, and mixed-state
+    chords with exact half-open boundary ordering. Exercise all zooms, atomic
+    capacity failure, and preserved changes beyond a shortened Song length.
+    Verify Play/Pause fades without phase loss, cursor starts are inclusive,
+    Loop resets phases, Stop restarts at zero, and Load/Reset runtime defaults
+    match the user guide. While playing, confirm ordinary turns edit master
+    Volume and held voices audition only future scheduled hits while bypassing
+    Track and ordinary Mute gates, without dirtying the song or cutting tails
+    on release.
 
 Then run the combined worst-case workload continuously for 10 minutes. Passing
 requires:
@@ -768,7 +792,10 @@ latest-wins full-gain preview, mute-in-place, independent live gain ramps,
 full/coarse dither continuity, adaptive-policy transitions, saturating mix,
 catalog rejection, and counter saturation. Pattern tests cover all 256 direct
 slots, independent enable/level persistence, relative whole-map adjustment,
-clamping, dirty synchronization, and reset defaults. UI host tests cover
+clamping, dirty synchronization, and reset defaults. Transport/Tracks tests
+cover Pause/Resume/seek/end behavior, gate ordering, projection and raster
+boundaries, forward/reverse painting, atomic capacity failure, live audition,
+and preserved changes beyond a shortened song. UI host tests cover
 ordered chord-entered multi-selection, exclusive single mode, chronological
 primary promotion, group replacement, and Pattern entry blocking; atomic group
 Beats/Cycle/Sample/Volume edits and mixed-value warning confirmation; primary-
@@ -783,10 +810,11 @@ all trigger levels to 100% while `Cancel` leaves enablement and levels intact.
 The display-route model covers every root, overlay, prompt, editor, and
 confirmation screen; reset-release tests also cover frozen silent gain and
 Emergency-policy preservation of primaries and pre-existing tails.
-They cannot establish RP2040 XIP, physical input ordering, OLED/LED appearance,
-or UI timing. No MacroPad was connected while implementing either the
-optimized/adaptive path or the mode-based UI, so the complete hardware run
-above remains pending and is the acceptance authority.
+Codec and storage tests cover v2/v3 migration, canonical v4 Track packing,
+maximum-size records, all 256 occupied slots, reopen/churn, and power cuts at
+each journal mutation point. These tests cannot establish RP2040 XIP, physical
+input ordering, OLED/LED appearance, analog flash behavior, or UI timing, so
+the complete hardware protocol above remains the acceptance authority.
 
 ## Deferred algorithms
 

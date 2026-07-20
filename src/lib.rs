@@ -3549,7 +3549,7 @@ impl SharedState {
         true
     }
 
-    /// Set one pad division without bypassing persistent dirty tracking.
+    /// Set one pad's Beats value without bypassing persistent dirty tracking.
     pub fn set_desired_beats(&mut self, pad: usize, beats: u16) -> bool {
         if pad >= BEAT_PAD_COUNT || beats > MAX_BEAT_MULTIPLIER {
             return false;
@@ -3803,7 +3803,8 @@ impl SharedState {
     }
 
     /// Restore every musical control to its boot value without disturbing
-    /// brightness, the playback epoch, adaptive-load state, or diagnostics.
+    /// brightness, the monotonic hardware-frame epoch, adaptive-load state, or
+    /// diagnostics. Finite song transport is deliberately restarted at zero.
     pub fn reset_musical_state(&mut self) {
         self.desired_beats = [0; BEAT_PAD_COUNT];
         self.pattern_repeats = [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT];
@@ -4614,7 +4615,8 @@ impl StoredSongV3 {
     }
 
     /// Atomically replace persistent musical state after complete validation.
-    /// Runtime clock, brightness, adaptive-load state, and diagnostics survive.
+    /// The finite song restarts at zero; brightness, the monotonic hardware-frame
+    /// epoch, adaptive-load state, and diagnostics survive.
     pub fn apply_to(&self, state: &mut SharedState) -> Result<(), SongValidationError> {
         StoredSongV4::from(self.clone()).apply_to(state)
     }
@@ -4647,7 +4649,8 @@ impl StoredSongV4 {
     }
 
     /// Atomically replace persistent musical state after complete validation.
-    /// Runtime clock, brightness, adaptive-load state, and diagnostics survive.
+    /// The finite song restarts at zero; brightness, the monotonic hardware-frame
+    /// epoch, adaptive-load state, and diagnostics survive.
     pub fn apply_to(&self, state: &mut SharedState) -> Result<(), SongValidationError> {
         self.validate()?;
 
@@ -5731,7 +5734,7 @@ pub enum UiAction {
 
 /// Complete, value-independent OLED route selected by the UI controller.
 ///
-/// Musical values (division, sample, brightness, and volume) are resolved from
+/// Musical values (Beats, sample, brightness, and volume) are resolved from
 /// `SharedState` by the firmware after this pure model has selected the screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiDisplayModel {
@@ -13038,8 +13041,10 @@ mod tests {
 
     #[test]
     fn song_decoder_migrates_v3_with_default_tracks_arrangement() {
-        let mut legacy = StoredSongV3::default();
-        legacy.base_interval_ms = 8_765;
+        let mut legacy = StoredSongV3 {
+            base_interval_ms: 8_765,
+            ..StoredSongV3::default()
+        };
         legacy.pads[2].cycle_length_override_ms = Some(4_321);
         let expected = StoredSongV4::from(legacy.clone());
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];

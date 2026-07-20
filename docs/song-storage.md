@@ -4,6 +4,10 @@ LoopTic reserves the final 2 MiB of the MacroPad's 8 MiB W25Q64 flash for
 explicitly saved songs. Addresses in the flash driver are device-relative;
 addresses in the linker and debugger use the RP2040 XIP window.
 
+This is the detailed persistence contract. See [Internals](internals.md) for
+the complete firmware architecture and the [user guide](user-guide.md) for the
+Save and Songs workflows.
+
 | Region | Flash offset | XIP address | Size |
 |---|---:|---:|---:|
 | boot2 + firmware | `0x000000..0x600000` | `0x10000000..0x10600000` | 6 MiB |
@@ -109,7 +113,9 @@ Save, Copy, and Delete—must therefore run only after the audio task has faded
 voices, reached a block boundary, stopped the PIO stream on centered silence,
 and acknowledged that flash is quiescent. Once a flash operation begins it is
 not cancellable. Loading and the boot occupancy scan also happen while audio is
-stopped; decoded musical state is applied atomically at a later block boundary.
+stopped; decoded musical state is applied atomically to shared state while
+audio is quiescent and becomes authoritative to the sequencer when audio
+resumes and takes its next block snapshot.
 
 Storage is initialized only by the first explicit Save. Booting blank storage
 does not write it. Initialization first verifies whether the map is erased,
@@ -118,10 +124,11 @@ that verification found data or initialization is resuming from an incomplete
 descriptor. Map scanning and erasing proceed one 4 KiB sector at a time and
 yield to the executor between sectors, keeping Busy display and LED feedback
 alive while audio remains paused. Explicit reformatting reports the completed
-erase-sector percentage on the OLED. This still clears every potentially stale map byte; the
-metadata-first write ordering makes a power cut during an erase reboot as
-Blank so the full erase can be retried safely. Saving an unchanged record
-silently skips the flash operation.
+erase-sector percentage on the OLED. This still clears every potentially stale
+map byte; the metadata-first write ordering makes a power cut during an erase
+reboot as Blank so the full erase can be retried safely. An unchanged root Save
+to the current clean slot silently skips the flash operation; Save-as always
+writes its chosen destination.
 
 An ordinary occupancy scan only reads flash. If a supported journal contains
 an interrupted operation, however, `sequential-storage` may automatically
