@@ -18,17 +18,17 @@ PIO underrun.
 
 ## Navigation and beat selection
 
-The OLED root menu is ordered `Beats`, `Cycle length`, `Pattern`, `Sample`,
-`Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot. Each
-encoder detent moves one item, clamps at Beats and Reset all, and never
+The OLED root menu is ordered `Beats`, `Song settings`, `Pattern`, `Tracks`,
+`Sample`, `Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at
+boot. Each encoder detent moves one item, clamps at Beats and Reset all, and never
 accelerates; pressing the encoder enters the selected mode or invokes Save. The
 five visible rows scroll as the cursor reaches the later entries. The root
 cursor is remembered when leaving and returning to the menu. Every selectable
 list uses a full-width white highlight with black text for its active row;
 continuation triangles remain visible at the left when more entries are above
-or below. Beats, Cycle length, Pattern, Sample, Light, and Songs remain open
-until Return is pressed; the Reset all confirmation instead exits when either
-choice is confirmed.
+or below. Beats, Song settings, Pattern, Tracks, Sample, Light, and Songs remain
+open until Return is pressed; the Reset all confirmation instead exits when
+either choice is confirmed.
 
 Selection starts in single-voice mode. A lone beat-key press selects only that
 voice, replaces a different single selection, or clears it when it was already
@@ -150,15 +150,20 @@ Cycles multiplier and remembered Pattern cursor to its valid range without
 erasing hidden Pattern data. Encoder push has no action when no warning is
 open, and Return goes directly to the root.
 
-## Cycle length mode
+## Song settings
 
-With no beat selected, turning the encoder directly changes the global Cycle
-length, starting at 1000 ms with a 50 ms safety minimum and no application-level
-maximum. With one or more selected pads, turning the encoder changes every
-selected pad to the same stored Cycle-length value, using the primary voice for
-display and mixed-value confirmation. `Length 0 (Global)` follows the current
-global value; any value at or above 50 ms is an independent persistent
-override. Values 1 through 49 are
+Song settings contains `Song length` and `Cycle length`. Song length ranges
+from `00:01` through `99:59` and defaults to `03:00`; each detent changes it by
+one second. Press the encoder on either row to open its editor. A second push or
+Return closes the editor and returns to Song settings; Return from the menu
+returns to the root.
+
+In the Cycle length editor, no beat selection targets the global Cycle length,
+starting at 1000 ms with a 50 ms safety minimum and no application-level
+maximum. One or more selected pads instead target the same stored per-voice
+Cycle length, using the primary voice for display and mixed-value confirmation.
+`Length 0 (Global)` follows the current global value; any value at or above 50
+ms is an independent persistent override. Values 1 through 49 are
 skipped: clockwise from 0 selects 50 ms, and counter-clockwise below 50 ms
 returns to 0.
 
@@ -166,10 +171,9 @@ Mixed-value comparison uses the stored editor value: `0` remains distinct from
 an explicit override that happens to equal the current global duration.
 
 Slow turns change a selected group or global length by 10 ms, and consecutive
-same-target, same-direction detents within 40 ms change it by 100 ms. Encoder
-push has no action when no warning is open, and Return goes directly to the
-root. Clockwise increases the length (slower), while counter-clockwise decreases
-it. Pattern `Cycles` remains a
+same-target, same-direction detents within 40 ms change it by 100 ms. Clockwise
+increases the length (slower), while counter-clockwise decreases it. Pattern
+`Cycles` remains a
 separate repeat multiplier: it changes pattern wrap length, not this timing
 interval. For example, a
 106,500 ms Cycle length with pad values 71 and 73 gives a 71:73 polyrhythm
@@ -178,6 +182,40 @@ millisecond value, whose representational limit is about 49.7 days. There is a
 hard admission ceiling of eight scheduled voice starts per pad in each
 128-frame audio block. Dense grids keep advancing their exact clock, pattern,
 and visual pulses when excess audible starts are skipped.
+
+## Tracks mode
+
+Tracks is a finite nine-column arrangement whose duration comes from Song
+length. Projected enabled Pattern hits are dots: filled dots fall inside enabled
+Track spans and hollow dots fall inside disabled spans. A thin vertical line
+joins enabled regions, and the horizontal line is the playhead while running or
+the edit cursor while paused/stopped. Dense events that share one OLED row are
+coalesced, with an enabled event taking visual priority.
+
+While stopped, each encoder detent moves the cursor by one projected trigger
+boundary. Hold one or more beat keys, turn to the other boundary, and release
+the chord to toggle those voices across the half-open span. A key tap paints
+through the next projected boundary, or through song end after the last one.
+Every voice toggles relative to its own state at the anchor, and the complete
+chord commits atomically; `Tracks full` / `Simplify spans` means the canonical
+256-change timeline has no room for that edit. The normal ordered voice
+selection remains preserved but hidden, and Track key gestures never alter it.
+
+Hold the encoder while turning to zoom through 50 ms, 100 ms, 250 ms, 500 ms,
+1 s, 2 s, 5 s, 10 s, 30 s, 1 m, 2 m, 5 m, 10 m, 20 m, 1 h, and the whole song.
+Zoom is display-only and stays centered on the cursor or playhead. Click without
+turning to open End Behavior, choose `Loop` or `Stop`, and click or Return to
+close it.
+
+In Tracks, the blue Mute key becomes Play/Pause: bright blue means playing and
+dim blue means paused or stopped, both scaled by the global Light setting. Play
+starts at the stopped cursor, including a hit exactly on that frame. Pause
+freezes song time and Pattern phase; Loop restarts every Pattern at `00:00`,
+while Stop holds at song end until the next Play restarts from zero. During
+playback, ordinary encoder turns adjust master volume. Holding beat keys makes
+those voices' future scheduled hits audible over the arrangement, bypassing
+Track gates and ordinary mute without firing an immediate hit or dirtying the
+song; released keys affect only future hits, so existing sample tails continue.
 
 ## Mute control
 
@@ -339,15 +377,15 @@ Load operations return to normal navigation without a completion dialog;
 Copy/Delete/Format completion screens and operation errors remain visible until
 Return or an encoder press acknowledges them.
 
-A song stores the global Cycle length; all nine Beats values, optional per-pad
-Cycle-length overrides, Pattern Cycles multipliers, sample assignments,
-patterns, and trigger levels; latched global/per-pad mute; and master/per-pad
-volume. It deliberately excludes active sample tails, playback phase, UI
-cursors, selection mask and order, mixed-value warnings, momentary mute,
-brightness, overload state, and diagnostics. Multi-selection therefore does not
-change the song schema or physical storage layout. Confirmed Reset all clears
-the current-slot association so a later root Save cannot accidentally overwrite
-the previously loaded song.
+A song stores its finite Song length and sparse nine-voice Track gates; the
+global Cycle length; all nine Beats values, optional per-pad Cycle-length
+overrides, Pattern Cycles multipliers, sample assignments, patterns, and trigger
+levels; latched global/per-pad mute; and master/per-pad volume. It deliberately
+excludes active sample tails, transport position and Loop/Stop choice, live
+audition, zoom, UI cursors, selection mask and order, mixed-value warnings,
+momentary mute, brightness, overload state, and diagnostics. Confirmed Reset
+all clears the current-slot association so a later root Save cannot accidentally
+overwrite the previously loaded song.
 
 The final 2 MiB of flash is a linker-reserved journal. A CRC-protected
 superblock versions the physical layout, and every Postcard song record has a
@@ -358,11 +396,12 @@ musical time pauses during the explicit operation. See the
 [song storage architecture](docs/song-storage.md) for the exact partition map,
 compatibility rules, and power-loss model.
 
-New saves use song format v3. Loading a v2 song preserves all of its musical
-state and assigns every pad to the global Cycle length, matching v2 behavior.
-Loading alone does not rewrite the stored v2 record. The next operation that
-actually writes the live song—Save after an edit or Save-as—encodes v3; raw Copy
-preserves the source's original version. V1 records remain unsupported.
+New saves use song format v4. Loading a v2 or v3 song preserves its existing
+musical state and adds a three-minute, fully enabled Tracks arrangement; v2
+also assigns every pad to the global Cycle length, matching v2 behavior.
+Loading alone does not rewrite an older record. The next operation that writes
+the live song—Save after an edit or Save-as—encodes v4; raw Copy preserves the
+source's original version. V1 records remain unsupported.
 
 The first Save erases and initializes the complete reserved song partition
 before writing slot data, so it can take noticeably longer than a later Save.
@@ -377,6 +416,7 @@ confirmation. `Cancel` returns to the root without changing musical settings;
 confirming `Reset` restores the 1000 ms global Cycle length, clears every
 per-pad Cycle-length override, sets all Beats values to 0 and Pattern Cycles to
 1x, fills every pattern enable map, restores every trigger level to 100%,
+restores a three-minute Song length with every Track enabled,
 restores the default AKU kick mapping on pads 1–6 and AKU open-hat mapping on
 pads 7–9, clears global and per-pad mute, sets master and per-pad volume to
 100%, and clears pending previews and visual pulses.

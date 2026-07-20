@@ -63,15 +63,15 @@ protects backend compatibility, while the song-record decoder distinguishes a
 supported song, an unsupported older/newer schema, and corrupt payload data.
 That second version gate permits future firmware to migrate records one song at
 a time without changing the physical partition.
-Current saves use song format v3, which adds an optional Cycle-length override
-for every pad. The decoder also accepts v2 and migrates it in memory by assigning
-every pad to the global Cycle length, exactly preserving v2 timing. Loading does
-not rewrite the stored bytes; the next Save after an edit or Save-as writes v3.
-Raw Copy retains the source record's original version. V1 and unknown newer
-records are reported as unsupported and are not rewritten automatically. This
-record-schema change
-does not alter the superblock or journal geometry, so the physical storage-layout
-version remains 1.
+Current saves use song format v4, which adds finite Song length and a sparse
+Tracks arrangement. The decoder also accepts v2 and v3: both migrate to a
+three-minute, fully enabled arrangement, and v2 additionally assigns every pad
+to the global Cycle length to preserve its timing. Loading does not rewrite the
+stored bytes; the next Save after an edit or Save-as writes v4. Raw Copy retains
+the source record's original version. V1 and unknown newer records are reported
+as unsupported and are not rewritten automatically. This record-schema change
+does not alter the superblock or journal geometry, so the physical
+storage-layout version remains 1.
 
 ## Map and operation rules
 
@@ -81,25 +81,27 @@ self-versioned song records. The backend exposes a one-pass 256-bit occupancy
 scan plus load, save, and delete operations. Animal names are firmware-owned
 labels derived from the slot and are not stored in flash.
 
-Two MiB is deliberate. A complete V3 song is about 2.7 KiB and therefore each
-live value occupies most of one 4 KiB erase sector. A 1 MiB partition contains
+Two MiB is deliberate. A V4 record ranges from about 2.7 KiB to 3,999 bytes, so
+each live value fits in one 4 KiB erase sector. A 1 MiB partition contains
 exactly 256 sectors, but the journal requires a next-page migration buffer. It
 therefore cannot operationally hold 256 one-sector live records and still
 update or collect them. The 511-sector map holds all 256 live slots plus the
-required buffer while retaining substantial append/compaction workspace and
-distributing erases cyclically.
+required buffer while retaining append/compaction workspace and distributing
+erases cyclically.
 
-The frozen Postcard/Serde V3 DTO stores the global Cycle length, nine Beats
-values, nine Pattern Cycles multipliers, nine optional per-pad Cycle-length
-overrides, nine sample identifiers, nine 32-byte enable maps, nine sets of 256
-trigger levels, global/per-pad latched mute, and master/per-pad volume. It is not
-`SharedState`: playback position, voices, scheduler and UI cursors, previews,
-momentary mute, brightness, dirty flags, adaptive-load state, and diagnostics
-are intentionally excluded. Nested 32-byte chunks keep serialization bounded
-and allocation-free. Decode validates every range and sample identifier before
-atomically applying the complete value. The current encode buffer is 3,072
-bytes; unknown versions and trailing, truncated, or semantically invalid data
-are rejected without changing live state.
+The frozen Postcard/Serde V4 DTO stores Song length, up to 256 canonical Track
+gate changes, the global Cycle length, nine Beats values, nine Pattern Cycles
+multipliers, nine optional per-pad Cycle-length overrides, nine sample
+identifiers, nine 32-byte enable maps, nine sets of 256 trigger levels,
+global/per-pad latched mute, and master/per-pad volume. Track changes are sorted
+absolute sample frames plus a nine-bit resulting mask, packed into five bytes
+each; an empty list means all Tracks enabled. It is not `SharedState`: transport
+position, Loop/Stop, live audition, zoom, voices, scheduler and UI cursors,
+previews, momentary mute, brightness, dirty flags, adaptive-load state, and
+diagnostics are intentionally excluded. Decode validates every range and
+identifier before atomically applying the complete value. The record/copy
+buffer is 4,085 bytes; unknown versions and trailing, truncated, noncanonical,
+or semantically invalid data are rejected without changing live state.
 
 Flash erase/program code temporarily makes XIP unavailable and can exceed the
 audio DMA/FIFO reserve. All write operations—including first initialization,

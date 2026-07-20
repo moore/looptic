@@ -38,6 +38,11 @@ pub const SELECTED_TRIGGER_COLOR_PERCENT: u8 = 20;
 pub const SAMPLE_COUNT: usize = 24;
 pub const SONG_SLOT_COUNT: usize = 256;
 pub const DEFAULT_PATTERN_REPEATS: u16 = 1;
+pub const TRACK_CHANGE_CAPACITY: usize = 256;
+pub const MIN_SONG_LENGTH_SECONDS: u16 = 1;
+pub const MAX_SONG_LENGTH_SECONDS: u16 = 99 * 60 + 59;
+pub const DEFAULT_SONG_LENGTH_SECONDS: u16 = 3 * 60;
+pub const MAX_SONG_LENGTH_FRAMES: u32 = MAX_SONG_LENGTH_SECONDS as u32 * SAMPLE_RATE;
 pub const PRIMARY_VOICE_COUNT: usize = 24;
 pub const FADE_TAIL_COUNT: usize = 9;
 pub const DECLICK_FRAMES: u8 = 32;
@@ -47,6 +52,7 @@ const DECLICK_SHIFT: u32 = DECLICK_FRAMES.trailing_zeros();
 const GAIN_RAMP_SHIFT: u32 = GAIN_RAMP_FRAMES.trailing_zeros();
 const _: () = assert!(DECLICK_FRAMES.is_power_of_two());
 const _: () = assert!(GAIN_RAMP_FRAMES.is_power_of_two());
+const _: () = assert!(MAX_SONG_LENGTH_FRAMES < (1_u32 << 27));
 
 const DEFAULT_KICK_INDEX: usize = 16;
 const DEFAULT_OPEN_HAT_INDEX: usize = 18;
@@ -79,6 +85,339 @@ const fn coarse_dither_masks() -> [u16; PWM_DITHER_CYCLES as usize + 1] {
 
 /// Centered PWM command used while no PCM data is available.
 pub const SILENCE_PWM_WORD: u32 = 64 | (63 << 7);
+
+/// One canonical change in the song arrangement's nine-bit voice gate.
+///
+/// The new mask applies before a projected trigger at the same song frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackChange {
+    pub frame: u32,
+    pub gate_mask: u16,
+}
+
+impl TrackChange {
+    pub const fn new(frame: u32, gate_mask: u16) -> Option<Self> {
+        if frame <= MAX_SONG_LENGTH_FRAMES && gate_mask & !BEAT_PAD_MASK == 0 {
+            Some(Self { frame, gate_mask })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackTimelineValidationError {
+    TooManyChanges,
+    GateMaskOutOfRange {
+        index: u16,
+        gate_mask: u16,
+    },
+    FrameOutOfRange {
+        index: u16,
+        frame: u32,
+    },
+    FramesNotIncreasing {
+        index: u16,
+        previous: u32,
+        frame: u32,
+    },
+    RedundantMask {
+        index: u16,
+        gate_mask: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackTimelineEditError {
+    InvalidVoiceMask,
+    InvalidRange,
+    CapacityExceeded,
+}
+
+/// Sparse, canonical song-arrangement gates shared by all nine voices.
+///
+/// Empty storage means every voice is enabled. Parallel fixed-capacity arrays
+/// keep the runtime representation compact and allocation-free. Serialization
+/// is custom so only the active prefix is written, using five bytes per point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackTimeline {
+    frames: [u32; TRACK_CHANGE_CAPACITY],
+    gate_masks: [u16; TRACK_CHANGE_CAPACITY],
+    len: u16,
+}
+
+impl TrackTimeline {
+    pub const fn all_enabled() -> Self {
+        Self {
+            frames: [0; TRACK_CHANGE_CAPACITY],
+            gate_masks: [0; TRACK_CHANGE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn change(&self, index: usize) -> Option<TrackChange> {
+        (index < self.len()).then(|| TrackChange {
+            frame: self.frames[index],
+            gate_mask: self.gate_masks[index],
+        })
+    }
+
+    pub fn iter_changes(&self) -> TrackChanges<'_> {
+        TrackChanges {
+            timeline: self,
+            index: 0,
+        }
+    }
+
+    /// Return the gate in force at `frame`; a same-frame point is inclusive.
+    pub fn gate_mask_at(&self, frame: u32) -> u16 {
+        let prefix = &self.frames[..self.len()];
+        match prefix.binary_search(&frame) {
+            Ok(index) => self.gate_masks[index],
+            Err(0) => BEAT_PAD_MASK,
+            Err(index) => self.gate_masks[index - 1],
+        }
+    }
+
+    pub fn pad_enabled_at(&self, pad: usize, frame: u32) -> Option<bool> {
+        (pad < BEAT_PAD_COUNT).then(|| self.gate_mask_at(frame) & (1_u16 << pad) != 0)
+    }
+
+    pub fn from_changes(changes: &[TrackChange]) -> Result<Self, TrackTimelineValidationError> {
+        if changes.len() > TRACK_CHANGE_CAPACITY {
+            return Err(TrackTimelineValidationError::TooManyChanges);
+        }
+        let mut result = Self::all_enabled();
+        for &change in changes {
+            result.push_canonical(change)?;
+        }
+        Ok(result)
+    }
+
+    /// Paint selected voices to the opposite of their state at the anchor.
+    ///
+    /// The selected bits are constant throughout the half-open interval while
+    /// other voices and all state outside it are preserved. The candidate is
+    /// built separately so capacity failure cannot partially mutate `self`.
+    pub fn paint_opposite(
+        &mut self,
+        voice_mask: u16,
+        anchor_frame: u32,
+        other_frame: u32,
+    ) -> Result<bool, TrackTimelineEditError> {
+        if voice_mask == 0 || voice_mask & !BEAT_PAD_MASK != 0 {
+            return Err(TrackTimelineEditError::InvalidVoiceMask);
+        }
+        if anchor_frame > MAX_SONG_LENGTH_FRAMES
+            || other_frame > MAX_SONG_LENGTH_FRAMES
+            || anchor_frame == other_frame
+        {
+            return Err(TrackTimelineEditError::InvalidRange);
+        }
+
+        let interval_start = anchor_frame.min(other_frame);
+        let interval_end = anchor_frame.max(other_frame);
+        let anchor_mask = self.gate_mask_at(anchor_frame);
+        let painted_bits = (!anchor_mask) & voice_mask;
+        let boundaries = [interval_start, interval_end];
+        let mut boundary_index = 0_usize;
+        let mut source_index = 0_usize;
+        let mut source_mask = BEAT_PAD_MASK;
+        let mut candidate = Self::all_enabled();
+
+        while source_index < self.len() || boundary_index < boundaries.len() {
+            let source_frame = (source_index < self.len()).then(|| self.frames[source_index]);
+            let boundary_frame = boundaries.get(boundary_index).copied();
+            let frame = match (source_frame, boundary_frame) {
+                (Some(source), Some(boundary)) => source.min(boundary),
+                (Some(source), None) => source,
+                (None, Some(boundary)) => boundary,
+                (None, None) => break,
+            };
+
+            if source_frame == Some(frame) {
+                source_mask = self.gate_masks[source_index];
+                source_index += 1;
+            }
+            if boundary_frame == Some(frame) {
+                boundary_index += 1;
+            }
+
+            let gate_mask = if frame >= interval_start && frame < interval_end {
+                (source_mask & !voice_mask) | painted_bits
+            } else {
+                source_mask
+            };
+            candidate
+                .push_if_changed(frame, gate_mask)
+                .map_err(|_| TrackTimelineEditError::CapacityExceeded)?;
+        }
+
+        let changed = candidate != *self;
+        if changed {
+            *self = candidate;
+        }
+        Ok(changed)
+    }
+
+    fn push_canonical(&mut self, change: TrackChange) -> Result<(), TrackTimelineValidationError> {
+        let index = self.len();
+        if index >= TRACK_CHANGE_CAPACITY {
+            return Err(TrackTimelineValidationError::TooManyChanges);
+        }
+        if change.frame > MAX_SONG_LENGTH_FRAMES {
+            return Err(TrackTimelineValidationError::FrameOutOfRange {
+                index: index as u16,
+                frame: change.frame,
+            });
+        }
+        if change.gate_mask & !BEAT_PAD_MASK != 0 {
+            return Err(TrackTimelineValidationError::GateMaskOutOfRange {
+                index: index as u16,
+                gate_mask: change.gate_mask,
+            });
+        }
+        if let Some(previous) = index.checked_sub(1)
+            && change.frame <= self.frames[previous]
+        {
+            return Err(TrackTimelineValidationError::FramesNotIncreasing {
+                index: index as u16,
+                previous: self.frames[previous],
+                frame: change.frame,
+            });
+        }
+        let previous_mask = index
+            .checked_sub(1)
+            .map_or(BEAT_PAD_MASK, |previous| self.gate_masks[previous]);
+        if change.gate_mask == previous_mask {
+            return Err(TrackTimelineValidationError::RedundantMask {
+                index: index as u16,
+                gate_mask: change.gate_mask,
+            });
+        }
+        self.frames[index] = change.frame;
+        self.gate_masks[index] = change.gate_mask;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn push_if_changed(
+        &mut self,
+        frame: u32,
+        gate_mask: u16,
+    ) -> Result<(), TrackTimelineValidationError> {
+        let previous_mask = self
+            .len()
+            .checked_sub(1)
+            .map_or(BEAT_PAD_MASK, |previous| self.gate_masks[previous]);
+        if gate_mask == previous_mask {
+            return Ok(());
+        }
+        self.push_canonical(TrackChange { frame, gate_mask })
+    }
+}
+
+impl Default for TrackTimeline {
+    fn default() -> Self {
+        Self::all_enabled()
+    }
+}
+
+pub struct TrackChanges<'a> {
+    timeline: &'a TrackTimeline,
+    index: usize,
+}
+
+impl Iterator for TrackChanges<'_> {
+    type Item = TrackChange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let change = self.timeline.change(self.index)?;
+        self.index += 1;
+        Some(change)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.timeline.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for TrackChanges<'_> {}
+
+impl serde::Serialize for TrackTimeline {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for change in self.iter_changes() {
+            let packed = (u64::from(change.frame) << 9) | u64::from(change.gate_mask);
+            let bytes = packed.to_le_bytes();
+            sequence.serialize_element(&[bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]])?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TrackTimeline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TimelineVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TimelineVisitor {
+            type Value = TrackTimeline;
+
+            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str("at most 256 canonical five-byte track changes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                use serde::de::Error;
+
+                let mut timeline = TrackTimeline::all_enabled();
+                let mut index = 0_u16;
+                while let Some(bytes) = sequence.next_element::<[u8; 5]>()? {
+                    if usize::from(index) >= TRACK_CHANGE_CAPACITY {
+                        return Err(A::Error::custom("too many track changes"));
+                    }
+                    if bytes[4] & 0xf0 != 0 {
+                        return Err(A::Error::custom("reserved track-change bits are set"));
+                    }
+                    let packed = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], 0, 0, 0,
+                    ]);
+                    let change = TrackChange {
+                        frame: (packed >> 9) as u32,
+                        gate_mask: (packed as u16) & BEAT_PAD_MASK,
+                    };
+                    timeline
+                        .push_canonical(change)
+                        .map_err(|_| A::Error::custom("non-canonical track timeline"))?;
+                    index += 1;
+                }
+                Ok(timeline)
+            }
+        }
+
+        deserializer.deserialize_seq(TimelineVisitor)
+    }
+}
 
 /// A persistent 256-slot map whose active prefix is selected independently of
 /// the pad's tick cadence by its beat count and repeat multiplier.
@@ -149,6 +488,26 @@ impl Pattern {
         } else {
             PatternFillState::Empty
         }
+    }
+
+    /// Return whether the half-open prefix-relative bit range contains an
+    /// enabled slot. Callers keep the range within the 256-slot map.
+    ///
+    /// Walking bytes instead of individual bits keeps Tracks projection
+    /// bounded even when a display row spans many Pattern cycles.
+    fn any_enabled_in_range(&self, start: usize, end: usize) -> bool {
+        debug_assert!(start <= end && end <= PATTERN_BITS);
+        let mut index = start;
+        while index < end {
+            let bit_offset = index % u8::BITS as usize;
+            let bit_count = (u8::BITS as usize - bit_offset).min(end - index);
+            let mask = (((1_u16 << bit_count) - 1) as u8) << bit_offset;
+            if self.bits[index / u8::BITS as usize] & mask != 0 {
+                return true;
+            }
+            index += bit_count;
+        }
+        false
     }
 }
 
@@ -576,12 +935,39 @@ impl PadState {
         base_interval_ms: u32,
         from_frame: u64,
     ) {
+        self.align_clock_at_or_after(
+            beats_per_interval,
+            pattern_steps,
+            base_interval_ms,
+            from_frame,
+            false,
+        );
+    }
+
+    /// Align to the first tick at or after `frame` when `inclusive` is set,
+    /// otherwise to the first tick strictly after it.
+    ///
+    /// Inclusive alignment is used by the finite-song transport after an
+    /// explicit seek so a trigger exactly under the stopped cursor is played.
+    fn align_clock_at_or_after(
+        &mut self,
+        beats_per_interval: u16,
+        pattern_steps: u16,
+        base_interval_ms: u32,
+        frame: u64,
+        inclusive: bool,
+    ) {
         debug_assert!(beats_per_interval != 0);
 
         let period_numerator = u64::from(SAMPLE_RATE) * u64::from(base_interval_ms);
         let period_denominator = 1_000_u32 * u32::from(beats_per_interval);
         let denominator = u128::from(period_denominator);
-        let ordinal = (u128::from(from_frame) * denominator) / u128::from(period_numerator) + 1;
+        let ordinal_frame = if inclusive {
+            frame.saturating_sub(1)
+        } else {
+            frame
+        };
+        let ordinal = (u128::from(ordinal_frame) * denominator) / u128::from(period_numerator) + 1;
         let tick_numerator = ordinal * u128::from(period_numerator);
         let deadline = tick_numerator.div_ceil(denominator);
         let deadline_error = deadline * denominator - tick_numerator;
@@ -596,6 +982,20 @@ impl PadState {
         self.pattern_steps = pattern_steps;
         self.cycle_length_ms = base_interval_ms;
         self.next_step = ((ordinal - 1) % u128::from(pattern_steps)) as u16;
+    }
+
+    fn seek_clock(&mut self, frame: u64, inclusive: bool) {
+        if self.beats_per_interval == 0 {
+            self.disable_clock();
+            return;
+        }
+        self.align_clock_at_or_after(
+            self.beats_per_interval,
+            self.pattern_steps,
+            self.cycle_length_ms,
+            frame,
+            inclusive,
+        );
     }
 
     /// Consume every tick due at `frame`, coalescing enabled triggers at the
@@ -1751,6 +2151,12 @@ pub struct Sequencer<'a> {
     block_starts_per_pad: [u8; BEAT_PAD_COUNT],
     block_frame_offset: u8,
     reset_release_frames: u8,
+    track_timeline: TrackTimeline,
+    song_length_frames: u32,
+    song_position_frame: u32,
+    transport_state: TransportState,
+    end_behavior: EndBehavior,
+    live_audition_mask: u16,
 }
 
 impl<'a> Sequencer<'a> {
@@ -1772,6 +2178,12 @@ impl<'a> Sequencer<'a> {
             block_starts_per_pad: [0; BEAT_PAD_COUNT],
             block_frame_offset: 0,
             reset_release_frames: 0,
+            track_timeline: TrackTimeline::default(),
+            song_length_frames: u32::from(DEFAULT_SONG_LENGTH_SECONDS) * SAMPLE_RATE,
+            song_position_frame: 0,
+            transport_state: TransportState::Playing,
+            end_behavior: EndBehavior::Loop,
+            live_audition_mask: 0,
         }
     }
 
@@ -1886,11 +2298,17 @@ impl<'a> Sequencer<'a> {
     /// continue from their current level. This is consumed at an audio-block
     /// boundary by the UI's confirmed Reset-all command.
     pub fn release_all_voices(&mut self) {
+        self.fade_all_voices();
+        self.reset_release_frames = DECLICK_FRAMES;
+    }
+
+    /// Fade every currently active voice without disturbing gain ramps. This
+    /// is the transport boundary behavior for Pause, Loop, and Stop.
+    fn fade_all_voices(&mut self) {
         self.pending_preview = None;
         self.pending_muted_voice_releases = self
             .pending_muted_voice_releases
             .saturating_add(self.voices.release_mask(BEAT_PAD_MASK));
-        self.reset_release_frames = DECLICK_FRAMES;
     }
 
     /// Apply master and per-pad gain at an audio render boundary.
@@ -1915,6 +2333,111 @@ impl<'a> Sequencer<'a> {
 
     pub fn pad_volume_percent(&self, pad: usize) -> Option<u8> {
         self.pad_gains.get(pad).map(GainRamp::target_percent)
+    }
+
+    /// Replace the arrangement gate snapshot at an audio-block boundary.
+    pub fn set_track_timeline(&mut self, timeline: &TrackTimeline) {
+        self.track_timeline = *timeline;
+    }
+
+    /// Set the voices whose scheduled hits temporarily bypass both the
+    /// arrangement gate and ordinary mute state.
+    pub fn set_live_audition_mask(&mut self, mask: u16) {
+        self.live_audition_mask = mask & BEAT_PAD_MASK;
+    }
+
+    pub const fn live_audition_mask(&self) -> u16 {
+        self.live_audition_mask
+    }
+
+    pub fn set_song_length_frames(&mut self, frames: u32) {
+        let frames = frames.clamp(SAMPLE_RATE, MAX_SONG_LENGTH_FRAMES);
+        if self.song_length_frames == frames {
+            return;
+        }
+        self.song_length_frames = frames;
+        if self.song_position_frame < frames {
+            return;
+        }
+        self.fade_all_voices();
+        match self.end_behavior {
+            EndBehavior::Loop => {
+                self.song_position_frame = 0;
+                self.seek_song_clocks(0, true);
+                if self.transport_state != TransportState::Playing {
+                    self.transport_state = TransportState::Paused;
+                }
+            }
+            EndBehavior::Stop => {
+                self.song_position_frame = frames;
+                self.transport_state = TransportState::Stopped;
+            }
+        }
+    }
+
+    pub const fn song_length_frames(&self) -> u32 {
+        self.song_length_frames
+    }
+
+    pub const fn song_position_frame(&self) -> u32 {
+        self.song_position_frame
+    }
+
+    pub const fn end_behavior(&self) -> EndBehavior {
+        self.end_behavior
+    }
+
+    pub fn set_end_behavior(&mut self, behavior: EndBehavior) {
+        self.end_behavior = behavior;
+    }
+
+    pub const fn transport_status(&self) -> TrackTransportStatus {
+        TrackTransportStatus {
+            state: self.transport_state,
+            position_frames: self.song_position_frame,
+        }
+    }
+
+    /// Pause before the next unrendered song frame and fade active voices.
+    pub fn pause_song(&mut self) {
+        if self.transport_state == TransportState::Playing {
+            self.transport_state = TransportState::Paused;
+            self.fade_all_voices();
+        }
+    }
+
+    /// Continue an ordinary pause without rebasing Pattern clocks. A stopped
+    /// end position instead restarts from zero.
+    pub fn resume_song(&mut self) {
+        if self.transport_state == TransportState::Playing {
+            return;
+        }
+        if self.transport_state == TransportState::Stopped
+            || self.song_position_frame >= self.song_length_frames
+        {
+            self.song_position_frame = 0;
+            self.seek_song_clocks(0, true);
+        }
+        self.transport_state = TransportState::Playing;
+    }
+
+    /// Start from an explicit stopped cursor. Seeking is inclusive so a
+    /// projected trigger exactly under the cursor is not skipped.
+    pub fn play_song_from(&mut self, frame: u32) {
+        self.fade_all_voices();
+        self.song_position_frame = if frame >= self.song_length_frames {
+            0
+        } else {
+            frame
+        };
+        self.seek_song_clocks(u64::from(self.song_position_frame), true);
+        self.transport_state = TransportState::Playing;
+    }
+
+    fn seek_song_clocks(&mut self, frame: u64, inclusive: bool) {
+        for pad in &mut self.pads {
+            pad.seek_clock(frame, inclusive);
+        }
     }
 
     /// Apply the base interval and per-pad beat multipliers at a render boundary.
@@ -2002,6 +2525,23 @@ impl<'a> Sequencer<'a> {
     #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_func"))]
     #[inline(never)]
     pub fn render(&mut self, start_frame: u64, output: &mut [u32]) -> RenderReport {
+        self.render_internal(start_frame, output, false)
+    }
+
+    /// Render against the finite song transport while retaining the monotonic
+    /// hardware frame for visual pulses and DMA diagnostics.
+    #[cfg_attr(target_arch = "arm", unsafe(link_section = ".data.ram_func"))]
+    #[inline(never)]
+    pub fn render_song(&mut self, hardware_start_frame: u64, output: &mut [u32]) -> RenderReport {
+        self.render_internal(hardware_start_frame, output, true)
+    }
+
+    fn render_internal(
+        &mut self,
+        hardware_start_frame: u64,
+        output: &mut [u32],
+        use_song_transport: bool,
+    ) -> RenderReport {
         let mut report = RenderReport {
             muted_voice_release_count: core::mem::take(&mut self.pending_muted_voice_releases),
             ..RenderReport::default()
@@ -2016,8 +2556,17 @@ impl<'a> Sequencer<'a> {
         }
         for (offset, word) in output.iter_mut().enumerate() {
             self.block_frame_offset = offset.min(u8::MAX as usize) as u8;
-            let frame = start_frame.wrapping_add(offset as u64);
-            let mixed = self.render_pcm_frame(frame, &mut report);
+            let visual_frame = hardware_start_frame.wrapping_add(offset as u64);
+            let mixed = if use_song_transport {
+                let schedule_frame = self.next_song_schedule_frame();
+                let mixed = self.render_pcm_frame_at(schedule_frame, visual_frame, &mut report);
+                if schedule_frame.is_some() {
+                    self.song_position_frame = self.song_position_frame.saturating_add(1);
+                }
+                mixed
+            } else {
+                self.render_pcm_frame(visual_frame, &mut report)
+            };
             *word = match self.render_policy.dither_quality {
                 DitherQuality::Full => self.dither.encode(mixed),
                 DitherQuality::Coarse => {
@@ -2030,25 +2579,69 @@ impl<'a> Sequencer<'a> {
         report
     }
 
+    fn next_song_schedule_frame(&mut self) -> Option<u64> {
+        if self.transport_state != TransportState::Playing {
+            return None;
+        }
+        if self.song_position_frame >= self.song_length_frames {
+            self.fade_all_voices();
+            match self.end_behavior {
+                EndBehavior::Loop => {
+                    self.song_position_frame = 0;
+                    self.seek_song_clocks(0, true);
+                }
+                EndBehavior::Stop => {
+                    self.song_position_frame = self.song_length_frames;
+                    self.transport_state = TransportState::Stopped;
+                    return None;
+                }
+            }
+        }
+        Some(u64::from(self.song_position_frame))
+    }
+
+    /// Render one hardware frame. `schedule_frame` is the independent musical
+    /// clock; `None` keeps Pattern clocks frozen while still rendering fades,
+    /// gain ramps, and explicit Sample previews.
     fn render_pcm_frame(&mut self, frame: u64, report: &mut RenderReport) -> i16 {
+        self.render_pcm_frame_at(Some(frame), frame, report)
+    }
+
+    fn render_pcm_frame_at(
+        &mut self,
+        schedule_frame: Option<u64>,
+        visual_frame: u64,
+        report: &mut RenderReport,
+    ) -> i16 {
         let mut scheduled = [None; BEAT_PAD_COUNT];
 
-        for (pad_index, pad) in self.pads.iter_mut().enumerate() {
-            let trigger_volume = pad.take_due_trigger(
-                frame,
-                &self.patterns[pad_index],
-                &self.trigger_volumes[pad_index],
-            );
+        if let Some(schedule_frame) = schedule_frame {
+            for (pad_index, pad) in self.pads.iter_mut().enumerate() {
+                let trigger_volume = pad.take_due_trigger(
+                    schedule_frame,
+                    &self.patterns[pad_index],
+                    &self.trigger_volumes[pad_index],
+                );
 
-            if let Some(trigger_volume) = trigger_volume {
-                report.latest_visual_triggers[pad_index] = Some(frame);
-                if trigger_volume == 0 || self.mute_mask & (1_u16 << pad_index) != 0 {
-                    continue;
+                if let Some(trigger_volume) = trigger_volume {
+                    report.latest_visual_triggers[pad_index] = Some(visual_frame);
+                    let pad_mask = 1_u16 << pad_index;
+                    let auditioned = self.live_audition_mask & pad_mask != 0;
+                    let arrangement_enabled = self
+                        .track_timeline
+                        .gate_mask_at(schedule_frame.min(u64::from(u32::MAX)) as u32)
+                        & pad_mask
+                        != 0;
+                    if trigger_volume == 0
+                        || (!auditioned && (!arrangement_enabled || self.mute_mask & pad_mask != 0))
+                    {
+                        continue;
+                    }
+                    scheduled[pad_index] = Some(VoiceStart::with_trigger_gain(
+                        pad.sample,
+                        TriggerGain::from_percent(trigger_volume),
+                    ));
                 }
-                scheduled[pad_index] = Some(VoiceStart::with_trigger_gain(
-                    pad.sample,
-                    TriggerGain::from_percent(trigger_volume),
-                ));
             }
         }
 
@@ -2104,7 +2697,7 @@ impl<'a> Sequencer<'a> {
             }
 
             if let Some(preview) = preview {
-                report.latest_visual_triggers[preview.pad] = Some(frame);
+                report.latest_visual_triggers[preview.pad] = Some(visual_frame);
                 if !self.render_policy.allow_preview {
                     report.load_shed_preview_count =
                         report.load_shed_preview_count.saturating_add(1);
@@ -2162,14 +2755,12 @@ impl<'a> Sequencer<'a> {
     }
 }
 
-#[cfg(test)]
 fn next_ordinal_after(frame: u64, beats_per_interval: u16, base_interval_ms: u32) -> u128 {
     let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
     let denominator = u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
     numerator / denominator + 1
 }
 
-#[cfg(test)]
 fn frame_for_tick(ordinal: u128, beats_per_interval: u16, base_interval_ms: u32) -> u64 {
     if beats_per_interval == 0 {
         return u64::MAX;
@@ -2177,6 +2768,78 @@ fn frame_for_tick(ordinal: u128, beats_per_interval: u16, base_interval_ms: u32)
     let numerator = ordinal * u128::from(SAMPLE_RATE) * u128::from(base_interval_ms);
     let denominator = 1_000 * u128::from(beats_per_interval);
     numerator.div_ceil(denominator) as u64
+}
+
+fn first_ordinal_at_or_after(frame: u64, beats_per_interval: u16, cycle_length_ms: u32) -> u128 {
+    if frame == 0 {
+        1
+    } else {
+        next_ordinal_after(frame - 1, beats_per_interval, cycle_length_ms)
+    }
+}
+
+fn last_ordinal_at_or_before(frame: u64, beats_per_interval: u16, cycle_length_ms: u32) -> u128 {
+    let numerator = u128::from(frame) * 1_000 * u128::from(beats_per_interval);
+    let denominator = u128::from(SAMPLE_RATE) * u128::from(cycle_length_ms);
+    numerator / denominator
+}
+
+/// Compact projection clock used by the OLED Tracks rasterizer.
+///
+/// Tracks frames are bounded by `u32` and valid beat counts by 256, so these
+/// products fit comfortably in `u64`. Keeping the display-only sweep out of
+/// `u128` is important on the Cortex-M0, where wide division is emulated.
+#[derive(Clone, Copy)]
+struct TrackProjectionClock {
+    ordinals_per_frame_numerator: u64,
+    denominator: u64,
+}
+
+impl TrackProjectionClock {
+    fn new(beats_per_interval: u16, cycle_length_ms: u32) -> Self {
+        debug_assert!(beats_per_interval != 0);
+        debug_assert!(cycle_length_ms != 0);
+        Self {
+            ordinals_per_frame_numerator: 1_000 * u64::from(beats_per_interval),
+            denominator: u64::from(SAMPLE_RATE) * u64::from(cycle_length_ms),
+        }
+    }
+
+    /// First one-based tick ordinal whose rounded-up deadline is at or after
+    /// `frame`. This is the `u64` equivalent of
+    /// [`first_ordinal_at_or_after`] for the bounded song timeline.
+    fn first_at_or_after(self, frame: u32) -> u64 {
+        if frame == 0 {
+            return 1;
+        }
+        u64::from(frame - 1) * self.ordinals_per_frame_numerator / self.denominator + 1
+    }
+}
+
+/// Test whether a periodic Pattern contains an enabled tick in the half-open
+/// ordinal range. The query examines at most two byte ranges, regardless of
+/// the number of Pattern cycles covered by the display row.
+fn pattern_enabled_in_ordinal_range(
+    pattern: &Pattern,
+    steps: u16,
+    first_ordinal: u64,
+    end_ordinal: u64,
+) -> bool {
+    if steps == 0 || first_ordinal >= end_ordinal {
+        return false;
+    }
+    let steps = usize::from(steps);
+    let ordinal_count = end_ordinal - first_ordinal;
+    if ordinal_count >= steps as u64 {
+        return pattern.any_enabled_in_range(0, steps);
+    }
+
+    let start = ((first_ordinal - 1) % steps as u64) as usize;
+    let count = ordinal_count as usize;
+    let first_end = (start + count).min(steps);
+    pattern.any_enabled_in_range(start, first_end)
+        || (first_end - start < count
+            && pattern.any_enabled_in_range(0, count - (first_end - start)))
 }
 
 /// Compare wrapping playback-frame counters. Scheduled events are always less
@@ -2386,6 +3049,14 @@ pub struct SharedState {
     pattern_repeats: [u16; BEAT_PAD_COUNT],
     pad_cycle_length_overrides_ms: [Option<u32>; BEAT_PAD_COUNT],
     pad_samples: [SampleId; BEAT_PAD_COUNT],
+    song_length_seconds: u16,
+    track_timeline: TrackTimeline,
+    /// Monotonic Track-timeline generation used by audio snapshots.
+    pub track_revision: u32,
+    track_transport_status: TrackTransportStatus,
+    pending_transport_command: Option<TransportCommand>,
+    end_behavior: EndBehavior,
+    live_audition_mask: u16,
     pending_preview: Option<PreviewRequest>,
     pub base_interval_ms: u32,
     pub led_brightness_percent: u8,
@@ -2434,6 +3105,13 @@ impl Default for SharedState {
             pattern_repeats: [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT],
             pad_cycle_length_overrides_ms: [None; BEAT_PAD_COUNT],
             pad_samples: DEFAULT_PAD_SAMPLES,
+            song_length_seconds: DEFAULT_SONG_LENGTH_SECONDS,
+            track_timeline: TrackTimeline::all_enabled(),
+            track_revision: 0,
+            track_transport_status: TrackTransportStatus::playing_from_start(),
+            pending_transport_command: None,
+            end_behavior: EndBehavior::Loop,
+            live_audition_mask: 0,
             pending_preview: None,
             base_interval_ms: DEFAULT_BASE_INTERVAL_MS,
             led_brightness_percent: DEFAULT_LED_BRIGHTNESS_PERCENT,
@@ -2476,6 +3154,389 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    pub const fn song_length_seconds(&self) -> u16 {
+        self.song_length_seconds
+    }
+
+    pub const fn song_length_frames(&self) -> u32 {
+        self.song_length_seconds as u32 * SAMPLE_RATE
+    }
+
+    /// Set the finite arrangement length. Valid no-op writes succeed without
+    /// advancing either persistent or arrangement revisions.
+    pub fn set_song_length_seconds(&mut self, seconds: u16) -> bool {
+        if !(MIN_SONG_LENGTH_SECONDS..=MAX_SONG_LENGTH_SECONDS).contains(&seconds) {
+            return false;
+        }
+        if self.song_length_seconds != seconds {
+            self.song_length_seconds = seconds;
+            self.mark_song_changed();
+        }
+        true
+    }
+
+    pub const fn track_timeline(&self) -> &TrackTimeline {
+        &self.track_timeline
+    }
+
+    pub fn track_gate_mask_at(&self, song_frame: u32) -> u16 {
+        self.track_timeline.gate_mask_at(song_frame)
+    }
+
+    pub const fn track_transport_status(&self) -> TrackTransportStatus {
+        self.track_transport_status
+    }
+
+    /// Publish the audio task's authoritative next-unrendered song frame.
+    pub fn publish_track_transport_status(&mut self, status: TrackTransportStatus) {
+        // A control edge may arrive while the audio task is rendering. Keep
+        // that command's optimistic UI state until the command is consumed;
+        // otherwise the just-finished older block would visibly undo it.
+        if self.pending_transport_command.is_some() {
+            return;
+        }
+        self.track_transport_status = status;
+        if status.state != TransportState::Playing {
+            self.live_audition_mask = 0;
+        }
+    }
+
+    pub fn request_transport(&mut self, command: TransportCommand) {
+        match command {
+            TransportCommand::Pause => {
+                self.track_transport_status.state = TransportState::Paused;
+                self.live_audition_mask = 0;
+            }
+            TransportCommand::Resume => {
+                if self.track_transport_status.state == TransportState::Stopped
+                    || self.track_transport_status.position_frames >= self.song_length_frames()
+                {
+                    self.track_transport_status.position_frames = 0;
+                }
+                self.track_transport_status.state = TransportState::Playing;
+            }
+            TransportCommand::PlayFrom { frame } => {
+                self.track_transport_status = TrackTransportStatus {
+                    state: TransportState::Playing,
+                    position_frames: if frame >= self.song_length_frames() {
+                        0
+                    } else {
+                        frame
+                    },
+                };
+            }
+        }
+        self.pending_transport_command = Some(command);
+    }
+
+    pub fn take_transport_command(&mut self) -> Option<TransportCommand> {
+        self.pending_transport_command.take()
+    }
+
+    pub const fn end_behavior(&self) -> EndBehavior {
+        self.end_behavior
+    }
+
+    pub fn set_end_behavior(&mut self, behavior: EndBehavior) {
+        self.end_behavior = behavior;
+    }
+
+    pub const fn live_audition_mask(&self) -> u16 {
+        self.live_audition_mask
+    }
+
+    pub fn set_live_audition_mask(&mut self, mask: u16) {
+        self.live_audition_mask = mask & BEAT_PAD_MASK;
+    }
+
+    /// Return the nearest projected enabled Pattern trigger in the requested
+    /// direction across all voices. Arrangement gates and mute state do not
+    /// remove projection dots.
+    pub fn next_projected_trigger_frame(&self, from: u32, inclusive: bool) -> Option<u32> {
+        let mut nearest = None;
+        for pad in 0..BEAT_PAD_COUNT {
+            if let Some(frame) = self.next_projected_trigger_for_pad(pad, from, inclusive) {
+                nearest = Some(nearest.map_or(frame, |current: u32| current.min(frame)));
+            }
+        }
+        nearest
+    }
+
+    pub fn previous_projected_trigger_frame(&self, from: u32, inclusive: bool) -> Option<u32> {
+        let mut nearest = None;
+        for pad in 0..BEAT_PAD_COUNT {
+            if let Some(frame) = self.previous_projected_trigger_for_pad(pad, from, inclusive) {
+                nearest = Some(nearest.map_or(frame, |current: u32| current.max(frame)));
+            }
+        }
+        nearest
+    }
+
+    fn next_projected_trigger_for_pad(
+        &self,
+        pad: usize,
+        from: u32,
+        inclusive: bool,
+    ) -> Option<u32> {
+        let beats = *self.desired_beats.get(pad)?;
+        let steps = self.effective_pattern_steps(pad)?;
+        if beats == 0 || steps == 0 {
+            return None;
+        }
+        let cycle_ms = self.effective_cycle_length_ms(pad)?;
+        let mut ordinal = if inclusive {
+            first_ordinal_at_or_after(u64::from(from), beats, cycle_ms)
+        } else {
+            next_ordinal_after(u64::from(from), beats, cycle_ms)
+        };
+        for _ in 0..steps {
+            let step = ((ordinal - 1) % u128::from(steps)) as usize;
+            if self.patterns[pad].bit(step).unwrap_or(false) {
+                let frame = frame_for_tick(ordinal, beats, cycle_ms);
+                return (frame < u64::from(self.song_length_frames())).then_some(frame as u32);
+            }
+            ordinal += 1;
+        }
+        None
+    }
+
+    fn previous_projected_trigger_for_pad(
+        &self,
+        pad: usize,
+        from: u32,
+        inclusive: bool,
+    ) -> Option<u32> {
+        let beats = *self.desired_beats.get(pad)?;
+        let steps = self.effective_pattern_steps(pad)?;
+        if beats == 0 || steps == 0 || (!inclusive && from == 0) {
+            return None;
+        }
+        let cycle_ms = self.effective_cycle_length_ms(pad)?;
+        let last_song_frame = self.song_length_frames().saturating_sub(1);
+        let limit = if inclusive {
+            from.min(last_song_frame)
+        } else {
+            from.saturating_sub(1).min(last_song_frame)
+        };
+        let mut ordinal = last_ordinal_at_or_before(u64::from(limit), beats, cycle_ms);
+        for _ in 0..steps {
+            if ordinal == 0 {
+                break;
+            }
+            let step = ((ordinal - 1) % u128::from(steps)) as usize;
+            if self.patterns[pad].bit(step).unwrap_or(false) {
+                return Some(frame_for_tick(ordinal, beats, cycle_ms) as u32);
+            }
+            ordinal -= 1;
+        }
+        None
+    }
+
+    /// Rasterize the current projection into bounded row masks suitable for
+    /// direct OLED drawing. Enabled dots honor only Track gates; ordinary mute
+    /// remains a separate performance layer.
+    pub fn rasterize_tracks<const ROWS: usize>(
+        &self,
+        view_start: u32,
+        view_end: u32,
+        raster: &mut TrackRaster<ROWS>,
+    ) {
+        raster.clear();
+        if ROWS == 0 || view_start >= view_end {
+            return;
+        }
+        let song_end = self.song_length_frames();
+        let view_start = view_start.min(song_end);
+        let view_end = view_end.min(song_end);
+        if view_start >= view_end {
+            return;
+        }
+        let duration = u64::from(view_end - view_start);
+
+        // Active-span lines are independent of Pattern projection. Sweep the
+        // canonical timeline once across all rows instead of searching it for
+        // every row and voice.
+        let change_prefix = &self.track_timeline.frames[..self.track_timeline.len()];
+        let first_change = match change_prefix.binary_search(&view_start) {
+            Ok(index) => index + 1,
+            Err(index) => index,
+        };
+        let starting_gate_mask = self.track_timeline.gate_mask_at(view_start);
+        let mut active_change_index = first_change;
+        let mut active_gate_mask = starting_gate_mask;
+        for row in 0..ROWS {
+            let row_start = view_start + (duration * row as u64 / ROWS as u64) as u32;
+            let row_end = view_start + (duration * (row + 1) as u64 / ROWS as u64) as u32;
+            while active_change_index < self.track_timeline.len()
+                && self.track_timeline.frames[active_change_index] <= row_start
+            {
+                active_gate_mask = self.track_timeline.gate_masks[active_change_index];
+                active_change_index += 1;
+            }
+            if row_start >= row_end {
+                continue;
+            }
+            let mut active_mask = active_gate_mask;
+            while active_change_index < self.track_timeline.len()
+                && self.track_timeline.frames[active_change_index] < row_end
+            {
+                active_gate_mask = self.track_timeline.gate_masks[active_change_index];
+                active_mask |= active_gate_mask;
+                active_change_index += 1;
+            }
+            raster.active_masks[row] = active_mask & BEAT_PAD_MASK;
+        }
+
+        // Projection is swept once per pad. Each row boundary is converted to
+        // a tick ordinal once, and a Track change needs another conversion
+        // only when that particular pad actually toggles. Pattern queries
+        // inspect bytes rather than ticking through potentially millions of
+        // dense events in a wide zoom level.
+        for pad in 0..BEAT_PAD_COUNT {
+            let beats = self.desired_beats[pad];
+            let steps = self.effective_pattern_steps(pad).unwrap_or(0);
+            if beats == 0 || steps == 0 {
+                continue;
+            }
+            let cycle_length_ms = self
+                .effective_cycle_length_ms(pad)
+                .unwrap_or(self.base_interval_ms);
+            let clock = TrackProjectionClock::new(beats, cycle_length_ms);
+            let pad_mask = 1_u16 << pad;
+            let mut change_index = first_change;
+            let mut gate_enabled = starting_gate_mask & pad_mask != 0;
+            let mut row_first_ordinal = clock.first_at_or_after(view_start);
+
+            for row in 0..ROWS {
+                let row_start = view_start + (duration * row as u64 / ROWS as u64) as u32;
+                let row_end = view_start + (duration * (row + 1) as u64 / ROWS as u64) as u32;
+                while change_index < self.track_timeline.len()
+                    && self.track_timeline.frames[change_index] <= row_start
+                {
+                    gate_enabled = self.track_timeline.gate_masks[change_index] & pad_mask != 0;
+                    change_index += 1;
+                }
+                let row_end_ordinal = if row_start < row_end {
+                    clock.first_at_or_after(row_end)
+                } else {
+                    row_first_ordinal
+                };
+                if row_start >= row_end {
+                    // Generic callers may request more rows than there are
+                    // frames. Advance the shared boundary explicitly even
+                    // though both ordinals are equal for this empty bucket.
+                    row_first_ordinal = row_end_ordinal;
+                    continue;
+                }
+
+                let projected = pattern_enabled_in_ordinal_range(
+                    &self.patterns[pad],
+                    steps,
+                    row_first_ordinal,
+                    row_end_ordinal,
+                );
+                if projected {
+                    raster.projected_masks[row] |= pad_mask;
+                }
+
+                let mut segment_first_ordinal = row_first_ordinal;
+                let mut enabled_trigger = false;
+                while change_index < self.track_timeline.len()
+                    && self.track_timeline.frames[change_index] < row_end
+                {
+                    let next_gate_enabled =
+                        self.track_timeline.gate_masks[change_index] & pad_mask != 0;
+                    if projected && !enabled_trigger && gate_enabled != next_gate_enabled {
+                        let boundary_ordinal =
+                            clock.first_at_or_after(self.track_timeline.frames[change_index]);
+                        if gate_enabled
+                            && pattern_enabled_in_ordinal_range(
+                                &self.patterns[pad],
+                                steps,
+                                segment_first_ordinal,
+                                boundary_ordinal,
+                            )
+                        {
+                            enabled_trigger = true;
+                        }
+                        segment_first_ordinal = boundary_ordinal;
+                    }
+                    gate_enabled = next_gate_enabled;
+                    change_index += 1;
+                }
+                if projected
+                    && !enabled_trigger
+                    && gate_enabled
+                    && pattern_enabled_in_ordinal_range(
+                        &self.patterns[pad],
+                        steps,
+                        segment_first_ordinal,
+                        row_end_ordinal,
+                    )
+                {
+                    enabled_trigger = true;
+                }
+                if enabled_trigger {
+                    raster.enabled_masks[row] |= pad_mask;
+                }
+                row_first_ordinal = row_end_ordinal;
+            }
+        }
+    }
+
+    /// Start a newly loaded song at zero while retaining the device-runtime
+    /// End Behavior and zoom choices.
+    pub fn restart_loaded_song_transport(&mut self) {
+        self.track_transport_status = TrackTransportStatus::playing_from_start();
+        self.pending_transport_command = Some(TransportCommand::PlayFrom { frame: 0 });
+        self.live_audition_mask = 0;
+    }
+
+    /// Reset runtime Tracks controls as well as restarting musical playback.
+    pub fn reset_track_transport(&mut self) {
+        self.end_behavior = EndBehavior::Loop;
+        self.restart_loaded_song_transport();
+    }
+
+    /// Apply one atomic stopped-transport paint gesture.
+    pub fn paint_track_span(
+        &mut self,
+        voice_mask: u16,
+        anchor_frame: u32,
+        other_frame: u32,
+    ) -> Result<bool, TrackTimelineEditError> {
+        let changed = self
+            .track_timeline
+            .paint_opposite(voice_mask, anchor_frame, other_frame)?;
+        if changed {
+            self.mark_tracks_changed();
+        }
+        Ok(changed)
+    }
+
+    /// Commit a precomputed canonical timeline only if the source snapshot is
+    /// still current. Firmware uses this to perform the O(256) paint merge
+    /// outside its interrupt-masking shared-state critical section.
+    pub fn commit_track_timeline_if_revision(
+        &mut self,
+        expected_track_revision: u32,
+        timeline: TrackTimeline,
+    ) -> bool {
+        if self.track_revision != expected_track_revision {
+            return false;
+        }
+        if self.track_timeline != timeline {
+            self.track_timeline = timeline;
+            self.mark_tracks_changed();
+        }
+        true
+    }
+
+    fn mark_tracks_changed(&mut self) {
+        self.track_revision = self.track_revision.wrapping_add(1);
+        self.mark_song_changed();
+    }
+
     /// Set the global interval without bypassing persistent dirty tracking.
     pub fn set_base_interval_ms(&mut self, interval_ms: u32) -> bool {
         if interval_ms < MIN_BASE_INTERVAL_MS {
@@ -2748,6 +3809,9 @@ impl SharedState {
         self.pattern_repeats = [DEFAULT_PATTERN_REPEATS; BEAT_PAD_COUNT];
         self.pad_cycle_length_overrides_ms = [None; BEAT_PAD_COUNT];
         self.pad_samples = DEFAULT_PAD_SAMPLES;
+        self.song_length_seconds = DEFAULT_SONG_LENGTH_SECONDS;
+        self.track_timeline = TrackTimeline::all_enabled();
+        self.track_revision = self.track_revision.wrapping_add(1);
         self.pending_preview = None;
         self.base_interval_ms = DEFAULT_BASE_INTERVAL_MS;
         self.latest_trigger_frames = [0; BEAT_PAD_COUNT];
@@ -2761,6 +3825,7 @@ impl SharedState {
         self.global_volume_percent = DEFAULT_VOLUME_PERCENT;
         self.pad_volume_percents = [DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT];
         self.release_all_requested = true;
+        self.reset_track_transport();
         self.mark_song_changed();
     }
 
@@ -3305,7 +4370,8 @@ pub const SONG_SLOT_ANIMAL_NAMES: [&str; SONG_SLOT_COUNT] = [
 pub const SONG_FORMAT_MAGIC: [u8; 4] = *b"LTSG";
 /// Previous record version still decoded and migrated in memory.
 pub const SONG_FORMAT_V2: u16 = 2;
-pub const SONG_FORMAT_VERSION: u16 = 3;
+pub const SONG_FORMAT_V3: u16 = 3;
+pub const SONG_FORMAT_VERSION: u16 = 4;
 pub const SONG_FORMAT_HEADER_LEN: usize = 8;
 /// Number of pads encoded by the frozen V2 song schema.
 pub const SONG_V2_PAD_COUNT: usize = 9;
@@ -3327,10 +4393,14 @@ pub const SONG_V3_TRIGGER_LEVEL_CHUNKS: usize = 8;
 ///
 /// This is a schema regression sentinel, not the maximum possible record size.
 pub const SONG_V3_DEFAULT_ENCODED_LEN: usize = 2_658;
-/// Includes the eight-byte envelope. The current maximum encoded size is
-/// tested to fit. The spare buffer space is not permission to change the
-/// frozen V3 schema; incompatible fields require a new format version.
-pub const SONG_ENCODED_MAX_LEN: usize = 3_072;
+/// Exact encoded length of [`StoredSongV4::default`] with an empty timeline.
+pub const SONG_V4_DEFAULT_ENCODED_LEN: usize = 2_661;
+/// Exact worst-case V4 envelope with all 256 five-byte track changes present.
+pub const SONG_V4_MAX_ENCODED_LEN: usize = 3_999;
+/// Includes the eight-byte envelope and is the sequential-storage map's hard
+/// per-item limit for the 4,096-byte erase geometry.
+pub const SONG_ENCODED_MAX_LEN: usize = 4_085;
+const _: () = assert!(SONG_V4_MAX_ENCODED_LEN <= SONG_ENCODED_MAX_LEN);
 
 /// Backward-compatible name for the current frozen trigger-level chunk count.
 pub const STORED_TRIGGER_LEVEL_CHUNKS: usize = SONG_V3_TRIGGER_LEVEL_CHUNKS;
@@ -3397,9 +4467,23 @@ pub struct StoredSongV3 {
     pub pads: [StoredPadV3; SONG_V3_PAD_COUNT],
 }
 
+/// Frozen schema for LoopTic song format version 4.
+///
+/// Track changes use [`TrackTimeline`]'s custom sparse five-byte codec.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct StoredSongV4 {
+    pub base_interval_ms: u32,
+    pub song_length_seconds: u16,
+    pub track_timeline: TrackTimeline,
+    pub global_mute: bool,
+    pub master_volume_percent: u8,
+    pub pads: [StoredPadV3; SONG_V3_PAD_COUNT],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SongValidationError {
     BaseIntervalTooShort { value: u32 },
+    SongLengthOutOfRange { value: u16 },
     DivisionOutOfRange { pad: u8, value: u16 },
     PatternRepeatsOutOfRange { pad: u8, value: u16, maximum: u16 },
     CycleLengthOverrideTooShort { pad: u8, value: u32 },
@@ -3426,92 +4510,140 @@ pub enum SongDecodeError {
     InvalidSong(SongValidationError),
 }
 
+fn validate_stored_song_fields(
+    base_interval_ms: u32,
+    master_volume_percent: u8,
+    pads: &[StoredPadV3; SONG_V3_PAD_COUNT],
+) -> Result<(), SongValidationError> {
+    if base_interval_ms < MIN_BASE_INTERVAL_MS {
+        return Err(SongValidationError::BaseIntervalTooShort {
+            value: base_interval_ms,
+        });
+    }
+    if master_volume_percent > 100 {
+        return Err(SongValidationError::MasterVolumeOutOfRange {
+            value: master_volume_percent,
+        });
+    }
+    for (pad, stored) in pads.iter().enumerate() {
+        let pad = pad as u8;
+        if stored.division > MAX_BEAT_MULTIPLIER {
+            return Err(SongValidationError::DivisionOutOfRange {
+                pad,
+                value: stored.division,
+            });
+        }
+        let maximum = max_pattern_repeats(stored.division);
+        if stored.pattern_repeats == 0 || stored.pattern_repeats > maximum {
+            return Err(SongValidationError::PatternRepeatsOutOfRange {
+                pad,
+                value: stored.pattern_repeats,
+                maximum,
+            });
+        }
+        if let Some(value) = stored.cycle_length_override_ms
+            && value < MIN_BASE_INTERVAL_MS
+        {
+            return Err(SongValidationError::CycleLengthOverrideTooShort { pad, value });
+        }
+        if usize::from(stored.sample_id) >= SAMPLE_COUNT {
+            return Err(SongValidationError::SampleOutOfRange {
+                pad,
+                value: stored.sample_id,
+            });
+        }
+        if stored.volume_percent > 100 {
+            return Err(SongValidationError::PadVolumeOutOfRange {
+                pad,
+                value: stored.volume_percent,
+            });
+        }
+        for (chunk_index, chunk) in stored.trigger_levels.iter().enumerate() {
+            for (offset, &value) in chunk.iter().enumerate() {
+                if value > 100 {
+                    return Err(SongValidationError::TriggerVolumeOutOfRange {
+                        pad,
+                        step: (chunk_index * SONG_V3_PATTERN_BYTES + offset) as u16,
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_stored_pads(state: &SharedState) -> [StoredPadV3; SONG_V3_PAD_COUNT] {
+    core::array::from_fn(|pad| {
+        let mut trigger_levels = [[0_u8; SONG_V3_PATTERN_BYTES]; SONG_V3_TRIGGER_LEVEL_CHUNKS];
+        for (chunk_index, chunk) in trigger_levels.iter_mut().enumerate() {
+            let start = chunk_index * SONG_V3_PATTERN_BYTES;
+            chunk.copy_from_slice(
+                &state.trigger_volumes[pad].percents[start..start + SONG_V3_PATTERN_BYTES],
+            );
+        }
+        StoredPadV3 {
+            division: state.desired_beats[pad],
+            pattern_repeats: state.pattern_repeats[pad],
+            cycle_length_override_ms: state.pad_cycle_length_overrides_ms[pad],
+            sample_id: state.pad_samples[pad].index() as u8,
+            pattern: state.patterns[pad].bits,
+            trigger_levels,
+            mute: state.pad_mute_latched[pad],
+            volume_percent: state.pad_volume_percents[pad],
+        }
+    })
+}
+
 impl StoredSongV3 {
     pub fn snapshot(state: &SharedState) -> Self {
-        let pads = core::array::from_fn(|pad| {
-            let mut trigger_levels = [[0_u8; SONG_V3_PATTERN_BYTES]; SONG_V3_TRIGGER_LEVEL_CHUNKS];
-            for (chunk_index, chunk) in trigger_levels.iter_mut().enumerate() {
-                let start = chunk_index * SONG_V3_PATTERN_BYTES;
-                chunk.copy_from_slice(
-                    &state.trigger_volumes[pad].percents[start..start + SONG_V3_PATTERN_BYTES],
-                );
-            }
-            StoredPadV3 {
-                division: state.desired_beats[pad],
-                pattern_repeats: state.pattern_repeats[pad],
-                cycle_length_override_ms: state.pad_cycle_length_overrides_ms[pad],
-                sample_id: state.pad_samples[pad].index() as u8,
-                pattern: state.patterns[pad].bits,
-                trigger_levels,
-                mute: state.pad_mute_latched[pad],
-                volume_percent: state.pad_volume_percents[pad],
-            }
-        });
         Self {
             base_interval_ms: state.base_interval_ms,
             global_mute: state.global_mute_latched,
             master_volume_percent: state.global_volume_percent,
-            pads,
+            pads: snapshot_stored_pads(state),
         }
     }
 
     pub fn validate(&self) -> Result<(), SongValidationError> {
-        if self.base_interval_ms < MIN_BASE_INTERVAL_MS {
-            return Err(SongValidationError::BaseIntervalTooShort {
-                value: self.base_interval_ms,
+        validate_stored_song_fields(
+            self.base_interval_ms,
+            self.master_volume_percent,
+            &self.pads,
+        )
+    }
+
+    /// Atomically replace persistent musical state after complete validation.
+    /// Runtime clock, brightness, adaptive-load state, and diagnostics survive.
+    pub fn apply_to(&self, state: &mut SharedState) -> Result<(), SongValidationError> {
+        StoredSongV4::from(self.clone()).apply_to(state)
+    }
+}
+
+impl StoredSongV4 {
+    pub fn snapshot(state: &SharedState) -> Self {
+        Self {
+            base_interval_ms: state.base_interval_ms,
+            song_length_seconds: state.song_length_seconds,
+            track_timeline: state.track_timeline,
+            global_mute: state.global_mute_latched,
+            master_volume_percent: state.global_volume_percent,
+            pads: snapshot_stored_pads(state),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SongValidationError> {
+        if !(MIN_SONG_LENGTH_SECONDS..=MAX_SONG_LENGTH_SECONDS).contains(&self.song_length_seconds)
+        {
+            return Err(SongValidationError::SongLengthOutOfRange {
+                value: self.song_length_seconds,
             });
         }
-        if self.master_volume_percent > 100 {
-            return Err(SongValidationError::MasterVolumeOutOfRange {
-                value: self.master_volume_percent,
-            });
-        }
-        for (pad, stored) in self.pads.iter().enumerate() {
-            let pad = pad as u8;
-            if stored.division > MAX_BEAT_MULTIPLIER {
-                return Err(SongValidationError::DivisionOutOfRange {
-                    pad,
-                    value: stored.division,
-                });
-            }
-            let maximum = max_pattern_repeats(stored.division);
-            if stored.pattern_repeats == 0 || stored.pattern_repeats > maximum {
-                return Err(SongValidationError::PatternRepeatsOutOfRange {
-                    pad,
-                    value: stored.pattern_repeats,
-                    maximum,
-                });
-            }
-            if let Some(value) = stored.cycle_length_override_ms
-                && value < MIN_BASE_INTERVAL_MS
-            {
-                return Err(SongValidationError::CycleLengthOverrideTooShort { pad, value });
-            }
-            if usize::from(stored.sample_id) >= SAMPLE_COUNT {
-                return Err(SongValidationError::SampleOutOfRange {
-                    pad,
-                    value: stored.sample_id,
-                });
-            }
-            if stored.volume_percent > 100 {
-                return Err(SongValidationError::PadVolumeOutOfRange {
-                    pad,
-                    value: stored.volume_percent,
-                });
-            }
-            for (chunk_index, chunk) in stored.trigger_levels.iter().enumerate() {
-                for (offset, &value) in chunk.iter().enumerate() {
-                    if value > 100 {
-                        return Err(SongValidationError::TriggerVolumeOutOfRange {
-                            pad,
-                            step: (chunk_index * SONG_V3_PATTERN_BYTES + offset) as u16,
-                            value,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
+        validate_stored_song_fields(
+            self.base_interval_ms,
+            self.master_volume_percent,
+            &self.pads,
+        )
     }
 
     /// Atomically replace persistent musical state after complete validation.
@@ -3519,15 +4651,13 @@ impl StoredSongV3 {
     pub fn apply_to(&self, state: &mut SharedState) -> Result<(), SongValidationError> {
         self.validate()?;
 
-        let mut samples = DEFAULT_PAD_SAMPLES;
-        let mut patterns = [Pattern::all_enabled(); BEAT_PAD_COUNT];
-        let mut trigger_volumes = [TriggerVolumes::all_default(); BEAT_PAD_COUNT];
-        let mut pad_mutes = [false; BEAT_PAD_COUNT];
-        let mut pad_volumes = [DEFAULT_VOLUME_PERCENT; BEAT_PAD_COUNT];
         for (pad, stored) in self.pads.iter().enumerate() {
-            samples[pad] = SampleId::from_index(usize::from(stored.sample_id))
+            state.desired_beats[pad] = stored.division;
+            state.pattern_repeats[pad] = stored.pattern_repeats;
+            state.pad_cycle_length_overrides_ms[pad] = stored.cycle_length_override_ms;
+            state.pad_samples[pad] = SampleId::from_index(usize::from(stored.sample_id))
                 .expect("validated sample identifier");
-            patterns[pad] = Pattern {
+            state.patterns[pad] = Pattern {
                 bits: stored.pattern,
             };
             let mut percents = [0_u8; PATTERN_BITS];
@@ -3536,35 +4666,36 @@ impl StoredSongV3 {
                 percents[start..start + SONG_V3_PATTERN_BYTES].copy_from_slice(chunk);
             }
             let sum = percents.iter().map(|&value| u32::from(value)).sum();
-            trigger_volumes[pad] = TriggerVolumes { percents, sum };
-            pad_mutes[pad] = stored.mute;
-            pad_volumes[pad] = stored.volume_percent;
+            state.trigger_volumes[pad] = TriggerVolumes { percents, sum };
+            state.pad_mute_latched[pad] = stored.mute;
+            state.pad_volume_percents[pad] = stored.volume_percent;
         }
 
-        state.desired_beats = core::array::from_fn(|pad| self.pads[pad].division);
-        state.pattern_repeats = core::array::from_fn(|pad| self.pads[pad].pattern_repeats);
-        state.pad_cycle_length_overrides_ms =
-            core::array::from_fn(|pad| self.pads[pad].cycle_length_override_ms);
-        state.pad_samples = samples;
+        state.song_length_seconds = self.song_length_seconds;
+        state.track_timeline = self.track_timeline;
+        state.track_revision = state.track_revision.wrapping_add(1);
         state.pending_preview = None;
         state.base_interval_ms = self.base_interval_ms;
         state.latest_trigger_frames = [0; BEAT_PAD_COUNT];
-        state.patterns = patterns;
-        state.trigger_volumes = trigger_volumes;
         state.pattern_dirty_mask |= BEAT_PAD_MASK;
         state.pattern_revision = state.pattern_revision.wrapping_add(1);
         state.global_mute_latched = self.global_mute;
-        state.pad_mute_latched = pad_mutes;
         state.momentary_mute_target = None;
         state.global_volume_percent = self.master_volume_percent;
-        state.pad_volume_percents = pad_volumes;
         state.release_all_requested = true;
+        state.restart_loaded_song_transport();
         state.mark_song_changed();
         Ok(())
     }
 }
 
 impl Default for StoredSongV3 {
+    fn default() -> Self {
+        Self::snapshot(&SharedState::default())
+    }
+}
+
+impl Default for StoredSongV4 {
     fn default() -> Self {
         Self::snapshot(&SharedState::default())
     }
@@ -3580,6 +4711,10 @@ impl StoredSongV2 {
     }
 
     pub fn into_v3(self) -> StoredSongV3 {
+        self.into()
+    }
+
+    pub fn into_v4(self) -> StoredSongV4 {
         self.into()
     }
 }
@@ -3629,6 +4764,25 @@ impl From<StoredSongV3> for StoredSongV2 {
     }
 }
 
+impl From<StoredSongV3> for StoredSongV4 {
+    fn from(song: StoredSongV3) -> Self {
+        Self {
+            base_interval_ms: song.base_interval_ms,
+            song_length_seconds: DEFAULT_SONG_LENGTH_SECONDS,
+            track_timeline: TrackTimeline::all_enabled(),
+            global_mute: song.global_mute,
+            master_volume_percent: song.master_volume_percent,
+            pads: song.pads,
+        }
+    }
+}
+
+impl From<StoredSongV2> for StoredSongV4 {
+    fn from(song: StoredSongV2) -> Self {
+        StoredSongV3::from(song).into()
+    }
+}
+
 /// Encode one validated V2 song into a self-describing, allocation-free value.
 pub fn encode_song_v2<'a>(
     song: &StoredSongV2,
@@ -3641,6 +4795,15 @@ pub fn encode_song_v2<'a>(
 /// Encode one validated V3 song into a self-describing, allocation-free value.
 pub fn encode_song_v3<'a>(
     song: &StoredSongV3,
+    output: &'a mut [u8],
+) -> Result<&'a [u8], SongEncodeError> {
+    song.validate().map_err(SongEncodeError::InvalidSong)?;
+    encode_song_envelope(song, SONG_FORMAT_V3, output)
+}
+
+/// Encode one validated V4 song into a self-describing, allocation-free value.
+pub fn encode_song_v4<'a>(
+    song: &StoredSongV4,
     output: &'a mut [u8],
 ) -> Result<&'a [u8], SongEncodeError> {
     song.validate().map_err(SongEncodeError::InvalidSong)?;
@@ -3667,7 +4830,7 @@ fn encode_song_envelope<'a>(
 
 /// Decode a song envelope and report unsupported schema versions separately
 /// from corruption, truncation, and semantically invalid values.
-pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV3, SongDecodeError> {
+pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV4, SongDecodeError> {
     if bytes.len() < SONG_FORMAT_HEADER_LEN {
         return Err(SongDecodeError::Truncated);
     }
@@ -3676,7 +4839,7 @@ pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV3, SongDecodeError> {
         return Err(SongDecodeError::BadMagic { found: found_magic });
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != SONG_FORMAT_V2 && version != SONG_FORMAT_VERSION {
+    if version != SONG_FORMAT_V2 && version != SONG_FORMAT_V3 && version != SONG_FORMAT_VERSION {
         return Err(SongDecodeError::UnsupportedVersion {
             found: version,
             supported: SONG_FORMAT_VERSION,
@@ -3691,20 +4854,32 @@ pub fn decode_song(bytes: &[u8]) -> Result<StoredSongV3, SongDecodeError> {
         return Err(SongDecodeError::LengthMismatch { declared, actual });
     }
     let payload = &bytes[SONG_FORMAT_HEADER_LEN..];
-    let song = if version == SONG_FORMAT_V2 {
-        let (song, remainder): (StoredSongV2, &[u8]) =
-            postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
-        if !remainder.is_empty() {
-            return Err(SongDecodeError::InvalidPayload);
+    let song = match version {
+        SONG_FORMAT_V2 => {
+            let (song, remainder): (StoredSongV2, &[u8]) =
+                postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
+            if !remainder.is_empty() {
+                return Err(SongDecodeError::InvalidPayload);
+            }
+            song.into_v4()
         }
-        song.into_v3()
-    } else {
-        let (song, remainder): (StoredSongV3, &[u8]) =
-            postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
-        if !remainder.is_empty() {
-            return Err(SongDecodeError::InvalidPayload);
+        SONG_FORMAT_V3 => {
+            let (song, remainder): (StoredSongV3, &[u8]) =
+                postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
+            if !remainder.is_empty() {
+                return Err(SongDecodeError::InvalidPayload);
+            }
+            song.into()
         }
-        song
+        SONG_FORMAT_VERSION => {
+            let (song, remainder): (StoredSongV4, &[u8]) =
+                postcard::take_from_bytes(payload).map_err(|_| SongDecodeError::InvalidPayload)?;
+            if !remainder.is_empty() {
+                return Err(SongDecodeError::InvalidPayload);
+            }
+            song
+        }
+        _ => unreachable!("version checked above"),
     };
     song.validate().map_err(SongDecodeError::InvalidSong)?;
     Ok(song)
@@ -3907,8 +5082,9 @@ impl Default for VoiceSelection {
 pub enum RootMode {
     #[default]
     Beats,
-    CycleLength,
+    SongSettings,
     Pattern,
+    Tracks,
     Sample,
     Light,
     Save,
@@ -3917,10 +5093,11 @@ pub enum RootMode {
 }
 
 impl RootMode {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Beats,
-        Self::CycleLength,
+        Self::SongSettings,
         Self::Pattern,
+        Self::Tracks,
         Self::Sample,
         Self::Light,
         Self::Save,
@@ -3955,7 +5132,8 @@ pub enum UiPage {
     Root,
     Pattern,
     Beats,
-    CycleLength,
+    SongSettings,
+    Tracks,
     Sample,
     Light,
     Songs,
@@ -4209,6 +5387,275 @@ impl ResetAllChoice {
     }
 }
 
+/// Rows in the top-level Song Settings page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SongSettingsItem {
+    #[default]
+    SongLength,
+    CycleLength,
+}
+
+impl SongSettingsItem {
+    pub const ALL: [Self; 2] = [Self::SongLength, Self::CycleLength];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SongLength => 0,
+            Self::CycleLength => 1,
+        }
+    }
+
+    fn adjusted(self, delta: i32) -> Self {
+        let index = (self.index() as i32)
+            .saturating_add(delta)
+            .clamp(0, Self::ALL.len() as i32 - 1) as usize;
+        Self::ALL[index]
+    }
+}
+
+/// Navigation state within Song Settings. Musical values remain in
+/// [`SharedState`]; this only tracks which row or editor owns the encoder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SongSettingsView {
+    #[default]
+    Menu,
+    SongLengthEditor,
+    CycleLengthEditor,
+}
+
+/// Runtime-only behavior when transport reaches the exclusive song end.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EndBehavior {
+    #[default]
+    Loop,
+    Stop,
+}
+
+impl EndBehavior {
+    fn adjusted(self, delta: i32) -> Self {
+        let current = i32::from(self == Self::Stop);
+        if current.saturating_add(delta).clamp(0, 1) == 0 {
+            Self::Loop
+        } else {
+            Self::Stop
+        }
+    }
+}
+
+/// User-visible transport state. Pause is resumable at the frozen frame;
+/// Stopped represents reaching the finite song end in Stop mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportState {
+    Playing,
+    Paused,
+    Stopped,
+}
+
+/// Small sequencer snapshot copied into the UI controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackTransportStatus {
+    pub state: TransportState,
+    pub position_frames: u32,
+}
+
+impl TrackTransportStatus {
+    pub const fn playing_from_start() -> Self {
+        Self {
+            state: TransportState::Playing,
+            position_frames: 0,
+        }
+    }
+}
+
+impl Default for TrackTransportStatus {
+    fn default() -> Self {
+        Self::playing_from_start()
+    }
+}
+
+/// Discrete vertical time scales for the Tracks viewport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TrackZoom {
+    Milliseconds50,
+    Milliseconds100,
+    Milliseconds250,
+    Milliseconds500,
+    Seconds1,
+    Seconds2,
+    Seconds5,
+    #[default]
+    Seconds10,
+    Seconds30,
+    Minutes1,
+    Minutes2,
+    Minutes5,
+    Minutes10,
+    Minutes20,
+    Hours1,
+    WholeSong,
+}
+
+impl TrackZoom {
+    pub const ALL: [Self; 16] = [
+        Self::Milliseconds50,
+        Self::Milliseconds100,
+        Self::Milliseconds250,
+        Self::Milliseconds500,
+        Self::Seconds1,
+        Self::Seconds2,
+        Self::Seconds5,
+        Self::Seconds10,
+        Self::Seconds30,
+        Self::Minutes1,
+        Self::Minutes2,
+        Self::Minutes5,
+        Self::Minutes10,
+        Self::Minutes20,
+        Self::Hours1,
+        Self::WholeSong,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Visible duration in audio frames. Whole Song uses the supplied live
+    /// length, while every fixed scale is independent of the musical Cycle.
+    pub const fn duration_frames(self, song_length_frames: u32) -> u32 {
+        let milliseconds = match self {
+            Self::Milliseconds50 => 50,
+            Self::Milliseconds100 => 100,
+            Self::Milliseconds250 => 250,
+            Self::Milliseconds500 => 500,
+            Self::Seconds1 => 1_000,
+            Self::Seconds2 => 2_000,
+            Self::Seconds5 => 5_000,
+            Self::Seconds10 => 10_000,
+            Self::Seconds30 => 30_000,
+            Self::Minutes1 => 60_000,
+            Self::Minutes2 => 120_000,
+            Self::Minutes5 => 300_000,
+            Self::Minutes10 => 600_000,
+            Self::Minutes20 => 1_200_000,
+            Self::Hours1 => 3_600_000,
+            Self::WholeSong => return song_length_frames,
+        };
+        ((milliseconds as u64 * SAMPLE_RATE as u64) / 1_000) as u32
+    }
+
+    /// Positive detents zoom in; negative detents zoom out.
+    pub fn adjusted(self, delta: i32) -> Self {
+        let index = (self.index() as i32)
+            .saturating_sub(delta)
+            .clamp(0, Self::ALL.len() as i32 - 1) as usize;
+        Self::ALL[index]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackCursorDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackPaintPreview {
+    pub voice_mask: u16,
+    pub anchor_frame: u32,
+    pub other_frame: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackNotice {
+    Full,
+}
+
+/// Bounded OLED-ready Tracks projection. Each row contains one bit per voice;
+/// callers choose the raster height without allocating.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrackRaster<const ROWS: usize> {
+    pub projected_masks: [u16; ROWS],
+    pub enabled_masks: [u16; ROWS],
+    pub active_masks: [u16; ROWS],
+}
+
+/// Map one frame to the exact row bucket used by [`SharedState::rasterize_tracks`].
+///
+/// `view_end` is exclusive for projected events, but a stopped cursor is
+/// allowed to sit exactly at song end; that boundary is pinned to the final
+/// visible row.
+pub fn track_raster_row_for_frame<const ROWS: usize>(
+    view_start: u32,
+    view_end: u32,
+    frame: u32,
+) -> Option<usize> {
+    if ROWS == 0 || view_start >= view_end {
+        return None;
+    }
+    let duration = u64::from(view_end - view_start);
+    let offset = u64::from(frame.clamp(view_start, view_end) - view_start);
+    if offset >= duration {
+        return Some(ROWS - 1);
+    }
+    Some((((offset + 1) * ROWS as u64 - 1) / duration).min((ROWS - 1) as u64) as usize)
+}
+
+impl<const ROWS: usize> TrackRaster<ROWS> {
+    pub const fn empty() -> Self {
+        Self {
+            projected_masks: [0; ROWS],
+            enabled_masks: [0; ROWS],
+            active_masks: [0; ROWS],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.projected_masks.fill(0);
+        self.enabled_masks.fill(0);
+        self.active_masks.fill(0);
+    }
+}
+
+/// Requests emitted by the pure controller for firmware/sequencer work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackUiAction {
+    MoveCursor {
+        from_frame: u32,
+        direction: TrackCursorDirection,
+    },
+    PaintSpan {
+        voice_mask: u16,
+        anchor_frame: u32,
+        other_frame: u32,
+    },
+    SetAuditionMask {
+        mask: u16,
+    },
+    PlayFrom {
+        frame: u32,
+        audition_mask: u16,
+    },
+    Pause,
+    SetEndBehavior(EndBehavior),
+}
+
+/// Latest-wins command transferred from the control task to the audio task at
+/// the next render boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportCommand {
+    Pause,
+    Resume,
+    PlayFrom { frame: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackPaintGesture {
+    voice_mask: u16,
+    anchor_frame: u32,
+    moved: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupEditParameter {
     Beats,
@@ -4257,8 +5704,13 @@ pub enum UiEncoderTarget {
     PatternNone,
     BeatsNone,
     BeatsGroup(VoiceGroup),
+    SongSettings,
+    SongLength,
     CycleGlobal,
     CycleGroup(VoiceGroup),
+    TrackCursor,
+    TrackZoom,
+    TrackEndBehavior,
     SampleNone,
     SampleGroup(VoiceGroup),
     Light,
@@ -4272,6 +5724,7 @@ pub enum UiEncoderTarget {
 pub enum UiAction {
     Pattern(PatternEditorAction),
     SynchronizeGroup(GroupEdit),
+    Track(TrackUiAction),
     Song(SongStorageOperation),
     ResetConfirmed,
 }
@@ -4310,6 +5763,10 @@ pub enum UiDisplayModel {
     BeatsGroup {
         group: VoiceGroup,
     },
+    SongSettingsMenu {
+        selected: SongSettingsItem,
+    },
+    SongLength,
     CycleGlobal,
     CycleGroup {
         group: VoiceGroup,
@@ -4323,6 +5780,18 @@ pub enum UiDisplayModel {
     },
     PatternNeedsSingle {
         group: VoiceGroup,
+    },
+    Tracks {
+        cursor_frame: u32,
+        zoom: TrackZoom,
+        end_behavior: EndBehavior,
+        transport: TrackTransportStatus,
+        live_audition_mask: u16,
+        paint: Option<TrackPaintPreview>,
+        notice: Option<TrackNotice>,
+    },
+    TrackEndBehavior {
+        selected: EndBehavior,
     },
     Light,
     SongsMenu {
@@ -4362,6 +5831,17 @@ pub struct UiController {
     pattern_all_menu: Option<PatternAllMenu>,
     group_warning: Option<GroupEdit>,
     pattern_needs_single: Option<VoiceGroup>,
+    song_settings_item: SongSettingsItem,
+    song_settings_view: SongSettingsView,
+    tracks_cursor_frame: u32,
+    tracks_zoom: TrackZoom,
+    tracks_end_behavior: EndBehavior,
+    tracks_transport: TrackTransportStatus,
+    tracks_end_behavior_open: bool,
+    tracks_encoder_gesture: Option<bool>,
+    tracks_paint: Option<TrackPaintGesture>,
+    tracks_live_audition_mask: u16,
+    tracks_notice: Option<TrackNotice>,
     reset_choice: ResetAllChoice,
     songs_view: SongsView,
     song_status: Option<SongUiStatus>,
@@ -4380,6 +5860,17 @@ impl UiController {
             pattern_all_menu: None,
             group_warning: None,
             pattern_needs_single: None,
+            song_settings_item: SongSettingsItem::SongLength,
+            song_settings_view: SongSettingsView::Menu,
+            tracks_cursor_frame: 0,
+            tracks_zoom: TrackZoom::Seconds10,
+            tracks_end_behavior: EndBehavior::Loop,
+            tracks_transport: TrackTransportStatus::playing_from_start(),
+            tracks_end_behavior_open: false,
+            tracks_encoder_gesture: None,
+            tracks_paint: None,
+            tracks_live_audition_mask: 0,
+            tracks_notice: None,
             reset_choice: ResetAllChoice::Cancel,
             songs_view: SongsView::Operations {
                 selected: SongMenuOperation::Load,
@@ -4415,6 +5906,9 @@ impl UiController {
     /// levels. A later edge that completes a held chord replaces any
     /// temporary single-key selection with the exact chord.
     pub fn press_voice_edges(&mut self, pressed_mask: u16, held_mask: u16) -> bool {
+        if self.page == UiPage::Tracks {
+            return false;
+        }
         let pressed_mask = pressed_mask & BEAT_PAD_MASK;
         if pressed_mask == 0 {
             return false;
@@ -4428,6 +5922,9 @@ impl UiController {
     }
 
     pub fn press_voice(&mut self, pad: usize) -> bool {
+        if self.page == UiPage::Tracks {
+            return false;
+        }
         let before = self.selection;
         let pattern_guard_active = self.pattern_needs_single.is_some();
         let valid = if self.selection.count() >= 2 {
@@ -4448,6 +5945,9 @@ impl UiController {
     /// Replace the selection with a newly held chord. A chord is always
     /// deterministic ascending order and always enters multi mode.
     pub fn press_voice_chord(&mut self, mask: u16) -> bool {
+        if self.page == UiPage::Tracks {
+            return false;
+        }
         let mask = mask & BEAT_PAD_MASK;
         if mask.count_ones() < 2 {
             return false;
@@ -4489,7 +5989,10 @@ impl UiController {
     pub fn open_group_warning(&mut self, edit: GroupEdit) -> bool {
         let valid_context = match edit.parameter() {
             GroupEditParameter::Beats => self.page == UiPage::Beats,
-            GroupEditParameter::CycleLength => self.page == UiPage::CycleLength,
+            GroupEditParameter::CycleLength => {
+                self.page == UiPage::SongSettings
+                    && self.song_settings_view == SongSettingsView::CycleLengthEditor
+            }
             GroupEditParameter::Sample => self.page == UiPage::Sample,
             GroupEditParameter::Volume => true,
         };
@@ -4506,6 +6009,7 @@ impl UiController {
     pub fn clear_transient_notices(&mut self) {
         self.group_warning = None;
         self.pattern_needs_single = None;
+        self.tracks_notice = None;
     }
 
     pub fn rotate_root(&mut self, delta: i32) {
@@ -4521,6 +6025,10 @@ impl UiController {
         }
         self.group_warning = None;
         self.pattern_all_menu = None;
+        self.song_settings_view = SongSettingsView::Menu;
+        self.tracks_end_behavior_open = false;
+        self.tracks_encoder_gesture = None;
+        self.tracks_paint = None;
         self.reset_choice = ResetAllChoice::Cancel;
         if self.root_mode == RootMode::Pattern
             && self.selection.count() >= 2
@@ -4533,7 +6041,11 @@ impl UiController {
         self.page = match self.root_mode {
             RootMode::Pattern => UiPage::Pattern,
             RootMode::Beats => UiPage::Beats,
-            RootMode::CycleLength => UiPage::CycleLength,
+            RootMode::SongSettings => UiPage::SongSettings,
+            RootMode::Tracks => {
+                self.tracks_cursor_frame = self.tracks_transport.position_frames;
+                UiPage::Tracks
+            }
             RootMode::Sample => UiPage::Sample,
             RootMode::Light => UiPage::Light,
             RootMode::Save => UiPage::Root,
@@ -4560,6 +6072,284 @@ impl UiController {
 
     pub const fn songs_view(self) -> SongsView {
         self.songs_view
+    }
+
+    pub const fn song_settings_item(self) -> SongSettingsItem {
+        self.song_settings_item
+    }
+
+    pub const fn song_settings_view(self) -> SongSettingsView {
+        self.song_settings_view
+    }
+
+    pub fn rotate_song_settings(&mut self, delta: i32) {
+        if self.page == UiPage::SongSettings && self.song_settings_view == SongSettingsView::Menu {
+            self.song_settings_item = self.song_settings_item.adjusted(delta);
+        }
+    }
+
+    pub const fn tracks_cursor_frame(self) -> u32 {
+        self.tracks_cursor_frame
+    }
+
+    pub const fn tracks_zoom(self) -> TrackZoom {
+        self.tracks_zoom
+    }
+
+    pub const fn tracks_end_behavior(self) -> EndBehavior {
+        self.tracks_end_behavior
+    }
+
+    pub const fn tracks_transport_status(self) -> TrackTransportStatus {
+        self.tracks_transport
+    }
+
+    pub const fn tracks_live_audition_mask(self) -> u16 {
+        self.tracks_live_audition_mask
+    }
+
+    pub const fn tracks_paint_preview(self) -> Option<TrackPaintPreview> {
+        match self.tracks_paint {
+            Some(gesture) => Some(TrackPaintPreview {
+                voice_mask: gesture.voice_mask,
+                anchor_frame: gesture.anchor_frame,
+                other_frame: self.tracks_cursor_frame,
+            }),
+            None => None,
+        }
+    }
+
+    pub const fn tracks_notice(self) -> Option<TrackNotice> {
+        self.tracks_notice
+    }
+
+    /// Synchronize the controller with the sequencer's authoritative runtime
+    /// transport. The playhead owns the cursor while running and hands it back
+    /// at the exact frozen/stopped frame.
+    pub fn set_track_transport_status(&mut self, status: TrackTransportStatus) {
+        let was_playing = self.tracks_transport.state == TransportState::Playing;
+        self.tracks_transport = status;
+        if was_playing || status.state == TransportState::Playing {
+            self.tracks_cursor_frame = status.position_frames;
+        }
+        if status.state != TransportState::Playing {
+            self.tracks_live_audition_mask = 0;
+        }
+    }
+
+    /// Apply a projected-boundary result returned by firmware after a
+    /// [`TrackUiAction::MoveCursor`] request.
+    pub fn set_tracks_cursor_frame(&mut self, frame: u32) {
+        if self.page != UiPage::Tracks || self.tracks_transport.state == TransportState::Playing {
+            return;
+        }
+        if frame != self.tracks_cursor_frame
+            && let Some(gesture) = &mut self.tracks_paint
+        {
+            gesture.moved = true;
+        }
+        self.tracks_cursor_frame = frame;
+        self.tracks_notice = None;
+    }
+
+    /// Request one unaccelerated move through the union of projected trigger
+    /// boundaries. Firmware resolves the request against live musical state.
+    pub fn rotate_tracks_cursor(&mut self, delta: i32) -> Option<UiAction> {
+        if self.page != UiPage::Tracks
+            || self.tracks_transport.state == TransportState::Playing
+            || self.tracks_end_behavior_open
+            || delta == 0
+        {
+            return None;
+        }
+        self.tracks_notice = None;
+        let direction = if delta > 0 {
+            TrackCursorDirection::Next
+        } else {
+            TrackCursorDirection::Previous
+        };
+        Some(UiAction::Track(TrackUiAction::MoveCursor {
+            from_frame: self.tracks_cursor_frame,
+            direction,
+        }))
+    }
+
+    /// Mark the start of a Tracks encoder click. Opening End Behavior is
+    /// deferred until release so a held-and-turned gesture can zoom instead.
+    pub fn begin_tracks_encoder_gesture(&mut self) -> bool {
+        if self.page != UiPage::Tracks {
+            return false;
+        }
+        self.tracks_notice = None;
+        if self.tracks_end_behavior_open {
+            self.tracks_end_behavior_open = false;
+            self.tracks_encoder_gesture = None;
+        } else {
+            self.tracks_encoder_gesture = Some(false);
+        }
+        true
+    }
+
+    /// Complete a deferred encoder click. A press with no zoom detent opens
+    /// End Behavior; a press-and-turn has no release action.
+    pub fn end_tracks_encoder_gesture(&mut self) -> bool {
+        if self.page != UiPage::Tracks {
+            self.tracks_encoder_gesture = None;
+            return false;
+        }
+        let open = self.tracks_encoder_gesture.take() == Some(false);
+        if open {
+            self.tracks_end_behavior_open = true;
+            self.tracks_paint = None;
+        }
+        open
+    }
+
+    pub fn rotate_tracks_zoom(&mut self, delta: i32) -> bool {
+        if self.page != UiPage::Tracks || self.tracks_end_behavior_open || delta == 0 {
+            return false;
+        }
+        let Some(turned) = &mut self.tracks_encoder_gesture else {
+            return false;
+        };
+        *turned = true;
+        let adjusted = self.tracks_zoom.adjusted(delta);
+        let changed = adjusted != self.tracks_zoom;
+        self.tracks_zoom = adjusted;
+        self.tracks_notice = None;
+        changed
+    }
+
+    pub fn rotate_tracks_end_behavior(&mut self, delta: i32) -> Option<UiAction> {
+        if self.page != UiPage::Tracks || !self.tracks_end_behavior_open || delta == 0 {
+            return None;
+        }
+        let adjusted = self.tracks_end_behavior.adjusted(delta);
+        if adjusted == self.tracks_end_behavior {
+            return None;
+        }
+        self.tracks_end_behavior = adjusted;
+        Some(UiAction::Track(TrackUiAction::SetEndBehavior(adjusted)))
+    }
+
+    /// Handle debounced voice levels in Tracks. Running transport maps the
+    /// exact held set to live audition. Paused/stopped transport captures a
+    /// chord at the cursor and emits one atomic paint request after every
+    /// captured key has been released.
+    pub fn update_tracks_voice_keys(
+        &mut self,
+        pressed_mask: u16,
+        released_mask: u16,
+        held_mask: u16,
+        tap_other_frame: u32,
+    ) -> Option<UiAction> {
+        let pressed_mask = pressed_mask & BEAT_PAD_MASK;
+        let released_mask = released_mask & BEAT_PAD_MASK;
+        let held_mask = held_mask & BEAT_PAD_MASK;
+        if self.page != UiPage::Tracks {
+            self.tracks_paint = None;
+            if self.tracks_live_audition_mask != 0 {
+                self.tracks_live_audition_mask = 0;
+                return Some(UiAction::Track(TrackUiAction::SetAuditionMask { mask: 0 }));
+            }
+            return None;
+        }
+
+        if pressed_mask != 0 {
+            self.tracks_notice = None;
+        }
+        if self.tracks_transport.state == TransportState::Playing {
+            self.tracks_paint = None;
+            if held_mask == self.tracks_live_audition_mask {
+                return None;
+            }
+            self.tracks_live_audition_mask = held_mask;
+            return Some(UiAction::Track(TrackUiAction::SetAuditionMask {
+                mask: held_mask,
+            }));
+        }
+
+        // End Behavior is modal. Voice edges seen while it is open must not
+        // seed a paint that commits later when the overlay closes.
+        if self.tracks_end_behavior_open {
+            self.tracks_paint = None;
+            return None;
+        }
+
+        self.tracks_live_audition_mask = 0;
+        if pressed_mask != 0 {
+            if let Some(gesture) = &mut self.tracks_paint {
+                gesture.voice_mask |= pressed_mask;
+            } else {
+                self.tracks_paint = Some(TrackPaintGesture {
+                    voice_mask: if held_mask == 0 {
+                        pressed_mask
+                    } else {
+                        held_mask
+                    },
+                    anchor_frame: self.tracks_cursor_frame,
+                    moved: false,
+                });
+            }
+        }
+
+        let gesture = self.tracks_paint?;
+        if released_mask & gesture.voice_mask == 0 || held_mask & gesture.voice_mask != 0 {
+            return None;
+        }
+        self.tracks_paint = None;
+        let other_frame = if gesture.moved {
+            self.tracks_cursor_frame
+        } else {
+            tap_other_frame
+        };
+        self.tracks_cursor_frame = other_frame;
+        Some(UiAction::Track(TrackUiAction::PaintSpan {
+            voice_mask: gesture.voice_mask,
+            anchor_frame: gesture.anchor_frame,
+            other_frame,
+        }))
+    }
+
+    /// Mute is the Tracks transport control instead of a mute gesture.
+    pub fn press_tracks_transport(&mut self, held_voice_mask: u16) -> Option<UiAction> {
+        if self.page != UiPage::Tracks {
+            return None;
+        }
+        self.tracks_paint = None;
+        self.tracks_notice = None;
+        match self.tracks_transport.state {
+            TransportState::Playing => {
+                self.tracks_live_audition_mask = 0;
+                Some(UiAction::Track(TrackUiAction::Pause))
+            }
+            TransportState::Paused | TransportState::Stopped => {
+                let audition_mask = held_voice_mask & BEAT_PAD_MASK;
+                self.tracks_live_audition_mask = audition_mask;
+                Some(UiAction::Track(TrackUiAction::PlayFrom {
+                    frame: self.tracks_cursor_frame,
+                    audition_mask,
+                }))
+            }
+        }
+    }
+
+    pub fn set_tracks_notice(&mut self, notice: Option<TrackNotice>) {
+        self.tracks_notice = notice;
+    }
+
+    /// Reset runtime-only Tracks defaults after Reset All. Load deliberately
+    /// does not call this, preserving End Behavior and zoom.
+    pub fn reset_tracks_runtime(&mut self) {
+        self.tracks_cursor_frame = 0;
+        self.tracks_zoom = TrackZoom::Seconds10;
+        self.tracks_end_behavior = EndBehavior::Loop;
+        self.tracks_transport = TrackTransportStatus::playing_from_start();
+        self.tracks_end_behavior_open = false;
+        self.tracks_encoder_gesture = None;
+        self.tracks_paint = None;
+        self.tracks_live_audition_mask = 0;
+        self.tracks_notice = None;
     }
 
     pub const fn song_status(self) -> Option<SongUiStatus> {
@@ -4727,6 +6517,13 @@ impl UiController {
                 }
             }
             UiPage::Pattern => self.press_pattern_control(selected_division),
+            UiPage::SongSettings => {
+                self.press_song_settings_control();
+                None
+            }
+            // Tracks defers encoder-click handling until release so a held
+            // turn can be distinguished from an options click.
+            UiPage::Tracks => None,
             UiPage::Songs => self.press_songs_control(library),
             UiPage::ResetAll => {
                 let confirmed = self.reset_choice == ResetAllChoice::Reset;
@@ -4735,13 +6532,26 @@ impl UiController {
                 if confirmed {
                     self.selection.clear();
                     self.clear_transient_notices();
+                    self.reset_tracks_runtime();
                     Some(UiAction::ResetConfirmed)
                 } else {
                     None
                 }
             }
-            UiPage::Beats | UiPage::CycleLength | UiPage::Sample | UiPage::Light => None,
+            UiPage::Beats | UiPage::Sample | UiPage::Light => None,
         }
+    }
+
+    fn press_song_settings_control(&mut self) {
+        self.song_settings_view = match self.song_settings_view {
+            SongSettingsView::Menu => match self.song_settings_item {
+                SongSettingsItem::SongLength => SongSettingsView::SongLengthEditor,
+                SongSettingsItem::CycleLength => SongSettingsView::CycleLengthEditor,
+            },
+            SongSettingsView::SongLengthEditor | SongSettingsView::CycleLengthEditor => {
+                SongSettingsView::Menu
+            }
+        };
     }
 
     fn press_songs_control(
@@ -4904,11 +6714,35 @@ impl UiController {
     }
 
     pub fn encoder_target(self, volume_pressed: bool) -> UiEncoderTarget {
+        self.encoder_target_with_button(volume_pressed, false)
+    }
+
+    /// Resolve the live encoder route, including Tracks' press-and-turn zoom
+    /// gesture. Existing callers can use [`Self::encoder_target`] when the
+    /// physical encoder button is irrelevant.
+    pub fn encoder_target_with_button(
+        self,
+        volume_pressed: bool,
+        encoder_pressed: bool,
+    ) -> UiEncoderTarget {
         if self.song_status.is_some() {
             return UiEncoderTarget::SongStatus;
         }
         if self.group_warning.is_some() {
             return UiEncoderTarget::GroupWarning;
+        }
+        if self.page == UiPage::Tracks {
+            if self.tracks_end_behavior_open {
+                return UiEncoderTarget::TrackEndBehavior;
+            }
+            if encoder_pressed {
+                return UiEncoderTarget::TrackZoom;
+            }
+            return if self.tracks_transport.state == TransportState::Playing {
+                UiEncoderTarget::Volume(VolumeTarget::Global)
+            } else {
+                UiEncoderTarget::TrackCursor
+            };
         }
         if volume_pressed {
             if self.page == UiPage::Pattern
@@ -4934,9 +6768,14 @@ impl UiController {
             UiPage::Beats => self
                 .selected_group()
                 .map_or(UiEncoderTarget::BeatsNone, UiEncoderTarget::BeatsGroup),
-            UiPage::CycleLength => self
-                .selected_group()
-                .map_or(UiEncoderTarget::CycleGlobal, UiEncoderTarget::CycleGroup),
+            UiPage::SongSettings => match self.song_settings_view {
+                SongSettingsView::Menu => UiEncoderTarget::SongSettings,
+                SongSettingsView::SongLengthEditor => UiEncoderTarget::SongLength,
+                SongSettingsView::CycleLengthEditor => self
+                    .selected_group()
+                    .map_or(UiEncoderTarget::CycleGlobal, UiEncoderTarget::CycleGroup),
+            },
+            UiPage::Tracks => unreachable!(),
             UiPage::Sample => self
                 .selected_group()
                 .map_or(UiEncoderTarget::SampleNone, UiEncoderTarget::SampleGroup),
@@ -4960,6 +6799,22 @@ impl UiController {
         }
         if let Some(edit) = self.group_warning {
             return UiDisplayModel::GroupWarning { edit };
+        }
+        if self.page == UiPage::Tracks {
+            if self.tracks_end_behavior_open {
+                return UiDisplayModel::TrackEndBehavior {
+                    selected: self.tracks_end_behavior,
+                };
+            }
+            return UiDisplayModel::Tracks {
+                cursor_frame: self.tracks_cursor_frame,
+                zoom: self.tracks_zoom,
+                end_behavior: self.tracks_end_behavior,
+                transport: self.tracks_transport,
+                live_audition_mask: self.tracks_live_audition_mask,
+                paint: self.tracks_paint_preview(),
+                notice: self.tracks_notice,
+            };
         }
         if volume_pressed {
             if self.page == UiPage::Pattern
@@ -5001,10 +6856,17 @@ impl UiController {
                 Some(group) => UiDisplayModel::BeatsGroup { group },
                 None => UiDisplayModel::BeatsSelectVoice,
             },
-            UiPage::CycleLength => match self.selected_group() {
-                Some(group) => UiDisplayModel::CycleGroup { group },
-                None => UiDisplayModel::CycleGlobal,
+            UiPage::SongSettings => match self.song_settings_view {
+                SongSettingsView::Menu => UiDisplayModel::SongSettingsMenu {
+                    selected: self.song_settings_item,
+                },
+                SongSettingsView::SongLengthEditor => UiDisplayModel::SongLength,
+                SongSettingsView::CycleLengthEditor => match self.selected_group() {
+                    Some(group) => UiDisplayModel::CycleGroup { group },
+                    None => UiDisplayModel::CycleGlobal,
+                },
             },
+            UiPage::Tracks => unreachable!(),
             UiPage::Sample => match self.selected_group() {
                 Some(group) => UiDisplayModel::SampleGroup { group },
                 None => UiDisplayModel::SampleSelectVoice,
@@ -5063,17 +6925,32 @@ impl UiController {
     /// mode or confirmation preserves voice selection; pressing Return while
     /// already at the root clears it. Every key or encoder push already held
     /// is suppressed until its release.
-    pub fn return_to_root(&mut self, held_keys: u16, encoder_held: bool) {
+    pub fn return_to_root(&mut self, held_keys: u16, encoder_held: bool) -> Option<UiAction> {
         if self.group_warning.take().is_some() {
             self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
             self.encoder_suppressed = encoder_held;
-            return;
+            return None;
         }
         if self.pattern_repeat_editor.take().is_some() {
             self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
             self.encoder_suppressed = encoder_held;
-            return;
+            return None;
         }
+        if self.page == UiPage::SongSettings && self.song_settings_view != SongSettingsView::Menu {
+            self.song_settings_view = SongSettingsView::Menu;
+            self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
+            self.encoder_suppressed = encoder_held;
+            return None;
+        }
+        if self.page == UiPage::Tracks && self.tracks_end_behavior_open {
+            self.tracks_end_behavior_open = false;
+            self.tracks_encoder_gesture = None;
+            self.tracks_paint = None;
+            self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
+            self.encoder_suppressed = encoder_held;
+            return None;
+        }
+        let leaving_tracks = self.page == UiPage::Tracks;
         let clear_selection = self.page == UiPage::Root;
         self.page = UiPage::Root;
         if clear_selection {
@@ -5081,6 +6958,12 @@ impl UiController {
         }
         self.pattern_needs_single = None;
         self.pattern_all_menu = None;
+        self.song_settings_view = SongSettingsView::Menu;
+        self.tracks_end_behavior_open = false;
+        self.tracks_encoder_gesture = None;
+        self.tracks_paint = None;
+        self.tracks_live_audition_mask = 0;
+        self.tracks_notice = None;
         self.reset_choice = ResetAllChoice::Cancel;
         let selected_song_operation = match self.songs_view {
             SongsView::Operations { selected } => selected,
@@ -5113,6 +6996,7 @@ impl UiController {
         }
         self.suppressed_keys = held_keys & ((1_u16 << KEY_COUNT) - 1);
         self.encoder_suppressed = encoder_held;
+        leaving_tracks.then_some(UiAction::Track(TrackUiAction::SetAuditionMask { mask: 0 }))
     }
 
     pub fn update_suppression(&mut self, held_keys: u16, encoder_held: bool) {
@@ -6547,6 +8431,445 @@ mod tests {
         );
         assert_eq!(report.load_shed_trigger_count, 21);
         assert!(!frame_has_reached((AUDIO_BLOCK_FRAMES - 1) as u64, next));
+    }
+
+    #[test]
+    fn finite_transport_pauses_without_advancing_pattern_phase() {
+        let kick_bytes = wav(&[100; 128], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = DENSE_TEST_DIVISION;
+        sequencer.apply_timing(&beats, DENSE_TEST_INTERVAL_MS, 0);
+
+        let mut first = [0_u32; 24];
+        let report = sequencer.render_song(1_000, &mut first);
+        assert_eq!(sequencer.song_position_frame(), 24);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+
+        sequencer.pause_song();
+        let frozen_ordinal = sequencer.pads()[0].tick_ordinal;
+        let frozen_deadline = sequencer.pads()[0].next_frame;
+        let mut paused = [0_u32; 64];
+        sequencer.render_song(1_024, &mut paused);
+        assert_eq!(sequencer.song_position_frame(), 24);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, frozen_ordinal);
+        assert_eq!(sequencer.pads()[0].next_frame, frozen_deadline);
+        assert_eq!(sequencer.transport_status().state, TransportState::Paused);
+
+        sequencer.play_song_from(24);
+        let mut resumed = [0_u32; 23];
+        let report = sequencer.render_song(1_088, &mut resumed);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+        assert_eq!(sequencer.song_position_frame(), 47);
+    }
+
+    #[test]
+    fn track_gate_advances_silently_and_live_audition_bypasses_gate_and_mute() {
+        let kick_bytes = wav(&[100; 128], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = DENSE_TEST_DIVISION;
+        sequencer.apply_timing(&beats, DENSE_TEST_INTERVAL_MS, 0);
+
+        let mut timeline = TrackTimeline::all_enabled();
+        assert_eq!(
+            timeline.paint_opposite(1, 0, MAX_SONG_LENGTH_FRAMES),
+            Ok(true)
+        );
+        sequencer.set_track_timeline(&timeline);
+        let mut output = [0_u32; 24];
+        let gated = sequencer.render_song(0, &mut output);
+        assert_eq!(gated.latest_visual_triggers[0], Some(23));
+        assert_eq!(gated.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()], 0);
+        assert_eq!(sequencer.pads()[0].tick_ordinal, 2);
+
+        sequencer.set_mute_mask(1);
+        sequencer.set_live_audition_mask(1);
+        sequencer.play_song_from(23);
+        let auditioned = sequencer.render_song(100, &mut output[..1]);
+        assert_eq!(
+            auditioned.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
+
+        sequencer.set_live_audition_mask(0);
+        let mut tail = [0_u32; 1];
+        sequencer.render_song(124, &mut tail);
+        assert_eq!(sequencer.active_voice_count_for_pad(0), Some(1));
+    }
+
+    #[test]
+    fn inclusive_seek_loop_and_stop_obey_finite_song_boundaries() {
+        let kick_bytes = wav(&[100; 128], false);
+        let hat_bytes = wav(&[1], false);
+        let mut sequencer = test_sequencer(&kick_bytes, &hat_bytes);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = DENSE_TEST_DIVISION;
+        sequencer.apply_timing(&beats, DENSE_TEST_INTERVAL_MS, 0);
+        sequencer.song_length_frames = 25;
+
+        sequencer.play_song_from(23);
+        let mut one = [0_u32; 1];
+        let inclusive = sequencer.render_song(0, &mut one);
+        assert_eq!(
+            inclusive.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+
+        sequencer.play_song_from(0);
+        let mut looped = [0_u32; 30];
+        let report = sequencer.render_song(1, &mut looped);
+        assert_eq!(
+            report.audible_trigger_counts[DEFAULT_KICK_SAMPLE.index()],
+            1
+        );
+        assert_eq!(sequencer.transport_status().state, TransportState::Playing);
+        assert_eq!(sequencer.song_position_frame(), 5);
+        assert_eq!(sequencer.pads()[0].next_frame, Some(23));
+
+        sequencer.set_end_behavior(EndBehavior::Stop);
+        sequencer.play_song_from(0);
+        let mut stopped = [0_u32; 30];
+        sequencer.render_song(31, &mut stopped);
+        assert_eq!(sequencer.transport_status().state, TransportState::Stopped);
+        assert_eq!(sequencer.song_position_frame(), 25);
+        sequencer.play_song_from(25);
+        assert_eq!(sequencer.song_position_frame(), 0);
+        assert_eq!(sequencer.transport_status().state, TransportState::Playing);
+    }
+
+    #[test]
+    fn shortening_song_applies_end_behavior_even_while_paused() {
+        let mut sequencer = test_sequencer(KICK_WAV, HAT_WAV);
+        let mut beats = [0; BEAT_PAD_COUNT];
+        beats[0] = 1;
+        sequencer.apply_timing(&beats, DEFAULT_BASE_INTERVAL_MS, 0);
+        sequencer.song_position_frame = SAMPLE_RATE * 2;
+        sequencer.transport_state = TransportState::Paused;
+
+        sequencer.set_end_behavior(EndBehavior::Loop);
+        sequencer.set_song_length_frames(SAMPLE_RATE);
+        assert_eq!(sequencer.song_position_frame(), 0);
+        assert_eq!(sequencer.transport_status().state, TransportState::Paused);
+
+        sequencer.song_length_frames = SAMPLE_RATE * 3;
+        sequencer.song_position_frame = SAMPLE_RATE * 2;
+        sequencer.set_end_behavior(EndBehavior::Stop);
+        sequencer.set_song_length_frames(SAMPLE_RATE);
+        assert_eq!(sequencer.song_position_frame(), SAMPLE_RATE);
+        assert_eq!(sequencer.transport_status().state, TransportState::Stopped);
+    }
+
+    fn reference_projected_trigger_in_interval(
+        state: &SharedState,
+        pad: usize,
+        start: u32,
+        end: u32,
+    ) -> bool {
+        if start >= end || pad >= BEAT_PAD_COUNT {
+            return false;
+        }
+        let beats = state.desired_beats[pad];
+        let steps = state.effective_pattern_steps(pad).unwrap_or(0);
+        if beats == 0 || steps == 0 {
+            return false;
+        }
+        let cycle_ms = state
+            .effective_cycle_length_ms(pad)
+            .unwrap_or(state.base_interval_ms);
+        let first = first_ordinal_at_or_after(u64::from(start), beats, cycle_ms);
+        let last = last_ordinal_at_or_before(u64::from(end - 1), beats, cycle_ms);
+        if first > last {
+            return false;
+        }
+        let count = last - first + 1;
+        if count >= u128::from(steps) {
+            return (0..usize::from(steps))
+                .any(|step| state.patterns[pad].bit(step).unwrap_or(false));
+        }
+        (first..=last).any(|ordinal| {
+            let step = ((ordinal - 1) % u128::from(steps)) as usize;
+            state.patterns[pad].bit(step).unwrap_or(false)
+        })
+    }
+
+    /// Deliberately straightforward pre-optimization implementation retained
+    /// in tests as an executable specification for boundary and gate rules.
+    fn reference_rasterize_tracks<const ROWS: usize>(
+        state: &SharedState,
+        view_start: u32,
+        view_end: u32,
+    ) -> TrackRaster<ROWS> {
+        let mut raster = TrackRaster::empty();
+        if ROWS == 0 || view_start >= view_end {
+            return raster;
+        }
+        let song_end = state.song_length_frames();
+        let view_start = view_start.min(song_end);
+        let view_end = view_end.min(song_end);
+        if view_start >= view_end {
+            return raster;
+        }
+        let duration = u64::from(view_end - view_start);
+        for row in 0..ROWS {
+            let row_start = view_start + (duration * row as u64 / ROWS as u64) as u32;
+            let row_end = view_start + (duration * (row + 1) as u64 / ROWS as u64) as u32;
+            if row_start >= row_end {
+                continue;
+            }
+            let change_prefix = &state.track_timeline.frames[..state.track_timeline.len()];
+            let first_change = match change_prefix.binary_search(&row_start) {
+                Ok(index) => index + 1,
+                Err(index) => index,
+            };
+            let starting_gate_mask = state.track_timeline.gate_mask_at(row_start);
+            let mut active_mask = starting_gate_mask;
+            let mut active_index = first_change;
+            while active_index < state.track_timeline.len()
+                && state.track_timeline.frames[active_index] < row_end
+            {
+                active_mask |= state.track_timeline.gate_masks[active_index];
+                active_index += 1;
+            }
+            raster.active_masks[row] = active_mask & BEAT_PAD_MASK;
+
+            for pad in 0..BEAT_PAD_COUNT {
+                let pad_mask = 1_u16 << pad;
+                if reference_projected_trigger_in_interval(state, pad, row_start, row_end) {
+                    raster.projected_masks[row] |= pad_mask;
+                }
+
+                let mut segment_start = row_start;
+                let mut gate_mask = starting_gate_mask;
+                let mut enabled_trigger = false;
+                let mut change_index = first_change;
+                while change_index < state.track_timeline.len()
+                    && state.track_timeline.frames[change_index] < row_end
+                {
+                    let change_frame = state.track_timeline.frames[change_index];
+                    if !enabled_trigger
+                        && gate_mask & pad_mask != 0
+                        && reference_projected_trigger_in_interval(
+                            state,
+                            pad,
+                            segment_start,
+                            change_frame,
+                        )
+                    {
+                        enabled_trigger = true;
+                    }
+                    segment_start = change_frame;
+                    gate_mask = state.track_timeline.gate_masks[change_index];
+                    change_index += 1;
+                }
+                if !enabled_trigger
+                    && gate_mask & pad_mask != 0
+                    && reference_projected_trigger_in_interval(state, pad, segment_start, row_end)
+                {
+                    enabled_trigger = true;
+                }
+                if enabled_trigger {
+                    raster.enabled_masks[row] |= pad_mask;
+                }
+            }
+        }
+        raster
+    }
+
+    #[test]
+    fn periodic_pattern_range_query_matches_bitwise_reference() {
+        for steps in [1_u16, 2, 7, 8, 9, 31, 64, 255, 256] {
+            let mut pattern = Pattern::all_enabled();
+            pattern.fill(false);
+            for step in 0..usize::from(steps) {
+                if (step * 37 + usize::from(steps)) % 11 < 4 {
+                    assert!(pattern.set_bit(step, true));
+                }
+            }
+
+            for start_step in 0..usize::from(steps) {
+                let first = 1 + start_step as u64 + u64::from(steps);
+                for count in 0..=usize::from(steps) {
+                    let end = first + count as u64;
+                    let expected = (first..end).any(|ordinal| {
+                        pattern
+                            .bit(((ordinal - 1) % u64::from(steps)) as usize)
+                            .unwrap()
+                    });
+                    assert_eq!(
+                        pattern_enabled_in_ordinal_range(&pattern, steps, first, end),
+                        expected,
+                        "steps={steps}, start={first}, count={count}"
+                    );
+                }
+                assert_eq!(
+                    pattern_enabled_in_ordinal_range(
+                        &pattern,
+                        steps,
+                        first,
+                        first + u64::from(steps) + 1,
+                    ),
+                    pattern.any_enabled_in_range(0, usize::from(steps))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swept_track_raster_matches_reference_with_all_change_slots_occupied() {
+        let mut state = SharedState::default();
+        assert!(state.set_song_length_seconds(60));
+        assert!(state.set_base_interval_ms(MIN_BASE_INTERVAL_MS));
+        for pad in 0..BEAT_PAD_COUNT {
+            assert!(state.set_desired_beats(pad, MAX_BEAT_MULTIPLIER - pad as u16));
+            state.patterns[pad].fill(false);
+            let steps = usize::from(state.effective_pattern_steps(pad).unwrap());
+            for step in 0..steps {
+                if (step * (pad + 3) + pad) % 13 < 5 {
+                    assert!(state.patterns[pad].set_bit(step, true));
+                }
+            }
+        }
+
+        let mut changes = Vec::with_capacity(TRACK_CHANGE_CAPACITY);
+        let mut gate_mask = BEAT_PAD_MASK;
+        for index in 0..TRACK_CHANGE_CAPACITY {
+            gate_mask ^= 1_u16 << (index % BEAT_PAD_COUNT);
+            changes.push(TrackChange {
+                frame: 100_000 + index as u32,
+                gate_mask,
+            });
+        }
+        state.track_timeline = TrackTimeline::from_changes(&changes).unwrap();
+        assert_eq!(state.track_timeline.len(), TRACK_CHANGE_CAPACITY);
+
+        let mut actual = TrackRaster::<43>::empty();
+        state.rasterize_tracks(99_900, 100_400, &mut actual);
+        assert_eq!(actual, reference_rasterize_tracks(&state, 99_900, 100_400));
+
+        state.rasterize_tracks(0, state.song_length_frames(), &mut actual);
+        assert_eq!(
+            actual,
+            reference_rasterize_tracks(&state, 0, state.song_length_frames())
+        );
+
+        // More rows than frames exercises repeated row boundaries in the
+        // sweep without losing same-frame Track changes.
+        let mut tiny_actual = TrackRaster::<43>::empty();
+        state.rasterize_tracks(100_000, 100_017, &mut tiny_actual);
+        assert_eq!(
+            tiny_actual,
+            reference_rasterize_tracks(&state, 100_000, 100_017)
+        );
+    }
+
+    #[test]
+    fn raster_gate_changes_apply_before_exact_boundary_triggers() {
+        let mut state = SharedState::default();
+        assert!(state.set_desired_beats(0, 1));
+        state.track_timeline = TrackTimeline::from_changes(&[
+            TrackChange {
+                frame: SAMPLE_RATE,
+                gate_mask: BEAT_PAD_MASK & !1,
+            },
+            TrackChange {
+                frame: SAMPLE_RATE * 2,
+                gate_mask: BEAT_PAD_MASK,
+            },
+        ])
+        .unwrap();
+
+        let mut raster = TrackRaster::<3>::empty();
+        state.rasterize_tracks(0, SAMPLE_RATE * 3, &mut raster);
+        assert_eq!(raster.projected_masks.map(|mask| mask & 1), [0, 1, 1]);
+        assert_eq!(raster.enabled_masks.map(|mask| mask & 1), [0, 0, 1]);
+        assert_eq!(raster.active_masks.map(|mask| mask & 1), [1, 0, 1]);
+
+        // Several same-row toggles exercise both directions of the gate
+        // sweep. Coalescing disabled and enabled hits gives the latter visual
+        // priority.
+        state.track_timeline = TrackTimeline::from_changes(&[
+            TrackChange {
+                frame: SAMPLE_RATE,
+                gate_mask: BEAT_PAD_MASK & !1,
+            },
+            TrackChange {
+                frame: SAMPLE_RATE * 2,
+                gate_mask: BEAT_PAD_MASK,
+            },
+            TrackChange {
+                frame: SAMPLE_RATE * 3,
+                gate_mask: BEAT_PAD_MASK & !1,
+            },
+            TrackChange {
+                frame: SAMPLE_RATE * 4,
+                gate_mask: BEAT_PAD_MASK,
+            },
+        ])
+        .unwrap();
+        let mut dense = TrackRaster::<1>::empty();
+        state.rasterize_tracks(SAMPLE_RATE, SAMPLE_RATE * 5, &mut dense);
+        assert_eq!(dense.projected_masks[0] & 1, 1);
+        assert_eq!(dense.enabled_masks[0] & 1, 1);
+        assert_eq!(dense.active_masks[0] & 1, 1);
+        assert_eq!(
+            dense,
+            reference_rasterize_tracks(&state, SAMPLE_RATE, SAMPLE_RATE * 5)
+        );
+    }
+
+    #[test]
+    fn projected_trigger_navigation_and_raster_follow_pattern_and_track_gates() {
+        let mut state = SharedState::default();
+        assert!(state.set_desired_beats(0, 1));
+        assert_eq!(state.next_projected_trigger_frame(0, true), Some(22_050));
+        assert_eq!(
+            state.previous_projected_trigger_frame(22_050, true),
+            Some(22_050)
+        );
+        assert_eq!(state.previous_projected_trigger_frame(22_050, false), None);
+
+        assert_eq!(state.paint_track_span(1, 22_050, 44_100), Ok(true));
+        let mut raster = TrackRaster::<4>::empty();
+        state.rasterize_tracks(0, 44_100, &mut raster);
+        assert_ne!(raster.projected_masks.iter().fold(0, |a, b| a | b) & 1, 0);
+        assert_eq!(raster.enabled_masks.iter().fold(0, |a, b| a | b) & 1, 0);
+        assert_ne!(raster.active_masks[0] & 1, 0);
+        assert_eq!(raster.active_masks[3] & 1, 0);
+    }
+
+    #[test]
+    fn track_marker_rows_match_raster_bucket_boundaries() {
+        const ROWS: usize = 43;
+        let view_start = 1_000;
+        let view_end = 1_100;
+        let duration = u64::from(view_end - view_start);
+
+        for row in 0..ROWS {
+            let row_start = view_start + (duration * row as u64 / ROWS as u64) as u32;
+            let row_end = view_start + (duration * (row + 1) as u64 / ROWS as u64) as u32;
+            for frame in row_start..row_end {
+                assert_eq!(
+                    track_raster_row_for_frame::<ROWS>(view_start, view_end, frame),
+                    Some(row)
+                );
+            }
+        }
+        assert_eq!(
+            track_raster_row_for_frame::<ROWS>(view_start, view_end, view_end),
+            Some(ROWS - 1)
+        );
+        assert_eq!(track_raster_row_for_frame::<0>(0, 1, 0), None);
     }
 
     #[test]
@@ -8722,8 +11045,9 @@ mod tests {
             RootMode::ALL,
             [
                 RootMode::Beats,
-                RootMode::CycleLength,
+                RootMode::SongSettings,
                 RootMode::Pattern,
+                RootMode::Tracks,
                 RootMode::Sample,
                 RootMode::Light,
                 RootMode::Save,
@@ -8822,7 +11146,7 @@ mod tests {
     }
 
     #[test]
-    fn beats_and_cycle_length_have_independent_top_level_routes() {
+    fn beats_and_song_settings_have_independent_top_level_routes() {
         let mut ui = UiController::new();
         ui.enter_root_mode();
         assert_eq!(ui.page(), UiPage::Beats);
@@ -8846,9 +11170,20 @@ mod tests {
 
         ui.return_to_root(0, false);
         assert_eq!(ui.page(), UiPage::Root);
-        ui.rotate_root(RootMode::CycleLength.index() as i32);
+        ui.rotate_root(RootMode::SongSettings.index() as i32);
         ui.enter_root_mode();
-        assert_eq!(ui.page(), UiPage::CycleLength);
+        assert_eq!(ui.page(), UiPage::SongSettings);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::SongSettings);
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::SongSettingsMenu {
+                selected: SongSettingsItem::SongLength,
+            }
+        );
+        ui.rotate_song_settings(1);
+        assert_eq!(ui.song_settings_item(), SongSettingsItem::CycleLength);
+        assert_eq!(ui.press_encoder(None), None);
+        assert_eq!(ui.song_settings_view(), SongSettingsView::CycleLengthEditor);
         assert_eq!(
             ui.encoder_target(false),
             UiEncoderTarget::CycleGroup(pad_two)
@@ -8862,12 +11197,14 @@ mod tests {
             UiEncoderTarget::Volume(VolumeTarget::Pad(2))
         );
         assert_eq!(ui.press_encoder(None), None);
-        assert_eq!(ui.page(), UiPage::CycleLength);
+        assert_eq!(ui.page(), UiPage::SongSettings);
+        assert_eq!(ui.song_settings_view(), SongSettingsView::Menu);
 
         ui.return_to_root(0, false);
         assert_eq!(ui.page(), UiPage::Root);
         assert_eq!(ui.selected_pad(), Some(2));
         ui.enter_root_mode();
+        ui.press_encoder(None);
         assert!(ui.press_voice(4));
         assert_eq!(ui.selected_pad(), Some(4));
         let pad_four = VoiceGroup::new(1 << 4, 4).unwrap();
@@ -8882,6 +11219,273 @@ mod tests {
         assert!(ui.press_voice(4));
         assert_eq!(ui.encoder_target(false), UiEncoderTarget::CycleGlobal);
         assert_eq!(ui.display_model(false), UiDisplayModel::CycleGlobal);
+    }
+
+    #[test]
+    fn track_zoom_levels_are_exact_clamped_and_whole_song_uses_live_length() {
+        assert_eq!(TrackZoom::ALL.len(), 16);
+        assert_eq!(TrackZoom::default(), TrackZoom::Seconds10);
+        assert_eq!(TrackZoom::Milliseconds50.duration_frames(123), 1_102);
+        assert_eq!(TrackZoom::Seconds10.duration_frames(123), SAMPLE_RATE * 10);
+        assert_eq!(
+            TrackZoom::Minutes20.duration_frames(123),
+            SAMPLE_RATE * 1_200
+        );
+        assert_eq!(TrackZoom::WholeSong.duration_frames(123), 123);
+        assert_eq!(
+            TrackZoom::Milliseconds50.adjusted(100),
+            TrackZoom::Milliseconds50
+        );
+        assert_eq!(TrackZoom::WholeSong.adjusted(-100), TrackZoom::WholeSong);
+        assert_eq!(TrackZoom::Seconds10.adjusted(1), TrackZoom::Seconds5);
+        assert_eq!(TrackZoom::Seconds10.adjusted(-1), TrackZoom::Seconds30);
+    }
+
+    #[test]
+    fn tracks_routes_cursor_zoom_and_end_behavior_without_changing_selection() {
+        let mut ui = UiController::new();
+        assert!(ui.press_voice(4));
+        let selection = ui.selection();
+        ui.rotate_root(RootMode::Tracks.index() as i32);
+        ui.enter_root_mode();
+        assert_eq!(ui.page(), UiPage::Tracks);
+        assert_eq!(
+            ui.encoder_target(false),
+            UiEncoderTarget::Volume(VolumeTarget::Global)
+        );
+        assert!(!ui.press_voice_edges(1 << 2, 1 << 2));
+        assert_eq!(ui.selection(), selection);
+
+        ui.set_track_transport_status(TrackTransportStatus {
+            state: TransportState::Paused,
+            position_frames: 44_100,
+        });
+        assert_eq!(ui.tracks_cursor_frame(), 44_100);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::TrackCursor);
+        assert_eq!(
+            ui.rotate_tracks_cursor(1),
+            Some(UiAction::Track(TrackUiAction::MoveCursor {
+                from_frame: 44_100,
+                direction: TrackCursorDirection::Next,
+            }))
+        );
+        ui.set_tracks_cursor_frame(55_125);
+        assert_eq!(ui.tracks_cursor_frame(), 55_125);
+
+        assert!(ui.begin_tracks_encoder_gesture());
+        assert_eq!(
+            ui.encoder_target_with_button(false, true),
+            UiEncoderTarget::TrackZoom
+        );
+        assert!(ui.rotate_tracks_zoom(1));
+        assert_eq!(ui.tracks_zoom(), TrackZoom::Seconds5);
+        assert!(!ui.end_tracks_encoder_gesture());
+        assert!(matches!(
+            ui.display_model(false),
+            UiDisplayModel::Tracks { .. }
+        ));
+
+        assert!(ui.begin_tracks_encoder_gesture());
+        assert!(ui.end_tracks_encoder_gesture());
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::TrackEndBehavior {
+                selected: EndBehavior::Loop,
+            }
+        );
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::TrackEndBehavior);
+        assert_eq!(
+            ui.rotate_tracks_end_behavior(1),
+            Some(UiAction::Track(TrackUiAction::SetEndBehavior(
+                EndBehavior::Stop
+            )))
+        );
+        assert!(ui.begin_tracks_encoder_gesture());
+        assert!(matches!(
+            ui.display_model(false),
+            UiDisplayModel::Tracks { .. }
+        ));
+        assert_eq!(ui.tracks_end_behavior(), EndBehavior::Stop);
+
+        assert_eq!(
+            ui.return_to_root(0, false),
+            Some(UiAction::Track(TrackUiAction::SetAuditionMask { mask: 0 }))
+        );
+        assert_eq!(ui.page(), UiPage::Root);
+        assert_eq!(ui.selection(), selection);
+    }
+
+    #[test]
+    fn paused_track_voice_chords_paint_atomically_and_taps_use_next_boundary() {
+        let mut ui = UiController::new();
+        ui.rotate_root(RootMode::Tracks.index() as i32);
+        ui.enter_root_mode();
+        ui.set_track_transport_status(TrackTransportStatus {
+            state: TransportState::Paused,
+            position_frames: 100,
+        });
+
+        let voices = (1 << 1) | (1 << 6);
+        assert_eq!(ui.update_tracks_voice_keys(voices, 0, voices, 200), None);
+        assert_eq!(
+            ui.tracks_paint_preview(),
+            Some(TrackPaintPreview {
+                voice_mask: voices,
+                anchor_frame: 100,
+                other_frame: 100,
+            })
+        );
+        assert_eq!(
+            ui.rotate_tracks_cursor(-1),
+            Some(UiAction::Track(TrackUiAction::MoveCursor {
+                from_frame: 100,
+                direction: TrackCursorDirection::Previous,
+            }))
+        );
+        ui.set_tracks_cursor_frame(40);
+        assert_eq!(ui.update_tracks_voice_keys(0, 1 << 1, 1 << 6, 200), None);
+        assert_eq!(
+            ui.update_tracks_voice_keys(0, 1 << 6, 0, 200),
+            Some(UiAction::Track(TrackUiAction::PaintSpan {
+                voice_mask: voices,
+                anchor_frame: 100,
+                other_frame: 40,
+            }))
+        );
+        assert_eq!(ui.tracks_paint_preview(), None);
+
+        assert_eq!(ui.update_tracks_voice_keys(1 << 3, 0, 1 << 3, 75), None);
+        assert_eq!(
+            ui.update_tracks_voice_keys(0, 1 << 3, 0, 75),
+            Some(UiAction::Track(TrackUiAction::PaintSpan {
+                voice_mask: 1 << 3,
+                anchor_frame: 40,
+                other_frame: 75,
+            }))
+        );
+        assert_eq!(ui.tracks_cursor_frame(), 75);
+
+        ui.set_tracks_notice(Some(TrackNotice::Full));
+        assert!(matches!(
+            ui.display_model(false),
+            UiDisplayModel::Tracks {
+                notice: Some(TrackNotice::Full),
+                ..
+            }
+        ));
+        assert_eq!(ui.update_tracks_voice_keys(0, 0, 0, 200), None);
+        assert_eq!(ui.tracks_notice(), Some(TrackNotice::Full));
+    }
+
+    #[test]
+    fn track_end_behavior_overlay_cannot_leak_a_paused_paint_gesture() {
+        let mut ui = UiController::new();
+        ui.rotate_root(RootMode::Tracks.index() as i32);
+        ui.enter_root_mode();
+        ui.set_track_transport_status(TrackTransportStatus {
+            state: TransportState::Paused,
+            position_frames: 100,
+        });
+
+        assert!(ui.begin_tracks_encoder_gesture());
+        assert!(ui.end_tracks_encoder_gesture());
+        assert_eq!(ui.update_tracks_voice_keys(1, 0, 1, 200), None);
+        assert_eq!(ui.tracks_paint_preview(), None);
+        assert_eq!(ui.return_to_root(1, false), None);
+        assert_eq!(ui.update_tracks_voice_keys(0, 1, 0, 200), None);
+        assert_eq!(ui.tracks_paint_preview(), None);
+    }
+
+    #[test]
+    fn playing_track_keys_are_live_audition_and_mute_controls_transport() {
+        let mut ui = UiController::new();
+        ui.rotate_root(RootMode::Tracks.index() as i32);
+        ui.enter_root_mode();
+        let first = (1 << 0) | (1 << 5);
+        assert_eq!(
+            ui.update_tracks_voice_keys(first, 0, first, 0),
+            Some(UiAction::Track(TrackUiAction::SetAuditionMask {
+                mask: first,
+            }))
+        );
+        assert_eq!(ui.tracks_live_audition_mask(), first);
+        assert_eq!(
+            ui.update_tracks_voice_keys(0, 1 << 0, 1 << 5, 0),
+            Some(UiAction::Track(TrackUiAction::SetAuditionMask {
+                mask: 1 << 5,
+            }))
+        );
+        assert_eq!(
+            ui.press_tracks_transport(first),
+            Some(UiAction::Track(TrackUiAction::Pause))
+        );
+        assert_eq!(ui.tracks_live_audition_mask(), 0);
+
+        ui.set_track_transport_status(TrackTransportStatus {
+            state: TransportState::Paused,
+            position_frames: 777,
+        });
+        assert_eq!(
+            ui.press_tracks_transport(1 << 5),
+            Some(UiAction::Track(TrackUiAction::PlayFrom {
+                frame: 777,
+                audition_mask: 1 << 5,
+            }))
+        );
+        assert_eq!(ui.tracks_live_audition_mask(), 1 << 5);
+        ui.set_track_transport_status(TrackTransportStatus {
+            state: TransportState::Stopped,
+            position_frames: 9_999,
+        });
+        ui.set_tracks_cursor_frame(9_999);
+        assert_eq!(
+            ui.press_tracks_transport(0),
+            Some(UiAction::Track(TrackUiAction::PlayFrom {
+                frame: 9_999,
+                audition_mask: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn song_settings_editors_close_before_returning_to_root() {
+        let mut ui = UiController::new();
+        ui.rotate_root(RootMode::SongSettings.index() as i32);
+        ui.enter_root_mode();
+        assert_eq!(
+            ui.display_model(false),
+            UiDisplayModel::SongSettingsMenu {
+                selected: SongSettingsItem::SongLength,
+            }
+        );
+        ui.press_encoder(None);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::SongLength);
+        assert_eq!(ui.display_model(false), UiDisplayModel::SongLength);
+        assert_eq!(ui.return_to_root(0, false), None);
+        assert_eq!(ui.page(), UiPage::SongSettings);
+        assert_eq!(ui.song_settings_view(), SongSettingsView::Menu);
+        assert_eq!(ui.return_to_root(0, false), None);
+        assert_eq!(ui.page(), UiPage::Root);
+    }
+
+    #[test]
+    fn cycle_group_warning_is_scoped_to_the_song_settings_cycle_editor() {
+        let mut ui = UiController::new();
+        assert!(ui.press_voice_chord((1 << 2) | (1 << 7)));
+        let group = ui.selected_group().unwrap();
+        let edit = GroupEdit::CycleLength { group, value: 0 };
+        ui.rotate_root(RootMode::SongSettings.index() as i32);
+        ui.enter_root_mode();
+        assert!(!ui.open_group_warning(edit));
+        ui.rotate_song_settings(1);
+        ui.press_encoder(None);
+        assert_eq!(ui.encoder_target(false), UiEncoderTarget::CycleGroup(group));
+        assert!(ui.open_group_warning(edit));
+        assert_eq!(
+            ui.press_encoder(None),
+            Some(UiAction::SynchronizeGroup(edit))
+        );
+        assert_eq!(ui.song_settings_view(), SongSettingsView::CycleLengthEditor);
     }
 
     #[test]
@@ -8953,8 +11557,10 @@ mod tests {
         );
 
         ui.return_to_root(0, false);
-        ui.rotate_root(RootMode::CycleLength.index() as i32);
+        ui.rotate_root(RootMode::SongSettings.index() as i32);
         ui.enter_root_mode();
+        ui.rotate_song_settings(1);
+        ui.press_encoder(None);
         assert_eq!(
             ui.display_model(false),
             UiDisplayModel::CycleGroup {
@@ -8966,7 +11572,8 @@ mod tests {
         ui.press_voice(4);
 
         ui.return_to_root(0, false);
-        ui.rotate_root(RootMode::Sample.index() as i32 - RootMode::CycleLength.index() as i32);
+        ui.return_to_root(0, false);
+        ui.rotate_root(RootMode::Sample.index() as i32 - RootMode::SongSettings.index() as i32);
         ui.enter_root_mode();
         assert_eq!(
             ui.display_model(false),
@@ -9886,8 +12493,192 @@ mod tests {
     }
 
     #[test]
+    fn track_timeline_is_canonical_and_same_frame_changes_are_inclusive() {
+        let disabled = BEAT_PAD_MASK & !(1 << 2);
+        let timeline = TrackTimeline::from_changes(&[
+            TrackChange {
+                frame: 10,
+                gate_mask: disabled,
+            },
+            TrackChange {
+                frame: 20,
+                gate_mask: BEAT_PAD_MASK,
+            },
+        ])
+        .unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline.gate_mask_at(9), BEAT_PAD_MASK);
+        assert_eq!(timeline.gate_mask_at(10), disabled);
+        assert_eq!(timeline.pad_enabled_at(2, 19), Some(false));
+        assert_eq!(timeline.pad_enabled_at(2, 20), Some(true));
+        assert_eq!(timeline.pad_enabled_at(BEAT_PAD_COUNT, 20), None);
+        assert_eq!(
+            timeline.iter_changes().collect::<std::vec::Vec<_>>(),
+            std::vec![
+                TrackChange {
+                    frame: 10,
+                    gate_mask: disabled,
+                },
+                TrackChange {
+                    frame: 20,
+                    gate_mask: BEAT_PAD_MASK,
+                },
+            ]
+        );
+
+        assert_eq!(
+            TrackTimeline::from_changes(&[TrackChange {
+                frame: 1,
+                gate_mask: BEAT_PAD_MASK,
+            }]),
+            Err(TrackTimelineValidationError::RedundantMask {
+                index: 0,
+                gate_mask: BEAT_PAD_MASK,
+            })
+        );
+        assert!(matches!(
+            TrackTimeline::from_changes(&[
+                TrackChange {
+                    frame: 2,
+                    gate_mask: disabled,
+                },
+                TrackChange {
+                    frame: 2,
+                    gate_mask: BEAT_PAD_MASK,
+                },
+            ]),
+            Err(TrackTimelineValidationError::FramesNotIncreasing { .. })
+        ));
+        assert!(matches!(
+            TrackTimeline::from_changes(&[TrackChange {
+                frame: 0,
+                gate_mask: BEAT_PAD_MASK | (1 << BEAT_PAD_COUNT),
+            }]),
+            Err(TrackTimelineValidationError::GateMaskOutOfRange { .. })
+        ));
+        assert!(matches!(
+            TrackTimeline::from_changes(&[TrackChange {
+                frame: MAX_SONG_LENGTH_FRAMES + 1,
+                gate_mask: disabled,
+            }]),
+            Err(TrackTimelineValidationError::FrameOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn track_span_painting_preserves_other_voices_and_outside_state() {
+        let mut timeline = TrackTimeline::default();
+        assert_eq!(timeline.paint_opposite(1 << 0, 10, 20), Ok(true));
+        assert_eq!(timeline.gate_mask_at(9), BEAT_PAD_MASK);
+        assert_eq!(timeline.gate_mask_at(10) & 1, 0);
+        assert_eq!(timeline.gate_mask_at(19) & 1, 0);
+        assert_eq!(timeline.gate_mask_at(20), BEAT_PAD_MASK);
+        let unchanged = timeline;
+        assert_eq!(timeline.paint_opposite(1, 20, 10), Ok(false));
+        assert_eq!(timeline, unchanged);
+
+        // Reverse painting derives the constant target from the actual anchor
+        // at frame 30 while preserving voice zero's earlier region.
+        assert_eq!(timeline.paint_opposite(1 << 1, 30, 15), Ok(true));
+        assert_eq!(timeline.gate_mask_at(14) & (1 << 1), 1 << 1);
+        assert_eq!(timeline.gate_mask_at(15) & (1 << 1), 0);
+        assert_eq!(timeline.gate_mask_at(29) & (1 << 1), 0);
+        assert_eq!(timeline.gate_mask_at(30) & (1 << 1), 1 << 1);
+        assert_eq!(timeline.gate_mask_at(15) & 1, 0);
+        assert_eq!(timeline.gate_mask_at(20) & 1, 1);
+
+        let before = timeline;
+        assert_eq!(
+            timeline.paint_opposite(0, 10, 20),
+            Err(TrackTimelineEditError::InvalidVoiceMask)
+        );
+        assert_eq!(
+            timeline.paint_opposite(1, 10, 10),
+            Err(TrackTimelineEditError::InvalidRange)
+        );
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn precomputed_track_commit_is_revision_checked_and_dirty_once() {
+        let mut state = SharedState::default();
+        let revision = state.track_revision;
+        let song_revision = state.song_revision;
+        let mut candidate = *state.track_timeline();
+        assert_eq!(candidate.paint_opposite(1, 10, 20), Ok(true));
+
+        assert!(state.commit_track_timeline_if_revision(revision, candidate));
+        assert_eq!(state.track_revision, revision.wrapping_add(1));
+        assert_eq!(state.song_revision, song_revision.wrapping_add(1));
+
+        let current = *state.track_timeline();
+        assert!(!state.commit_track_timeline_if_revision(revision, TrackTimeline::all_enabled()));
+        assert_eq!(*state.track_timeline(), current);
+        assert!(state.commit_track_timeline_if_revision(state.track_revision, current));
+        assert_eq!(state.song_revision, song_revision.wrapping_add(1));
+    }
+
+    #[test]
+    fn track_span_capacity_failure_is_atomic() {
+        let mut changes = [TrackChange {
+            frame: 0,
+            gate_mask: 0,
+        }; TRACK_CHANGE_CAPACITY];
+        for (index, change) in changes.iter_mut().enumerate() {
+            *change = TrackChange {
+                frame: index as u32 + 1,
+                gate_mask: if index % 2 == 0 {
+                    BEAT_PAD_MASK & !1
+                } else {
+                    BEAT_PAD_MASK
+                },
+            };
+        }
+        let mut timeline = TrackTimeline::from_changes(&changes).unwrap();
+        let before = timeline;
+        assert_eq!(
+            timeline.paint_opposite(1 << 1, MAX_SONG_LENGTH_FRAMES - 1, MAX_SONG_LENGTH_FRAMES,),
+            Err(TrackTimelineEditError::CapacityExceeded)
+        );
+        assert_eq!(timeline, before);
+    }
+
+    #[test]
+    fn track_timeline_codec_is_sparse_packed_and_rejects_reserved_bits() {
+        let mut changes = [TrackChange {
+            frame: 0,
+            gate_mask: 0,
+        }; TRACK_CHANGE_CAPACITY];
+        for (index, change) in changes.iter_mut().enumerate() {
+            *change = TrackChange {
+                frame: index as u32 + 1,
+                gate_mask: if index % 2 == 0 {
+                    BEAT_PAD_MASK & !1
+                } else {
+                    BEAT_PAD_MASK
+                },
+            };
+        }
+        let timeline = TrackTimeline::from_changes(&changes).unwrap();
+        let mut packed = [0_u8; TRACK_CHANGE_CAPACITY * 5 + 2];
+        let encoded = postcard::to_slice(&timeline, &mut packed).unwrap();
+        assert_eq!(encoded.len(), TRACK_CHANGE_CAPACITY * 5 + 2);
+        assert_eq!(postcard::from_bytes::<TrackTimeline>(encoded), Ok(timeline));
+
+        let last = encoded.len() - 1;
+        packed[last] |= 0x80;
+        assert!(postcard::from_bytes::<TrackTimeline>(&packed[..=last]).is_err());
+    }
+
+    #[test]
     fn versioned_song_codec_round_trips_every_persistent_control() {
         let mut source = SharedState::default();
+        assert!(source.set_song_length_seconds(321));
+        assert_eq!(source.paint_track_span(1 << 3, 123, 4_567), Ok(true));
+        assert_eq!(
+            source.paint_track_span((1 << 1) | (1 << 7), 8_000, 6_000),
+            Ok(true)
+        );
         assert!(source.set_base_interval_ms(71_073));
         assert!(source.set_desired_beats(3, MAX_BEAT_MULTIPLIER));
         assert!(source.set_desired_beats(4, 3));
@@ -9913,9 +12704,9 @@ mod tests {
             tapped: true,
         }));
 
-        let song = StoredSongV3::snapshot(&source);
+        let song = StoredSongV4::snapshot(&source);
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
-        let encoded = encode_song_v3(&song, &mut bytes).unwrap();
+        let encoded = encode_song_v4(&song, &mut bytes).unwrap();
         assert_eq!(&encoded[..4], &SONG_FORMAT_MAGIC);
         assert_eq!(
             u16::from_le_bytes([encoded[4], encoded[5]]),
@@ -9931,9 +12722,15 @@ mod tests {
             underrun_count: 12,
             audio_load_transition_count: 34,
             pattern_revision: 56,
+            track_revision: 67,
             song_revision: 78,
             ..SharedState::default()
         };
+        destination.set_end_behavior(EndBehavior::Stop);
+        destination.publish_track_transport_status(TrackTransportStatus {
+            state: TransportState::Paused,
+            position_frames: 12_345,
+        });
         assert_eq!(
             destination.queue_preview(PreviewRequest::new(1, sample(4)).unwrap()),
             None
@@ -9942,13 +12739,19 @@ mod tests {
 
         decoded.apply_to(&mut destination).unwrap();
 
-        assert_eq!(StoredSongV3::snapshot(&destination), song);
+        assert_eq!(StoredSongV4::snapshot(&destination), song);
         assert_eq!(destination.led_brightness_percent, 17);
         assert_eq!(destination.playback_frame, 9_876_543);
         assert_eq!(destination.underrun_count, 12);
         assert_eq!(destination.audio_load_transition_count, 34);
         assert_eq!(destination.pattern_revision, 57);
+        assert_eq!(destination.track_revision, 68);
         assert_eq!(destination.song_revision, 79);
+        assert_eq!(destination.end_behavior(), EndBehavior::Stop);
+        assert_eq!(
+            destination.track_transport_status(),
+            TrackTransportStatus::playing_from_start()
+        );
         assert_eq!(destination.take_preview(), None);
         assert_eq!(destination.take_pattern_dirty_mask(), BEAT_PAD_MASK);
         assert!(destination.take_release_all_request());
@@ -9991,6 +12794,7 @@ mod tests {
 
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
         let encoded = encode_song_v3(&StoredSongV3::default(), &mut bytes).unwrap();
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), SONG_FORMAT_V3);
         assert_eq!(
             (encoded.len(), fnv1a64(encoded)),
             (SONG_V3_DEFAULT_ENCODED_LEN, EXPECTED_FNV1A64)
@@ -9998,6 +12802,21 @@ mod tests {
         assert_eq!(
             usize::from(u16::from_le_bytes([encoded[6], encoded[7]])),
             SONG_V3_DEFAULT_ENCODED_LEN - SONG_FORMAT_HEADER_LEN
+        );
+    }
+
+    #[test]
+    fn default_song_v4_encoding_is_sparse() {
+        let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
+        let encoded = encode_song_v4(&StoredSongV4::default(), &mut bytes).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([encoded[4], encoded[5]]),
+            SONG_FORMAT_VERSION
+        );
+        assert_eq!(encoded.len(), SONG_V4_DEFAULT_ENCODED_LEN);
+        assert_eq!(
+            usize::from(u16::from_le_bytes([encoded[6], encoded[7]])),
+            SONG_V4_DEFAULT_ENCODED_LEN - SONG_FORMAT_HEADER_LEN
         );
     }
 
@@ -10097,13 +12916,22 @@ mod tests {
         assert_eq!(StoredSongV3::snapshot(&state), before);
         assert_eq!(state.song_revision, revision);
         assert_eq!(state.led_brightness_percent, 91);
+
+        let invalid_length = StoredSongV4 {
+            song_length_seconds: 0,
+            ..StoredSongV4::default()
+        };
+        assert_eq!(
+            invalid_length.validate(),
+            Err(SongValidationError::SongLengthOutOfRange { value: 0 })
+        );
     }
 
     #[test]
     fn song_decoder_distinguishes_versions_corruption_and_semantic_errors() {
-        let song = StoredSongV3::default();
+        let song = StoredSongV4::default();
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
-        let encoded_len = encode_song_v3(&song, &mut bytes).unwrap().len();
+        let encoded_len = encode_song_v4(&song, &mut bytes).unwrap().len();
 
         for unsupported in [0_u16, 1_u16, SONG_FORMAT_VERSION + 1] {
             let mut versioned = bytes;
@@ -10162,7 +12990,7 @@ mod tests {
             Err(SongDecodeError::InvalidPayload)
         );
 
-        let mut invalid_song = StoredSongV3::default();
+        let mut invalid_song = StoredSongV4::default();
         invalid_song.pads[7].sample_id = SAMPLE_COUNT as u8;
         let mut semantic = [0_u8; SONG_ENCODED_MAX_LEN];
         let payload_len =
@@ -10191,7 +13019,7 @@ mod tests {
         };
         legacy.pads[4].division = 3;
         legacy.pads[4].pattern_repeats = 2;
-        let expected = StoredSongV3::from(legacy.clone());
+        let expected = StoredSongV4::from(legacy.clone());
 
         let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
         let encoded = encode_song_v2(&legacy, &mut bytes).unwrap();
@@ -10204,14 +13032,28 @@ mod tests {
                 .iter()
                 .all(|pad| pad.cycle_length_override_ms.is_none())
         );
+        assert_eq!(decoded.song_length_seconds, DEFAULT_SONG_LENGTH_SECONDS);
+        assert!(decoded.track_timeline.is_empty());
+    }
+
+    #[test]
+    fn song_decoder_migrates_v3_with_default_tracks_arrangement() {
+        let mut legacy = StoredSongV3::default();
+        legacy.base_interval_ms = 8_765;
+        legacy.pads[2].cycle_length_override_ms = Some(4_321);
+        let expected = StoredSongV4::from(legacy.clone());
+        let mut bytes = [0_u8; SONG_ENCODED_MAX_LEN];
+        let encoded = encode_song_v3(&legacy, &mut bytes).unwrap();
+
+        assert_eq!(decode_song(encoded), Ok(expected));
     }
 
     #[test]
     fn song_encoder_is_bounded_and_rejects_invalid_input() {
-        let mut song = StoredSongV3 {
+        let mut song = StoredSongV4 {
             base_interval_ms: u32::MAX,
             global_mute: true,
-            ..StoredSongV3::default()
+            ..StoredSongV4::default()
         };
         for pad in &mut song.pads {
             pad.division = MAX_BEAT_MULTIPLIER;
@@ -10220,17 +13062,35 @@ mod tests {
             pad.pattern = [0x55; PATTERN_BYTES];
             pad.mute = true;
         }
+        let mut changes = [TrackChange {
+            frame: 0,
+            gate_mask: 0,
+        }; TRACK_CHANGE_CAPACITY];
+        for (index, change) in changes.iter_mut().enumerate() {
+            *change = TrackChange {
+                frame: MAX_SONG_LENGTH_FRAMES - TRACK_CHANGE_CAPACITY as u32 + index as u32,
+                gate_mask: if index % 2 == 0 {
+                    BEAT_PAD_MASK & !1
+                } else {
+                    BEAT_PAD_MASK
+                },
+            };
+        }
+        song.song_length_seconds = MAX_SONG_LENGTH_SECONDS;
+        song.track_timeline = TrackTimeline::from_changes(&changes).unwrap();
         let mut exact_budget = [0_u8; SONG_ENCODED_MAX_LEN];
-        assert!(encode_song_v3(&song, &mut exact_budget).is_ok());
+        let encoded = encode_song_v4(&song, &mut exact_budget).unwrap();
+        assert_eq!(encoded.len(), SONG_V4_MAX_ENCODED_LEN);
+        assert_eq!(decode_song(encoded), Ok(song.clone()));
         let mut tiny = [0_u8; SONG_FORMAT_HEADER_LEN];
         assert_eq!(
-            encode_song_v3(&song, &mut tiny),
+            encode_song_v4(&song, &mut tiny),
             Err(SongEncodeError::BufferTooSmall)
         );
-        let mut invalid = StoredSongV3::default();
+        let mut invalid = StoredSongV4::default();
         invalid.pads[0].volume_percent = 101;
         assert_eq!(
-            encode_song_v3(&invalid, &mut exact_budget),
+            encode_song_v4(&invalid, &mut exact_budget),
             Err(SongEncodeError::InvalidSong(
                 SongValidationError::PadVolumeOutOfRange { pad: 0, value: 101 }
             ))
@@ -10269,7 +13129,22 @@ mod tests {
             tapped: true,
         }));
         assert_eq!(state.song_revision, 6);
-        state.reset_musical_state();
+        assert!(!state.set_song_length_seconds(0));
+        assert!(state.set_song_length_seconds(DEFAULT_SONG_LENGTH_SECONDS));
+        assert_eq!(state.song_revision, 6);
+        assert!(state.set_song_length_seconds(DEFAULT_SONG_LENGTH_SECONDS + 1));
         assert_eq!(state.song_revision, 7);
+        assert_eq!(state.track_revision, 0);
+        assert_eq!(state.paint_track_span(1, 10, 20), Ok(true));
+        assert_eq!(state.song_revision, 8);
+        assert_eq!(state.track_revision, 1);
+        assert_eq!(state.paint_track_span(1, 20, 10), Ok(false));
+        assert_eq!(state.song_revision, 8);
+        assert_eq!(state.track_revision, 1);
+        state.reset_musical_state();
+        assert_eq!(state.song_revision, 9);
+        assert_eq!(state.track_revision, 2);
+        assert_eq!(state.song_length_seconds(), DEFAULT_SONG_LENGTH_SECONDS);
+        assert!(state.track_timeline().is_empty());
     }
 }

@@ -39,24 +39,28 @@ use embassy_time::{Delay, Duration, Instant, Timer, with_deadline};
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_6X10};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle, Triangle};
+use embedded_graphics::primitives::{
+    Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, Triangle,
+};
 use embedded_graphics::text::{Baseline, Text};
 use fixed::types::U24F8;
 use heapless::String;
 use looptic::load_control::{AudioLoadController, LoadLevel, RenderPolicy};
 use looptic::{
-    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, GroupEdit, GroupEditParameter, KEY_COUNT, KeyDebouncer,
-    MUTE_KEY_INDEX, MuteButtonState, MuteScanAction, MuteTarget, PatternAllChoice,
-    PatternEditorAction, PatternFillState, PatternVolumeTarget, PreviewRequest, RETURN_KEY_INDEX,
-    ResetAllChoice, RootMode, SAMPLE_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN,
+    AUDIO_BLOCK_FRAMES, BEAT_PAD_COUNT, EndBehavior, GroupEdit, GroupEditParameter, KEY_COUNT,
+    KeyDebouncer, MAX_SONG_LENGTH_SECONDS, MIN_SONG_LENGTH_SECONDS, MUTE_KEY_INDEX,
+    MuteButtonState, MuteScanAction, MuteTarget, PatternAllChoice, PatternEditorAction,
+    PatternFillState, PatternVolumeTarget, PreviewRequest, RETURN_KEY_INDEX, ResetAllChoice,
+    RootMode, SAMPLE_COUNT, SAMPLE_RATE, SILENCE_PWM_WORD, SONG_ENCODED_MAX_LEN,
     SONG_FORMAT_VERSION, Sequencer, SharedState, SongBrowserPurpose, SongConfirmChoice,
-    SongLibraryStatus, SongMenuOperation, SongSlot, SongSlotOccupancy, SongStorageOperation,
-    SongUiStatus, SongsView, StoredSongV3, UiAction, UiController, UiDisplayModel,
-    UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX, VoiceGroup, VolumeTarget,
-    adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness, adjust_pad_cycle_length,
-    adjust_sample_selection, decode_song, encode_song_v3, led_pulse_active, mute_led_color,
-    resolve_mute_scan, return_led_color, sample_assets, sample_selection_preview_request,
-    scroll_menu_window, voice_led_color, volume_led_color,
+    SongLibraryStatus, SongMenuOperation, SongSettingsItem, SongSlot, SongSlotOccupancy,
+    SongStorageOperation, SongUiStatus, SongsView, StoredSongV4, TrackCursorDirection, TrackNotice,
+    TrackPaintPreview, TrackRaster, TrackUiAction, TrackZoom, TransportState, UiAction,
+    UiController, UiDisplayModel, UiEncoderAcceleration, UiEncoderTarget, UiPage, VOLUME_KEY_INDEX,
+    VoiceGroup, VolumeTarget, adjust_base_interval, adjust_beat_multiplier, adjust_led_brightness,
+    adjust_pad_cycle_length, adjust_sample_selection, decode_song, encode_song_v4,
+    led_pulse_active, mute_led_color, resolve_mute_scan, return_led_color, sample_assets,
+    sample_selection_preview_request, scroll_menu_window, voice_led_color, volume_led_color,
 };
 use sh1106::Builder;
 use sh1106::mode::GraphicsMode;
@@ -81,6 +85,7 @@ struct UiState {
     song_library_ready: bool,
     pending_song_operation: Option<SongStorageOperation>,
     clean_song_revision: u32,
+    track_volume_feedback_until_ms: u64,
 }
 
 struct OledResources {
@@ -340,8 +345,8 @@ async fn storage_task(
                 }
 
                 pause_audio_for_storage().await;
-                let song = shared.lock(|state| StoredSongV3::snapshot(&state.borrow()));
-                let encoded_len = match encode_song_v3(&song, record_buffer) {
+                let song = shared.lock(|state| StoredSongV4::snapshot(&state.borrow()));
+                let encoded_len = match encode_song_v4(&song, record_buffer) {
                     Ok(encoded) => encoded.len(),
                     Err(_) => {
                         resume_audio_after_storage();
@@ -666,6 +671,11 @@ async fn audio_task(
         initial_mute_mask,
         initial_global_volume,
         initial_pad_volumes,
+        initial_track_timeline,
+        initial_track_revision,
+        initial_song_length_frames,
+        initial_end_behavior,
+        initial_live_audition_mask,
     ) = shared.lock(|state| {
         let state = state.borrow();
         (
@@ -677,6 +687,11 @@ async fn audio_task(
             state.effective_mute_mask(),
             state.global_volume_percent(),
             *state.pad_volume_percents(),
+            *state.track_timeline(),
+            state.track_revision,
+            state.song_length_frames(),
+            state.end_behavior(),
+            state.live_audition_mask(),
         )
     });
     sequencer.apply_timing_with_cycles(
@@ -689,9 +704,14 @@ async fn audio_task(
     sequencer.set_pad_samples(&initial_pad_samples);
     sequencer.set_mute_mask(initial_mute_mask);
     sequencer.set_volumes(initial_global_volume, &initial_pad_volumes);
+    sequencer.set_track_timeline(&initial_track_timeline);
+    sequencer.set_song_length_frames(initial_song_length_frames);
+    sequencer.set_end_behavior(initial_end_behavior);
+    sequencer.set_live_audition_mask(initial_live_audition_mask);
+    let mut applied_track_revision = initial_track_revision;
     sync_pattern_updates(shared, &mut sequencer);
     let render_started = Instant::now();
-    let report = sequencer.render(front_start, front);
+    let report = sequencer.render_song(front_start, front);
     let render_us = Instant::now()
         .saturating_duration_since(render_started)
         .as_micros();
@@ -756,12 +776,19 @@ async fn audio_task(
             global_volume,
             pad_volumes,
             release_all,
+            track_update,
+            song_length_frames,
+            end_behavior,
+            live_audition_mask,
+            transport_command,
         ) = shared.lock(|state| {
             let mut state = state.borrow_mut();
             if let Some(metrics) = pending_metrics.take() {
                 record_audio_service_metrics(&mut state, metrics);
             }
             state.playback_frame = front_start;
+            let track_update = (state.track_revision != applied_track_revision)
+                .then(|| (*state.track_timeline(), state.track_revision));
             (
                 state.desired_beats,
                 *state.pattern_repeats(),
@@ -773,14 +800,26 @@ async fn audio_task(
                 state.global_volume_percent(),
                 *state.pad_volume_percents(),
                 state.take_release_all_request(),
+                track_update,
+                state.song_length_frames(),
+                state.end_behavior(),
+                state.live_audition_mask(),
+                state.take_transport_command(),
             )
         });
+        if let Some((timeline, revision)) = track_update {
+            sequencer.set_track_timeline(&timeline);
+            applied_track_revision = revision;
+        }
+        sequencer.set_end_behavior(end_behavior);
+        sequencer.set_song_length_frames(song_length_frames);
+        sequencer.set_live_audition_mask(live_audition_mask);
         sequencer.apply_timing_with_cycles(
             &beats,
             &repeats,
             &cycle_lengths,
             base_interval,
-            back_start,
+            u64::from(sequencer.song_position_frame()),
         );
         sequencer.set_pad_samples(&pad_samples);
         sequencer.set_mute_mask(mute_mask);
@@ -791,11 +830,19 @@ async fn audio_task(
         if let Some(preview) = preview {
             let _ = sequencer.queue_preview(preview);
         }
+        if let Some(command) = transport_command {
+            apply_transport_command(&mut sequencer, command);
+        }
         sync_pattern_updates(shared, &mut sequencer);
         let render_started = Instant::now();
-        let report = sequencer.render(back_start, back);
+        let report = sequencer.render_song(back_start, back);
         let render_us = duration_us_u32(Instant::now().saturating_duration_since(render_started));
         publish_render(shared, &report, u64::from(render_us));
+        shared.lock(|state| {
+            state
+                .borrow_mut()
+                .publish_track_transport_status(sequencer.transport_status());
+        });
         let service_us = duration_us_u32(Instant::now().saturating_duration_since(service_started));
         let observation = AudioServiceObservation {
             service_us,
@@ -829,11 +876,17 @@ async fn audio_task(
             // `front` is the already-rendered block immediately following the
             // completed DMA. Let it play, render one final muted release block
             // from the contiguous sequencer state, and only then stop PIO.
+            // The independent song clock freezes during this storage-only
+            // pause even though the monotonic DMA frame keeps advancing.
+            let transport_before_storage = sequencer.transport_status();
+            if transport_before_storage.state == looptic::TransportState::Playing {
+                sequencer.pause_song();
+            }
             let normal_transfer = sm.tx().dma_push(&mut dma, front, false);
             let fade_start = front_start.wrapping_add(AUDIO_BLOCK_FRAMES as u64);
             sequencer.set_mute_mask(looptic::BEAT_PAD_MASK);
             sequencer.release_all_voices();
-            let fade_report = sequencer.render(fade_start, back);
+            let fade_report = sequencer.render_song(fade_start, back);
             publish_render(shared, &fade_report, 0);
 
             normal_transfer.await;
@@ -867,9 +920,16 @@ async fn audio_task(
                 global_volume,
                 pad_volumes,
                 release_all,
+                track_update,
+                song_length_frames,
+                end_behavior,
+                live_audition_mask,
+                transport_command,
             ) = shared.lock(|state| {
                 let mut state = state.borrow_mut();
                 state.playback_frame = front_start;
+                let track_update = (state.track_revision != applied_track_revision)
+                    .then(|| (*state.track_timeline(), state.track_revision));
                 (
                     state.desired_beats,
                     *state.pattern_repeats(),
@@ -881,14 +941,26 @@ async fn audio_task(
                     state.global_volume_percent(),
                     *state.pad_volume_percents(),
                     state.take_release_all_request(),
+                    track_update,
+                    state.song_length_frames(),
+                    state.end_behavior(),
+                    state.live_audition_mask(),
+                    state.take_transport_command(),
                 )
             });
+            if let Some((timeline, revision)) = track_update {
+                sequencer.set_track_timeline(&timeline);
+                applied_track_revision = revision;
+            }
+            sequencer.set_end_behavior(end_behavior);
+            sequencer.set_song_length_frames(song_length_frames);
+            sequencer.set_live_audition_mask(live_audition_mask);
             sequencer.apply_timing_with_cycles(
                 &beats,
                 &repeats,
                 &cycle_lengths,
                 base_interval,
-                front_start,
+                u64::from(sequencer.song_position_frame()),
             );
             sequencer.set_pad_samples(&pad_samples);
             sequencer.set_mute_mask(mute_mask);
@@ -899,9 +971,19 @@ async fn audio_task(
             if let Some(preview) = preview {
                 let _ = sequencer.queue_preview(preview);
             }
+            if let Some(command) = transport_command {
+                apply_transport_command(&mut sequencer, command);
+            } else if transport_before_storage.state == looptic::TransportState::Playing {
+                sequencer.resume_song();
+            }
             sync_pattern_updates(shared, &mut sequencer);
-            let report = sequencer.render(front_start, front);
+            let report = sequencer.render_song(front_start, front);
             publish_render(shared, &report, 0);
+            shared.lock(|state| {
+                state
+                    .borrow_mut()
+                    .publish_track_transport_status(sequencer.transport_status());
+            });
 
             sm.restart();
             sm.clear_fifos();
@@ -932,6 +1014,14 @@ fn record_audio_underrun(shared: &Shared) -> u32 {
 
 fn duration_us_u32(duration: Duration) -> u32 {
     duration.as_micros().min(u64::from(u32::MAX)) as u32
+}
+
+fn apply_transport_command(sequencer: &mut Sequencer<'_>, command: looptic::TransportCommand) {
+    match command {
+        looptic::TransportCommand::Pause => sequencer.pause_song(),
+        looptic::TransportCommand::Resume => sequencer.resume_song(),
+        looptic::TransportCommand::PlayFrom { frame } => sequencer.play_song_from(frame),
+    }
 }
 
 fn record_audio_service_metrics(state: &mut SharedState, metrics: AudioServiceMetrics) {
@@ -1070,6 +1160,87 @@ fn queue_primary_sample_preview(shared: &Shared, edit: GroupEdit) {
     }
 }
 
+fn apply_track_ui_action(shared: &Shared, controller: &mut UiController, action: TrackUiAction) {
+    match action {
+        TrackUiAction::MoveCursor {
+            from_frame,
+            direction,
+        } => {
+            let projection = shared.lock(|state| *state.borrow());
+            let frame = match direction {
+                TrackCursorDirection::Previous => projection
+                    .previous_projected_trigger_frame(from_frame, false)
+                    .unwrap_or(0),
+                TrackCursorDirection::Next => projection
+                    .next_projected_trigger_frame(from_frame, false)
+                    .unwrap_or_else(|| projection.song_length_frames()),
+            };
+            controller.set_tracks_cursor_frame(frame);
+        }
+        TrackUiAction::PaintSpan {
+            voice_mask,
+            anchor_frame,
+            other_frame,
+        } => {
+            let (mut candidate, expected_revision) = shared.lock(|state| {
+                let state = state.borrow();
+                (*state.track_timeline(), state.track_revision)
+            });
+            let result = candidate.paint_opposite(voice_mask, anchor_frame, other_frame);
+            let result = match result {
+                Ok(false) => Ok(false),
+                Ok(true) => {
+                    let committed = shared.lock(|state| {
+                        state
+                            .borrow_mut()
+                            .commit_track_timeline_if_revision(expected_revision, candidate)
+                    });
+                    // Both calls are synchronous on the controls task, while
+                    // audio never mutates arrangement state. A mismatch can
+                    // therefore only come from a future concurrent editor;
+                    // leave the current value intact if one is introduced.
+                    Ok(committed)
+                }
+                Err(error) => Err(error),
+            };
+            controller.set_tracks_notice(match result {
+                Ok(_) => None,
+                Err(looptic::TrackTimelineEditError::CapacityExceeded) => Some(TrackNotice::Full),
+                Err(
+                    looptic::TrackTimelineEditError::InvalidVoiceMask
+                    | looptic::TrackTimelineEditError::InvalidRange,
+                ) => None,
+            });
+        }
+        TrackUiAction::SetAuditionMask { mask } => shared.lock(|state| {
+            state.borrow_mut().set_live_audition_mask(mask);
+        }),
+        TrackUiAction::PlayFrom {
+            frame,
+            audition_mask,
+        } => shared.lock(|state| {
+            let mut state = state.borrow_mut();
+            state.set_live_audition_mask(audition_mask);
+            let status = state.track_transport_status();
+            let command =
+                if status.state == TransportState::Paused && status.position_frames == frame {
+                    looptic::TransportCommand::Resume
+                } else {
+                    looptic::TransportCommand::PlayFrom { frame }
+                };
+            state.request_transport(command);
+        }),
+        TrackUiAction::Pause => shared.lock(|state| {
+            state
+                .borrow_mut()
+                .request_transport(looptic::TransportCommand::Pause);
+        }),
+        TrackUiAction::SetEndBehavior(behavior) => shared.lock(|state| {
+            state.borrow_mut().set_end_behavior(behavior);
+        }),
+    }
+}
+
 #[embassy_executor::task]
 async fn controls_task(
     mut keys: [Input<'static>; KEY_COUNT],
@@ -1096,7 +1267,8 @@ async fn controls_task(
                 && !controller.encoder_suppressed()
             {
                 let encoder_button_held = encoder_button.is_low();
-                let target = controller.encoder_target(ui_state.volume_pressed);
+                let target = controller
+                    .encoder_target_with_button(ui_state.volume_pressed, encoder_button_held);
                 let direction_delta = match direction {
                     Direction::Clockwise => 1,
                     Direction::CounterClockwise => -1,
@@ -1108,6 +1280,11 @@ async fn controls_task(
                         | UiEncoderTarget::PatternRepeat(_)
                         | UiEncoderTarget::PatternAll(_)
                         | UiEncoderTarget::PatternNone
+                        | UiEncoderTarget::SongSettings
+                        | UiEncoderTarget::SongLength
+                        | UiEncoderTarget::TrackCursor
+                        | UiEncoderTarget::TrackZoom
+                        | UiEncoderTarget::TrackEndBehavior
                         | UiEncoderTarget::SampleNone
                         | UiEncoderTarget::SampleGroup(_)
                         | UiEncoderTarget::SongStatus
@@ -1150,6 +1327,45 @@ async fn controls_task(
                         let _ = state.set_pattern_repeat(pad, adjusted);
                     }),
                     UiEncoderTarget::PatternNone => {}
+                    UiEncoderTarget::SongSettings => ui.lock(|state| {
+                        state.borrow_mut().controller.rotate_song_settings(delta);
+                    }),
+                    UiEncoderTarget::SongLength => shared.lock(|state| {
+                        let mut state = state.borrow_mut();
+                        let adjusted = i32::from(state.song_length_seconds())
+                            .saturating_add(delta)
+                            .clamp(
+                                i32::from(MIN_SONG_LENGTH_SECONDS),
+                                i32::from(MAX_SONG_LENGTH_SECONDS),
+                            ) as u16;
+                        let _ = state.set_song_length_seconds(adjusted);
+                    }),
+                    UiEncoderTarget::TrackCursor => {
+                        let action = ui.lock(|state| {
+                            state.borrow_mut().controller.rotate_tracks_cursor(delta)
+                        });
+                        if let Some(UiAction::Track(action)) = action {
+                            let mut controller = ui.lock(|state| state.borrow().controller);
+                            apply_track_ui_action(shared, &mut controller, action);
+                            ui.lock(|state| state.borrow_mut().controller = controller);
+                        }
+                    }
+                    UiEncoderTarget::TrackZoom => ui.lock(|state| {
+                        let _ = state.borrow_mut().controller.rotate_tracks_zoom(delta);
+                    }),
+                    UiEncoderTarget::TrackEndBehavior => {
+                        let action = ui.lock(|state| {
+                            state
+                                .borrow_mut()
+                                .controller
+                                .rotate_tracks_end_behavior(delta)
+                        });
+                        if let Some(UiAction::Track(action)) = action {
+                            let mut controller = ui.lock(|state| state.borrow().controller);
+                            apply_track_ui_action(shared, &mut controller, action);
+                            ui.lock(|state| state.borrow_mut().controller = controller);
+                        }
+                    }
                     UiEncoderTarget::SampleGroup(group) if group.count() >= 2 => {
                         match apply_group_detent(shared, GroupEditParameter::Sample, group, delta) {
                             GroupDetentOutcome::Applied {
@@ -1217,9 +1433,17 @@ async fn controls_task(
                             GroupDetentOutcome::Applied { .. } | GroupDetentOutcome::Invalid => {}
                         }
                     }
-                    UiEncoderTarget::Volume(target) => shared.lock(|state| {
-                        let _ = state.borrow_mut().adjust_volume(target, delta);
-                    }),
+                    UiEncoderTarget::Volume(target) => {
+                        shared.lock(|state| {
+                            let _ = state.borrow_mut().adjust_volume(target, delta);
+                        });
+                        if controller.page() == UiPage::Tracks && target == VolumeTarget::Global {
+                            ui.lock(|state| {
+                                state.borrow_mut().track_volume_feedback_until_ms =
+                                    Instant::now().as_millis().saturating_add(1_000);
+                            });
+                        }
+                    }
                     UiEncoderTarget::PatternVolume(target) => shared.lock(|state| {
                         let _ = state.borrow_mut().adjust_pattern_volume(target, delta);
                     }),
@@ -1309,6 +1533,10 @@ async fn controls_task(
             let stable_mask = debouncer.stable_mask();
             let debounced_encoder_pressed = encoder_button_debouncer.stable_mask() & 1 != 0;
             let mut next_ui = ui.lock(|state| *state.borrow());
+            let transport_status = shared.lock(|state| state.borrow().track_transport_status());
+            next_ui
+                .controller
+                .set_track_transport_status(transport_status);
             next_ui
                 .controller
                 .update_suppression(raw_mask, physical_encoder_pressed);
@@ -1319,21 +1547,33 @@ async fn controls_task(
 
             let return_pressed = changes.pressed & return_bit != 0
                 && !next_ui.controller.key_suppressed(RETURN_KEY_INDEX);
-            let mute_action = resolve_mute_scan(
-                &mut mute_button,
-                return_pressed,
-                changes.released & mute_bit != 0,
-                now_ms,
-            );
+            let mute_action = if next_ui.controller.page() == UiPage::Tracks {
+                if mute_button.cancel().is_some() {
+                    shared.lock(|state| {
+                        state.borrow_mut().cancel_mute_gesture();
+                    });
+                }
+                None
+            } else {
+                resolve_mute_scan(
+                    &mut mute_button,
+                    return_pressed,
+                    changes.released & mute_bit != 0,
+                    now_ms,
+                )
+            };
             if return_pressed {
                 if matches!(mute_action, Some(MuteScanAction::Cancel(_))) {
                     shared.lock(|state| {
                         state.borrow_mut().cancel_mute_gesture();
                     });
                 }
-                next_ui
+                let action = next_ui
                     .controller
                     .return_to_root(raw_mask, physical_encoder_pressed);
+                if let Some(UiAction::Track(action)) = action {
+                    apply_track_ui_action(shared, &mut next_ui.controller, action);
+                }
                 next_ui.volume_pressed = false;
                 encoder_acceleration = UiEncoderAcceleration::new();
             } else {
@@ -1364,10 +1604,32 @@ async fn controls_task(
                 }
                 let allowed_pressed = changes.pressed & !next_ui.controller.suppressed_keys();
                 let pressed_beats = allowed_pressed & looptic::BEAT_PAD_MASK;
-                if pressed_beats != 0 {
-                    let held_beats = stable_mask
-                        & looptic::BEAT_PAD_MASK
-                        & !next_ui.controller.suppressed_keys();
+                let released_beats = changes.released & looptic::BEAT_PAD_MASK;
+                let held_beats =
+                    stable_mask & looptic::BEAT_PAD_MASK & !next_ui.controller.suppressed_keys();
+                if next_ui.controller.page() == UiPage::Tracks {
+                    let cursor_frame = next_ui.controller.tracks_cursor_frame();
+                    let tap_other_frame = if transport_status.state != TransportState::Playing
+                        && released_beats != 0
+                    {
+                        let projection = shared.lock(|state| *state.borrow());
+                        projection
+                            .next_projected_trigger_frame(cursor_frame, false)
+                            .unwrap_or_else(|| projection.song_length_frames())
+                    } else {
+                        cursor_frame
+                    };
+                    if let Some(UiAction::Track(action)) =
+                        next_ui.controller.update_tracks_voice_keys(
+                            pressed_beats,
+                            released_beats,
+                            held_beats,
+                            tap_other_frame,
+                        )
+                    {
+                        apply_track_ui_action(shared, &mut next_ui.controller, action);
+                    }
+                } else if pressed_beats != 0 {
                     next_ui
                         .controller
                         .press_voice_edges(pressed_beats, held_beats);
@@ -1384,11 +1646,19 @@ async fn controls_task(
                 }
 
                 if allowed_pressed & mute_bit != 0 {
-                    let target = MuteTarget::for_selection(next_ui.controller.selection());
-                    if mute_button.press(target, now_ms) {
-                        shared.lock(|state| {
-                            state.borrow_mut().begin_mute_gesture(target);
-                        });
+                    if next_ui.controller.page() == UiPage::Tracks {
+                        if let Some(UiAction::Track(action)) =
+                            next_ui.controller.press_tracks_transport(held_beats)
+                        {
+                            apply_track_ui_action(shared, &mut next_ui.controller, action);
+                        }
+                    } else {
+                        let target = MuteTarget::for_selection(next_ui.controller.selection());
+                        if mute_button.press(target, now_ms) {
+                            shared.lock(|state| {
+                                state.borrow_mut().begin_mute_gesture(target);
+                            });
+                        }
                     }
                 }
 
@@ -1398,8 +1668,18 @@ async fn controls_task(
                     debounced_encoder_pressed && !next_ui.controller.encoder_suppressed();
                 next_ui.volume_pressed = volume_pressed;
 
+                if next_ui.controller.page() == UiPage::Tracks {
+                    if button_changes.pressed & 1 != 0 && encoder_pressed {
+                        let _ = next_ui.controller.begin_tracks_encoder_gesture();
+                    }
+                    if button_changes.released & 1 != 0 {
+                        let _ = next_ui.controller.end_tracks_encoder_gesture();
+                    }
+                }
+
                 if button_changes.pressed & 1 != 0
                     && encoder_pressed
+                    && next_ui.controller.page() != UiPage::Tracks
                     && (!volume_pressed || next_ui.controller.group_warning().is_some())
                 {
                     let selected_division = next_ui.controller.selected_pad().map(|pad| {
@@ -1464,6 +1744,10 @@ async fn controls_task(
                             }
                             encoder_acceleration = UiEncoderAcceleration::new();
                         }
+                        Some(UiAction::Track(action)) => {
+                            apply_track_ui_action(shared, &mut next_ui.controller, action);
+                            encoder_acceleration = UiEncoderAcceleration::new();
+                        }
                         Some(UiAction::ResetConfirmed) => {
                             mute_button.cancel();
                             let revision = shared.lock(|state| {
@@ -1520,9 +1804,10 @@ async fn led_task(
     loop {
         let ui_state = ui.lock(|state| *state.borrow());
         let selection = ui_state.controller.selection();
+        let tracks_page = ui_state.controller.page() == UiPage::Tracks;
         let fallback_mute_target = MuteTarget::for_selection(selection);
         let volume_target = ui_state.controller.encoder_target(true);
-        let (playback_frame, triggers, underruns, brightness, mute_active, volume) =
+        let (playback_frame, triggers, underruns, brightness, mute_active, volume, transport) =
             shared.lock(|state| {
                 let state = state.borrow();
                 (
@@ -1535,7 +1820,11 @@ async fn led_task(
                             state.active_mute_target().unwrap_or(fallback_mute_target),
                         )
                         .unwrap_or(false),
-                    match volume_target {
+                    match if tracks_page {
+                        UiEncoderTarget::Volume(VolumeTarget::Global)
+                    } else {
+                        volume_target
+                    } {
                         UiEncoderTarget::PatternVolume(target) => {
                             state.pattern_volume_percent(target).unwrap_or(0)
                         }
@@ -1547,6 +1836,7 @@ async fn led_task(
                             .unwrap_or(0),
                         _ => 0,
                     },
+                    state.track_transport_status(),
                 )
             });
         let light_preview = ui_state.controller.page() == UiPage::Light;
@@ -1557,15 +1847,29 @@ async fn led_task(
             let (r, g, b) = voice_led_color(
                 pad,
                 brightness,
-                selection.count() != 0,
-                selection.contains(pad),
+                !tracks_page && selection.count() != 0,
+                !tracks_page && selection.contains(pad),
                 trigger_active,
                 light_preview,
             );
             colors[pad] = RGB8 { r, g, b };
         }
-        let (r, g, b) = mute_led_color(mute_active, brightness);
-        colors[MUTE_KEY_INDEX] = RGB8 { r, g, b };
+        colors[MUTE_KEY_INDEX] = if tracks_page {
+            let scaled = (u16::from(brightness) * 255 / 100) as u8;
+            let blue = if transport.state == TransportState::Playing {
+                scaled
+            } else {
+                (u16::from(scaled) / 5) as u8
+            };
+            RGB8 {
+                r: 0,
+                g: 0,
+                b: blue,
+            }
+        } else {
+            let (r, g, b) = mute_led_color(mute_active, brightness);
+            RGB8 { r, g, b }
+        };
         let (r, g, b) = volume_led_color(volume, brightness);
         colors[VOLUME_KEY_INDEX] = RGB8 { r, g, b };
         let (r, g, b) = return_led_color(brightness);
@@ -1773,6 +2077,247 @@ fn write_voice_group<const N: usize>(line: &mut String<N>, group: VoiceGroup) {
     }
 }
 
+fn draw_song_settings_menu<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    selected: SongSettingsItem,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ =
+        Text::with_baseline("LoopTic Song", Point::new(0, 0), style, Baseline::Top).draw(display);
+    for (row, (item, label)) in [
+        (SongSettingsItem::SongLength, "Song length"),
+        (SongSettingsItem::CycleLength, "Cycle length"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        draw_menu_item(
+            display,
+            style,
+            label,
+            18 + row as i32 * 16,
+            16,
+            *item == selected,
+        );
+    }
+}
+
+fn draw_track_end_behavior<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    selected: EndBehavior,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let _ =
+        Text::with_baseline("End behavior", Point::new(0, 0), style, Baseline::Top).draw(display);
+    for (row, (behavior, label)) in [(EndBehavior::Loop, "Loop"), (EndBehavior::Stop, "Stop")]
+        .iter()
+        .enumerate()
+    {
+        draw_menu_item(
+            display,
+            style,
+            label,
+            18 + row as i32 * 16,
+            16,
+            *behavior == selected,
+        );
+    }
+    let _ = Text::with_baseline("Push/Return done", Point::new(0, 51), style, Baseline::Top)
+        .draw(display);
+}
+
+fn write_song_time<const N: usize>(line: &mut String<N>, frames: u32) {
+    let seconds = frames / SAMPLE_RATE;
+    let _ = write!(line, "{:02}:{:02}", seconds / 60, seconds % 60);
+}
+
+fn track_zoom_label(zoom: TrackZoom) -> &'static str {
+    match zoom {
+        TrackZoom::Milliseconds50 => "50ms",
+        TrackZoom::Milliseconds100 => "100ms",
+        TrackZoom::Milliseconds250 => "250ms",
+        TrackZoom::Milliseconds500 => "500ms",
+        TrackZoom::Seconds1 => "1s",
+        TrackZoom::Seconds2 => "2s",
+        TrackZoom::Seconds5 => "5s",
+        TrackZoom::Seconds10 => "10s",
+        TrackZoom::Seconds30 => "30s",
+        TrackZoom::Minutes1 => "1m",
+        TrackZoom::Minutes2 => "2m",
+        TrackZoom::Minutes5 => "5m",
+        TrackZoom::Minutes10 => "10m",
+        TrackZoom::Minutes20 => "20m",
+        TrackZoom::Hours1 => "1h",
+        TrackZoom::WholeSong => "All",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tracks<D>(
+    display: &mut D,
+    style: MonoTextStyle<'_, BinaryColor>,
+    shared: &Shared,
+    cursor_frame: u32,
+    zoom: TrackZoom,
+    end_behavior: EndBehavior,
+    transport: looptic::TrackTransportStatus,
+    live_audition_mask: u16,
+    paint: Option<TrackPaintPreview>,
+    notice: Option<TrackNotice>,
+    master_feedback: Option<u8>,
+) where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    if notice == Some(TrackNotice::Full) {
+        let _ = Text::with_baseline("Tracks full", Point::new(0, 8), style, Baseline::Top)
+            .draw(display);
+        let _ = Text::with_baseline("Simplify spans", Point::new(0, 28), style, Baseline::Top)
+            .draw(display);
+        let _ = Text::with_baseline("Turn/Return", Point::new(0, 48), style, Baseline::Top)
+            .draw(display);
+        return;
+    }
+
+    const TRACK_TOP: i32 = 21;
+    const TRACK_ROWS: usize = 43;
+    const TRACK_X: [i32; BEAT_PAD_COUNT] = [10, 23, 36, 49, 62, 75, 88, 101, 114];
+
+    let projection = shared.lock(|state| *state.borrow());
+    let mut raster = TrackRaster::<TRACK_ROWS>::empty();
+    let song_length = projection.song_length_frames();
+    let focus = if transport.state == TransportState::Playing {
+        transport.position_frames
+    } else {
+        cursor_frame
+    }
+    .min(song_length);
+    let duration = zoom.duration_frames(song_length).min(song_length).max(1);
+    let mut view_start = focus.saturating_sub(duration / 2);
+    if view_start.saturating_add(duration) > song_length {
+        view_start = song_length.saturating_sub(duration);
+    }
+    let view_end = view_start.saturating_add(duration).min(song_length);
+    projection.rasterize_tracks(view_start, view_end, &mut raster);
+
+    let mut header: String<24> = String::new();
+    if let Some(volume) = master_feedback {
+        let _ = write!(&mut header, "Master {}%", volume);
+    } else {
+        let state_label = match transport.state {
+            TransportState::Playing => '>',
+            TransportState::Paused => '|',
+            TransportState::Stopped => 'X',
+        };
+        let _ = header.push(state_label);
+        write_song_time(&mut header, transport.position_frames.min(song_length));
+        let _ = write!(
+            &mut header,
+            " {} {}",
+            if end_behavior == EndBehavior::Loop {
+                'L'
+            } else {
+                'S'
+            },
+            track_zoom_label(zoom)
+        );
+    }
+    let _ = Text::with_baseline(&header, Point::new(0, 0), style, Baseline::Top).draw(display);
+
+    for (pad, &x) in TRACK_X.iter().enumerate() {
+        let mut label: String<2> = String::new();
+        let _ = write!(&mut label, "{}", pad + 1);
+        let _ =
+            Text::with_baseline(&label, Point::new(x - 3, 10), style, Baseline::Top).draw(display);
+        let mask = 1_u16 << pad;
+        if live_audition_mask & mask != 0 || paint.is_some_and(|edit| edit.voice_mask & mask != 0) {
+            let _ = Line::new(Point::new(x - 3, 19), Point::new(x + 3, 19))
+                .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+                .draw(display);
+        }
+    }
+
+    for (pad, &x) in TRACK_X.iter().enumerate() {
+        let mask = 1_u16 << pad;
+        let mut row = 0;
+        while row < TRACK_ROWS {
+            if raster.active_masks[row] & mask == 0 {
+                row += 1;
+                continue;
+            }
+            let start = row;
+            while row + 1 < TRACK_ROWS && raster.active_masks[row + 1] & mask != 0 {
+                row += 1;
+            }
+            let _ = Line::new(
+                Point::new(x, TRACK_TOP + start as i32),
+                Point::new(x, TRACK_TOP + row as i32),
+            )
+            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+            .draw(display);
+            row += 1;
+        }
+    }
+
+    for row in 0..TRACK_ROWS {
+        let y = TRACK_TOP + row as i32;
+        for (pad, &x) in TRACK_X.iter().enumerate() {
+            let mask = 1_u16 << pad;
+            if raster.projected_masks[row] & mask == 0 {
+                continue;
+            }
+            let dot = Circle::new(Point::new(x - 1, y - 1), 3);
+            let dot_style = if raster.enabled_masks[row] & mask != 0 {
+                PrimitiveStyle::with_fill(BinaryColor::On)
+            } else {
+                // Clear the active-span center line before stroking a disabled
+                // event so coarse rows remain visibly hollow.
+                PrimitiveStyleBuilder::new()
+                    .fill_color(BinaryColor::Off)
+                    .stroke_color(BinaryColor::On)
+                    .stroke_width(1)
+                    .build()
+            };
+            let _ = dot.into_styled(dot_style).draw(display);
+        }
+    }
+
+    let marker_frame = if transport.state == TransportState::Playing {
+        transport.position_frames
+    } else {
+        cursor_frame
+    }
+    .min(song_length);
+    let marker_row =
+        looptic::track_raster_row_for_frame::<TRACK_ROWS>(view_start, view_end, marker_frame)
+            .unwrap_or(0) as i32;
+    let marker_y = TRACK_TOP + marker_row;
+    let line_style = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
+    let _ = Line::new(
+        Point::new(0, marker_y),
+        Point::new(TRACK_X[0] - 3, marker_y),
+    )
+    .into_styled(line_style)
+    .draw(display);
+    for pair in TRACK_X.windows(2) {
+        let _ = Line::new(
+            Point::new(pair[0] + 3, marker_y),
+            Point::new(pair[1] - 3, marker_y),
+        )
+        .into_styled(line_style)
+        .draw(display);
+    }
+    let _ = Line::new(
+        Point::new(TRACK_X[BEAT_PAD_COUNT - 1] + 3, marker_y),
+        Point::new(127, marker_y),
+    )
+    .into_styled(line_style)
+    .draw(display);
+}
+
 fn draw_root_menu<D>(
     display: &mut D,
     style: MonoTextStyle<'_, BinaryColor>,
@@ -1812,9 +2357,10 @@ fn draw_root_menu<D>(
         .enumerate()
     {
         let label = match mode {
-            RootMode::Pattern => "Pattern",
             RootMode::Beats => "Beats",
-            RootMode::CycleLength => "Cycle length",
+            RootMode::SongSettings => "Song settings",
+            RootMode::Pattern => "Pattern",
+            RootMode::Tracks => "Tracks",
             RootMode::Sample => "Sample",
             RootMode::Light => "Light",
             RootMode::Save => "Save",
@@ -2230,6 +2776,8 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
         let model = ui_state
             .controller
             .display_model_with_library(ui_state.volume_pressed, ui_state.song_library);
+        let track_feedback_active =
+            ui_state.track_volume_feedback_until_ms > Instant::now().as_millis();
         let (displayed_value, pattern_revision) = shared.lock(|state| {
             let state = state.borrow();
             match model {
@@ -2243,6 +2791,7 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 UiDisplayModel::BeatsGroup { group } => {
                     (u32::from(state.desired_beats[group.primary()]), 0)
                 }
+                UiDisplayModel::SongLength => (u32::from(state.song_length_seconds()), 0),
                 UiDisplayModel::CycleGlobal => (state.base_interval_ms, 0),
                 UiDisplayModel::CycleGroup { group } => (
                     state
@@ -2274,9 +2823,19 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     0,
                 ),
                 UiDisplayModel::Light => (u32::from(state.led_brightness_percent), 0),
+                UiDisplayModel::Tracks { .. } => (
+                    if track_feedback_active {
+                        0x8000_0000 | u32::from(state.global_volume_percent())
+                    } else {
+                        0
+                    },
+                    state.song_revision,
+                ),
                 UiDisplayModel::Root { .. }
                 | UiDisplayModel::PatternSelectVoice
                 | UiDisplayModel::BeatsSelectVoice
+                | UiDisplayModel::SongSettingsMenu { .. }
+                | UiDisplayModel::TrackEndBehavior { .. }
                 | UiDisplayModel::SampleSelectVoice
                 | UiDisplayModel::PatternNeedsSingle { .. }
                 | UiDisplayModel::SongsMenu { .. }
@@ -2405,6 +2964,28 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                     let _ = Text::with_baseline(&line, Point::new(0, 18), style, Baseline::Top)
                         .draw(&mut display);
                 }
+                UiDisplayModel::SongSettingsMenu { selected } => {
+                    draw_song_settings_menu(&mut display, style, selected);
+                }
+                UiDisplayModel::SongLength => {
+                    let _ =
+                        Text::with_baseline("LoopTic Song", Point::new(0, 0), style, Baseline::Top)
+                            .draw(&mut display);
+                    let _ =
+                        Text::with_baseline("Song length", Point::new(0, 16), style, Baseline::Top)
+                            .draw(&mut display);
+                    let mut line: String<24> = String::new();
+                    write_song_time(&mut line, displayed_value.saturating_mul(SAMPLE_RATE));
+                    let _ = Text::with_baseline(&line, Point::new(0, 32), style, Baseline::Top)
+                        .draw(&mut display);
+                    let _ = Text::with_baseline(
+                        "Push/Return done",
+                        Point::new(0, 50),
+                        style,
+                        Baseline::Top,
+                    )
+                    .draw(&mut display);
+                }
                 UiDisplayModel::CycleGlobal => {
                     let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)
                         .draw(&mut display);
@@ -2463,6 +3044,34 @@ async fn display_task(resources: OledResources, shared: &'static Shared, ui: &'s
                 }
                 UiDisplayModel::PatternNeedsSingle { group } => {
                     draw_pattern_needs_single(&mut display, style, group);
+                }
+                UiDisplayModel::Tracks {
+                    cursor_frame,
+                    zoom,
+                    end_behavior,
+                    transport,
+                    live_audition_mask,
+                    paint,
+                    notice,
+                } => {
+                    let master_feedback = (displayed_value & 0x8000_0000 != 0)
+                        .then_some((displayed_value & 0xff) as u8);
+                    draw_tracks(
+                        &mut display,
+                        style,
+                        shared,
+                        cursor_frame,
+                        zoom,
+                        end_behavior,
+                        transport,
+                        live_audition_mask,
+                        paint,
+                        notice,
+                        master_feedback,
+                    );
+                }
+                UiDisplayModel::TrackEndBehavior { selected } => {
+                    draw_track_end_behavior(&mut display, style, selected);
                 }
                 UiDisplayModel::Light => {
                     let _ = Text::with_baseline("LoopTic", Point::new(0, 0), style, Baseline::Top)

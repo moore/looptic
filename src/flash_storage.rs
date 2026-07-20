@@ -195,7 +195,8 @@ pub fn inspect_superblock(
     let expected = encode_superblock(expected_initial_song_format_version);
     let is_exact_partial_descriptor = matches_uncommitted_descriptor(&expected)
         || (expected_initial_song_format_version == crate::SONG_FORMAT_VERSION
-            && matches_uncommitted_descriptor(&encode_superblock(crate::SONG_FORMAT_V2)));
+            && (matches_uncommitted_descriptor(&encode_superblock(crate::SONG_FORMAT_V2))
+                || matches_uncommitted_descriptor(&encode_superblock(crate::SONG_FORMAT_V3))));
     if is_exact_partial_descriptor {
         return SuperblockStatus::Incomplete;
     }
@@ -751,21 +752,23 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_v2_initialization_is_retryable_after_the_v3_upgrade() {
-        let descriptor = encode_superblock(crate::SONG_FORMAT_V2);
-        assert_eq!(
-            inspect_page(descriptor, crate::SONG_FORMAT_VERSION),
-            SuperblockStatus::Incomplete
-        );
-
-        for prefix_len in 1..=SUPERBLOCK_COMMIT_OFFSET {
-            let mut partial = [0xff; FLASH_PROGRAM_BYTES];
-            partial[..prefix_len].copy_from_slice(&descriptor[..prefix_len]);
+    fn interrupted_v2_and_v3_initialization_is_retryable_after_the_v4_upgrade() {
+        for legacy_version in [crate::SONG_FORMAT_V2, crate::SONG_FORMAT_V3] {
+            let descriptor = encode_superblock(legacy_version);
             assert_eq!(
-                inspect_page(partial, crate::SONG_FORMAT_VERSION),
-                SuperblockStatus::Incomplete,
-                "v2 partial prefix length {prefix_len}"
+                inspect_page(descriptor, crate::SONG_FORMAT_VERSION),
+                SuperblockStatus::Incomplete
             );
+
+            for prefix_len in 1..=SUPERBLOCK_COMMIT_OFFSET {
+                let mut partial = [0xff; FLASH_PROGRAM_BYTES];
+                partial[..prefix_len].copy_from_slice(&descriptor[..prefix_len]);
+                assert_eq!(
+                    inspect_page(partial, crate::SONG_FORMAT_VERSION),
+                    SuperblockStatus::Incomplete,
+                    "v{legacy_version} partial prefix length {prefix_len}"
+                );
+            }
         }
     }
 

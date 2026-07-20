@@ -14,6 +14,7 @@ use embedded_storage_async::nor_flash::{
 };
 use looptic::flash_storage::{FLASH_ERASE_BYTES, SONG_MAP_BYTES, SONG_MAP_PAGE_COUNT};
 use looptic::{SONG_ENCODED_MAX_LEN, SONG_SLOT_COUNT};
+use sequential_storage::Error as SequentialError;
 use sequential_storage::cache::Cache;
 use sequential_storage::cache::Uncached;
 use sequential_storage::cache::key_pointers::ArrayKeyPointers;
@@ -186,7 +187,13 @@ fn full_map(flash: FullFlash) -> FullMap {
 fn actual_partition_holds_all_256_slots_then_updates_deletes_and_reopens() {
     let mut map = full_map(FullFlash::erased());
     let mut work = [0_u8; 4096];
-    let mut record = [0_u8; SONG_ENCODED_MAX_LEN - 128];
+    let mut record = [0_u8; SONG_ENCODED_MAX_LEN];
+    let oversized = [0_u8; SONG_ENCODED_MAX_LEN + 1];
+    let oversized_value: &[u8] = &oversized;
+    assert_eq!(
+        block_on(map.store_item(&mut work, &0, &oversized_value)),
+        Err(SequentialError::ItemTooBig)
+    );
 
     for slot in 0_u16..SONG_SLOT_COUNT as u16 {
         record.fill(slot as u8);
@@ -194,9 +201,14 @@ fn actual_partition_holds_all_256_slots_then_updates_deletes_and_reopens() {
         block_on(map.store_item(&mut work, &(slot as u8), &value)).unwrap();
     }
 
-    record.fill(0xa5);
-    let replacement: &[u8] = &record;
-    block_on(map.store_item(&mut work, &17, &replacement)).unwrap();
+    // Churn every occupied key at the exact maximum record size. This crosses
+    // the partition's page-reclamation boundary rather than proving only the
+    // initial fill case.
+    for slot in (0_u16..SONG_SLOT_COUNT as u16).rev() {
+        record.fill((slot as u8) ^ 0xa5);
+        let replacement: &[u8] = &record;
+        block_on(map.store_item(&mut work, &(slot as u8), &replacement)).unwrap();
+    }
     block_on(map.remove_item(&mut work, &93)).unwrap();
 
     let (flash, _) = map.destroy();
@@ -207,7 +219,7 @@ fn actual_partition_holds_all_256_slots_then_updates_deletes_and_reopens() {
             assert!(loaded.is_none());
         } else {
             let loaded = loaded.expect("occupied slot survives reopen");
-            let expected = if slot == 17 { 0xa5 } else { slot as u8 };
+            let expected = (slot as u8) ^ 0xa5;
             assert_eq!(loaded.len(), record.len());
             assert!(loaded.iter().all(|byte| *byte == expected));
         }

@@ -81,8 +81,8 @@ voice constant-time, independently addressable XIP reads.
 
 ### Control state and modes
 
-The OLED root menu is ordered `Beats`, `Cycle length`, `Pattern`, `Sample`,
-`Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot.
+The OLED root menu is ordered `Beats`, `Song settings`, `Pattern`, `Tracks`,
+`Sample`, `Light`, `Save`, `Songs`, and `Reset all`, with Beats highlighted at boot.
 Encoder navigation moves one item per detent without acceleration and clamps at
 both ends; the five-row window scrolls and its cursor survives mode entry and
 Return. Selectable lists render their active row as a full-width white band with
@@ -116,10 +116,10 @@ its press, Return takes priority over other key-press edges and an
 encoder-button press. A simultaneous Mute release is cancelled without a latch
 toggle. The physical Return level blocks encoder detents throughout the
 five-sample debounce window, so they cannot edit a value or queue a preview just
-before Return is recognized. In the Pattern Cycles editor, Return closes only
-that editor and remains in Pattern. Otherwise, Return closes the current mode
-or confirmation, discards any still-uncommitted
-choice or control gesture,
+before Return is recognized. Return first closes a Pattern Cycles editor, a
+Song-settings editor, or Tracks' End Behavior overlay while remaining in that
+mode. Otherwise, Return closes the current mode or confirmation and discards
+any still-uncommitted choice or control gesture,
 preserves the complete selection, and restores the root at its remembered
 cursor. A Return press while already at the root instead clears selection. Controls
 already physically held at that point are blocked until release, preventing an
@@ -159,13 +159,23 @@ Mode behavior is:
   Pattern Cycles and its remembered cursor independently without erasing hidden
   Pattern state. Encoder push has no action outside a warning, and Return closes
   the mode.
-- **Cycle length:** with no selection, directly edit the global length with
-  10/100 ms acceleration. A selected group atomically edits its primary's
-  stored Cycle length with the same acceleration and mixed-value confirmation.
-  Zero means follow the current global value; 50 ms is the minimum independent
-  length, and values 1 through 49 are skipped. Mixed detection compares stored
-  values, so zero differs from an explicit override equal to Global. Encoder
-  push has no action outside a warning, and Return closes the mode.
+- **Song settings:** choose `Song length` or `Cycle length`. Song length is a
+  persistent 1–5,999 second value, edited one second per detent. In the Cycle
+  editor, no selection targets the global length with 10/100 ms acceleration;
+  a selected group atomically edits its primary's stored Cycle length with the
+  same acceleration and mixed-value confirmation. Zero means follow Global;
+  50 ms is the minimum independent length, and values 1 through 49 are skipped.
+  Mixed detection compares stored values, so zero differs from an explicit
+  override equal to Global. Push or Return closes an editor back to the menu.
+- **Tracks:** hide but preserve ordinary voice selection and render nine
+  vertically scrolling projection columns. Filled/hollow dots distinguish
+  enabled/disabled gate spans, enabled spans have center lines, and dense rows
+  coalesce with enabled priority. Stopped turns move one projected boundary;
+  held voice chords paint half-open spans atomically on release. Encoder-held
+  turns select one of 16 display-only zooms; an unturned click opens runtime
+  Loop/Stop choice. Mute is brightness-scaled blue Play/Pause. While playing,
+  ordinary turns edit master volume and held voices live-audition future
+  scheduled hits through Track and mute gates without persistent mutation.
 - **Sample:** with no selection, show `Select voice`. For a selected group, each
   encoder detent moves the primary value one entry through the 24-sample catalog without
   acceleration and clamps at the first or last sample. Group editing atomically
@@ -198,9 +208,9 @@ Mode behavior is:
   detent moves one choice without acceleration and clamps at the ends. Pressing
   the encoder on either choice exits the confirmation.
 
-Mute captures the persistent selected group at its press edge, or Global if the
-selection is empty, and retains that target for the complete tap/hold gesture
-on every page. A group tap atomically sets every member's local latch opposite
+Outside Tracks, Mute captures the persistent selected group at its press edge,
+or Global if the selection is empty, and retains that target for the complete
+tap/hold gesture. A group tap atomically sets every member's local latch opposite
 the primary member's latch. A group hold momentarily mutes every captured member
 and restores their persistent latches on release. Return retains priority and
 cancels an active gesture. The Mute LED follows Global when selection is empty;
@@ -210,7 +220,8 @@ the selected group or the master when selection is empty, using the common
 mixed-value warning. On a selected pad's Pattern page, it edits the highlighted
 trigger level; highlighting `All` targets all stored trigger levels. It then returns
 encoder control to the open mode on release unless a warning remains open for
-push confirmation.
+push confirmation. Tracks replaces Mute with transport and routes unmodified
+encoder turns to master volume while playing.
 
 Beat LEDs are composed in two stages. The base color is off when idle, steady
 white for every selected beat, a pad's normal palette color for a 100 ms trigger
@@ -223,7 +234,8 @@ unselected beat LED. Consequently idle keys remain off; trigger, preview, and
 Light states on other pads are dimmed by 80% rather than replaced with a steady
 light. Every selected beat retains its computed white or palette color, and no
 multiplier is applied when selection is empty. The bottom controls do not
-participate: their identities remain Mute red, Volume yellow, and Return white.
+participate: their identities remain Mute red, Volume yellow, and Return white,
+except that Tracks renders Mute dim/bright blue for stopped/playing transport.
 
 ### Pattern representation
 
@@ -564,12 +576,12 @@ distinct from timing failure.
 | RP2040 physical flash | 8 MiB |
 | Linker-owned firmware partition | 6 MiB |
 | Persistent song partition | 2 MiB (511 journal sectors after superblock) |
-| Current release flash use | 1,248,972 bytes |
+| Current release flash use | 1,298,836 bytes |
 | Complete 24-sample bank | 1,064,964 bytes |
-| Free flash in firmware partition | 5,042,484 bytes (about 4.81 MiB) |
-| Current executable text | 153,148 bytes (about 149.6 KiB) |
-| Current linked static RAM span | 48,624 bytes |
-| RAM remaining before runtime stack | 221,712 bytes (about 216.5 KiB) |
+| Free flash in firmware partition | 4,992,620 bytes (about 4.76 MiB) |
+| Current executable text | 209,664 bytes (about 204.8 KiB) |
+| Current linked static RAM span | 52,720 bytes |
+| RAM remaining before runtime stack | 217,616 bytes (about 212.5 KiB) |
 | RP2040 SRAM | 264 KiB |
 | Pattern state per pad, per copy | 32-byte enable map + 260-byte trigger-level map/cache |
 | Primary voices | 24 physical slots; adaptive effective limit 1–24 |
@@ -581,19 +593,22 @@ distinct from timing failure.
 | Emergency threshold | 5,225 µs service |
 
 These values come from the current optimized release ELF's loadable sections:
-flash is 256 bytes boot2 + 192 bytes vectors + 153,148 bytes text + 1,080,732
-bytes read-only data + the 14,644-byte data load image. Static RAM is 14,644
-bytes data + 32,952 bytes BSS + the 1,024-byte reserved uninitialized region,
-rounded to the 48,624-byte heap/stack boundary.
+flash is 256 bytes boot2 + 192 bytes vectors + 209,664 bytes text + 1,082,844
+bytes read-only data + the 5,880-byte data load image. Static RAM is 5,880
+bytes data + 45,816 bytes BSS + the 1,024-byte reserved uninitialized region,
+ending at the 52,720-byte heap/stack boundary.
 The data section includes hot renderer/allocator code copied to SRAM; PCM
 consumes no SRAM beyond catalog references. Enable and trigger-level maps are
 duplicated deliberately between shared UI state and the audio sequencer so the
 renderer never locks shared state per frame. Across nine pads, those two copies
-use 5,256 bytes. The storage increase includes two fixed work/record buffers,
-the 511-page and 256-key journal caches, and the static storage-task future;
-there is still no heap. Voice pools and diagnostics also remain fixed-size.
-The RAM remainder is available to runtime stacks and does not claim a measured
-worst-case stack high-water mark.
+use 5,256 bytes. Tracks adds two 1,540-byte canonical timelines, one each in
+shared and audio state. Storage includes fixed 4,096-byte work and 4,085-byte
+record buffers, the 511-page and 256-key journal caches, and the static
+storage-task future; there is still no heap. Voice pools and diagnostics also
+remain fixed-size. Release assembly puts the largest audited synchronous
+controls-to-paint stack chain at about 11.6 KiB, comfortably inside the 212.5
+KiB remainder. That is a regression bound, not a measured runtime stack
+high-water mark.
 ELF and UF2 file lengths are not device-usage figures because they include
 debug information or container formatting.
 
@@ -712,9 +727,10 @@ Exercise these cases separately and confirm their diagnostic counters:
     Format confirmations, stored-slot Copy, Delete of the current slot,
     empty-slot feedback, dirty indication, Return cancellation, audio
     fade/pause/resume, USB firmware replacement with data retained, and the
-    version/corruption screens. Load a v2 record and verify an in-memory
-    migration with every pad following Global, no automatic flash rewrite, and
-    a v3 record after an edit followed by Save or after Save-as. Run the
+    version/corruption screens. Load v2 and v3 records and verify their in-memory
+    migration to a three-minute fully enabled arrangement, with every v2 pad
+    following Global, no automatic flash rewrite, and a v4 record after an edit
+    followed by Save or after Save-as. Run the
     power-cut matrix in `song-storage.md`; every slot must recover as the old or
     new complete value, never a mixture.
 13. Alter every Reset all category and verify its default Cancel choice,
